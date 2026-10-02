@@ -20,17 +20,38 @@ const strategy = new MomentumStrategyV1();
 export async function getBotStatus(portfolioId: string): Promise<BotStatusInfo> {
   const p = await getPortfolio(portfolioId);
   const stats = getRuntimeBotStats();
+
+  const scan = await query<{ last: Date | null; scanned: string }>(
+    `SELECT MAX(discovered_at) AS last, COUNT(*)::text AS scanned FROM tokens WHERE data_mode = $1`,
+    [dataMode],
+  );
+  const signals = await query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM signals WHERE data_mode = $1`,
+    [dataMode],
+  );
+  const lastMarket = await query<{ last: Date | null }>(
+    `SELECT MAX(observed_at) AS last FROM market_snapshots WHERE data_mode = $1`,
+    [dataMode],
+  );
+
   const tradesToday = await query<{ c: string }>(
     `SELECT COUNT(*)::text AS c FROM paper_orders
      WHERE portfolio_id = $1 AND created_at >= date_trunc('day', NOW()) AND status IN ('FILLED','PARTIAL')`,
     [portfolioId],
   );
+
+  const lastScanAt =
+    stats.lastScanAt?.toISOString() ??
+    lastMarket.rows[0]?.last?.toISOString() ??
+    scan.rows[0]?.last?.toISOString() ??
+    null;
+
   return {
     status: p?.botStatus ?? 'PAUSED',
     dataMode,
-    lastScanAt: stats.lastScanAt?.toISOString() ?? null,
-    tokensScanned: stats.tokensScanned,
-    signalsGenerated: stats.signalsGenerated,
+    lastScanAt,
+    tokensScanned: Math.max(stats.tokensScanned, Number(scan.rows[0]?.scanned ?? 0)),
+    signalsGenerated: Math.max(stats.signalsGenerated, Number(signals.rows[0]?.c ?? 0)),
     tradesToday: Number(tradesToday.rows[0]?.c ?? 0),
     currentStrategy: `${strategy.name} ${strategy.version}`,
     riskState: p?.riskState ?? 'OK',

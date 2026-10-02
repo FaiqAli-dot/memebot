@@ -89,16 +89,17 @@ export class DemoMarketDataProvider implements MarketDataProvider, PriceProvider
         basePrice * (1 + wave(meta.seed, now, 120_000, 0.12) + (h - 0.5) * 0.04),
       );
       const liquidityUsd = 8_000 + meta.seed * 120 + wave(meta.seed + 1, now, 180_000, 3_000);
-      const volume5mUsd = Math.max(
-        100,
-        2_000 + meta.seed * 40 + wave(meta.seed + 2, now, 90_000, 4_000) + h * 1500,
-      );
-      const volume1hUsd = volume5mUsd * (8 + h * 4);
-      const buyRatio = 0.45 + wave(meta.seed + 3, now, 100_000, 0.2) + (h - 0.5) * 0.1;
+        const volume5mUsd = Math.max(
+          2500,
+          4_000 + meta.seed * 60 + wave(meta.seed + 2, now, 90_000, 6_000) + h * 2500,
+        );
+        // Keep 1h volume lower so 5m*12/1h acceleration often exceeds 1.3
+        const volume1hUsd = Math.max(volume5mUsd * 4, volume5mUsd * (5 + h * 2));
+      const buyRatio = 0.58 + wave(meta.seed + 3, now, 100_000, 0.12) + (h - 0.5) * 0.05;
       const buyVolume5mUsd = volume5mUsd * Math.min(0.9, Math.max(0.1, buyRatio));
       const sellVolume5mUsd = volume5mUsd - buyVolume5mUsd;
       const priceChange5mPct =
-        wave(meta.seed + 4, now, 80_000, 8) + (meta.seed % 7) - 2;
+        2.5 + wave(meta.seed + 4, now, 80_000, 6) + (meta.seed % 5);
       const feeBps = meta.seed % 2 === 0 ? 25 : 30;
       const liq =
         meta.symbol === 'RUG?'

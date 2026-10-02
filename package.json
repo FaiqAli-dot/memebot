@@ -1,0 +1,30 @@
+{
+  "name": "memebot",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,worker,web -c cyan,magenta,green \"npm run dev -w @memebot/server\" \"npm run dev:worker -w @memebot/server\" \"npm run dev -w @memebot/web\"",
+    "dev:server": "npm run dev -w @memebot/server",
+    "dev:worker": "npm run dev:worker -w @memebot/server",
+    "dev:web": "npm run dev -w @memebot/web",
+    "build": "npm run build -w @memebot/shared && npm run build -w @memebot/server && npm run build -w @memebot/web",
+    "typecheck": "npm run typecheck -w @memebot/shared && npm run typecheck -w @memebot/server && npm run typecheck -w @memebot/web",
+    "lint": "npm run lint -w @memebot/server && npm run lint -w @memebot/web",
+    "test": "npm run test -w @memebot/server",
+    "test:unit": "npm run test:unit -w @memebot/server",
+    "test:integration": "npm run test:integration -w @memebot/server",
+    "db:migrate": "npm run db:migrate -w @memebot/server",
+    "db:seed": "npm run db:seed -w @memebot/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

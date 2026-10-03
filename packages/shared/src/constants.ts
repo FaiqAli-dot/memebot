@@ -88,6 +88,7 @@ export const DISCOVERY_SOURCES = [
   'DEXSCREENER_BOOST',
   'DEXSCREENER_NEW_PAIR',
   'GECKO_NEW_POOL',
+  'METEORA_DBC',
   'PUMPFUN_LAUNCH',
   'TRADE_STREAM',
   'DEMO_ORGANIC',
@@ -96,6 +97,20 @@ export const DISCOVERY_SOURCES = [
   'UNKNOWN',
 ] as const;
 export type DiscoverySource = (typeof DISCOVERY_SOURCES)[number];
+
+/** Canonical discoverySource keys used in APIs / dashboards (snake/lower where helpful). */
+export const DISCOVERY_SOURCE_LABELS: Record<DiscoverySource, string> = {
+  DEXSCREENER_BOOST: 'dexscreener_boosts',
+  DEXSCREENER_NEW_PAIR: 'dexscreener_profiles',
+  GECKO_NEW_POOL: 'geckoterminal_new_pools',
+  METEORA_DBC: 'meteora_dbc',
+  PUMPFUN_LAUNCH: 'pumpfun_launch',
+  TRADE_STREAM: 'trade_stream',
+  DEMO_ORGANIC: 'demo_organic',
+  DEMO_SYNTHETIC: 'demo_synthetic',
+  MANUAL: 'manual',
+  UNKNOWN: 'unknown',
+};
 
 export const REJECTION_REASONS = [
   'SAFETY_REJECTION',
@@ -113,6 +128,90 @@ export const REJECTION_REASONS = [
   'UNKNOWN',
 ] as const;
 export type RejectionReason = (typeof REJECTION_REASONS)[number];
+
+/**
+ * Machine-readable decision audit reason codes.
+ * Mapped onto existing gates — do not invent new trading gates.
+ */
+export const DECISION_REASON_CODES = [
+  // Discovery
+  'INVALID_ADDRESS',
+  'UNSUPPORTED_TOKEN_FORMAT',
+  // Eligibility / universe
+  'TOKEN_TOO_YOUNG',
+  'TOKEN_TOO_OLD',
+  'LIQUIDITY_TOO_LOW',
+  'LIQUIDITY_UNKNOWN',
+  'MARKET_CAP_TOO_LOW',
+  'MARKET_CAP_TOO_HIGH',
+  'INSUFFICIENT_VOLUME',
+  'INSUFFICIENT_HOLDERS',
+  'UNSUPPORTED_VENUE',
+  'HIGH_RISK',
+  'STALE_MARKET_DATA',
+  // Signal
+  'SCORE_BELOW_THRESHOLD',
+  'EXPECTED_VALUE_TOO_LOW',
+  'STRATEGY_REJECTED',
+  'KILL_SWITCH_ACTIVE',
+  // Risk
+  'LIQUIDITY_RISK',
+  'EXECUTION_RISK',
+  'POSITION_SIZE_TOO_LARGE',
+  'CORRELATED_EXPOSURE',
+  'VOLATILITY_EXTREME',
+  'INSUFFICIENT_CASH',
+  'RISK_STATE_BLOCKED',
+  // Position capacity
+  'MAX_OPEN_POSITIONS',
+  'INSUFFICIENT_CAPACITY',
+  // Outcomes
+  'TRADED',
+  'NOT_TRADED',
+  'UNKNOWN',
+] as const;
+export type DecisionReasonCode = (typeof DECISION_REASON_CODES)[number];
+
+export const DECISION_STAGES = [
+  'DISCOVERED',
+  'NORMALIZED',
+  'TRACKED',
+  'ELIGIBILITY',
+  'SIGNAL',
+  'RISK_GATE',
+  'POSITION_CAPACITY',
+  'FINAL_OUTCOME',
+] as const;
+export type DecisionStage = (typeof DECISION_STAGES)[number];
+
+export const DBC_STATUSES = [
+  'PRE_BONDING_CURVE',
+  'POST_BONDING_CURVE',
+  'LOCKED_VESTING',
+  'CREATED_POOL',
+  'UNKNOWN',
+] as const;
+export type DbcStatus = (typeof DBC_STATUSES)[number];
+
+export const MIGRATION_STATUSES = [
+  'NOT_MIGRATED',
+  'MIGRATING',
+  'MIGRATED',
+  'UNKNOWN',
+] as const;
+export type MigrationStatus = (typeof MIGRATION_STATUSES)[number];
+
+export const OUTCOME_CHECKPOINT_LABELS = [
+  '5m',
+  '15m',
+  '30m',
+  '1h',
+  '3h',
+  '6h',
+  '12h',
+  '24h',
+] as const;
+export type OutcomeCheckpointLabel = (typeof OUTCOME_CHECKPOINT_LABELS)[number];
 
 export const FRESHNESS_LEVELS = ['FRESH', 'STALE', 'VERY_STALE', 'UNKNOWN'] as const;
 export type FreshnessLevel = (typeof FRESHNESS_LEVELS)[number];

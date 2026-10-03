@@ -101,6 +101,19 @@ export const api = {
       body: JSON.stringify({ active }),
     }),
   health: () => request<Record<string, unknown>>('/api/health'),
+  intelligence: () => request<Record<string, unknown>>('/api/intelligence'),
+  intelligenceTokens: (qs = '') =>
+    request<{ rows: Record<string, unknown>[]; total: number }>(`/api/intelligence/tokens${qs}`),
+  intelligenceToken: (id: string) =>
+    request<Record<string, unknown>>(`/api/intelligence/tokens/${id}`),
+  intelligenceStorage: () => request<Record<string, unknown>>('/api/intelligence/storage'),
+  intelligenceSources: () =>
+    request<{ sources: Record<string, unknown>[] }>('/api/intelligence/sources'),
+  intelligenceMissed: () =>
+    request<{
+      falseNegatives: Record<string, unknown>[];
+      successfulRejections: Record<string, unknown>[];
+    }>('/api/intelligence/missed'),
 };
 
 export function money(n: number | null | undefined, digits = 2): string {

@@ -14,10 +14,12 @@ import { SettingsPage } from './pages/SettingsPage';
 import { TokenDetailPage } from './pages/TokenDetailPage';
 import { ShadowPage } from './pages/ShadowPage';
 import { LabPage } from './pages/LabPage';
+import { TokenIntelligencePage } from './pages/TokenIntelligencePage';
 
 const links = [
   ['/', 'Dashboard'],
   ['/scanner', 'Scanner'],
+  ['/intelligence', 'Token Intel'],
   ['/live', 'Live'],
   ['/positions', 'Positions'],
   ['/trades', 'Trades'],
@@ -86,6 +88,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/scanner" element={<ScannerPage />} />
+          <Route path="/intelligence" element={<TokenIntelligencePage />} />
           <Route path="/live" element={<LivePage />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/trades" element={<TradesPage />} />

@@ -48,11 +48,20 @@ export function tokenAge(input: TokenAgeInput, now: Date = new Date()): TokenAge
   };
 }
 
-const BONDING_CURVE_VENUES = new Set(['pumpfun', 'pump.fun', 'pumpdotfun', 'pump']);
+const BONDING_CURVE_VENUES = new Set([
+  'pumpfun',
+  'pump.fun',
+  'pumpdotfun',
+  'pump',
+  'meteora_dbc',
+  'meteora-dbc',
+  'meteora dbc',
+]);
 
 /**
- * Pump.fun pre-migration tokens trade on a bonding curve, not an AMM pool, and
- * DexScreener reports no liquidity for them. A missing value is UNKNOWN — never zero.
+ * Pre-migration bonding-curve venues (pump.fun, Meteora DBC, …) are not AMM pools.
+ * DexScreener often reports no liquidity for them. A missing value is UNKNOWN — never zero.
+ * Eligibility outcome is unchanged: BONDING_CURVE → RESEARCH_ONLY (existing gate).
  */
 export function classifyLiquidity(opts: {
   venue: string | null | undefined;
@@ -76,6 +85,7 @@ export function classifyTradingEligibility(liquidityStatus: LiquidityStatus): {
     case 'BONDING_CURVE':
       return {
         eligibility: 'RESEARCH_ONLY',
+        // Existing gate reason (shared by pump + meteora_dbc bonding curves)
         reasons: ['pumpfun_bonding_curve_no_execution_model'],
       };
     default:

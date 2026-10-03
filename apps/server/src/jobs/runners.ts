@@ -90,6 +90,20 @@ import type { ExitParams } from '../research/exit-sim.js';
 import { recordOpportunity, processOpportunityOutcomes } from '../research/opportunities.js';
 import { classifyStrategyRejection, FunnelRecorder, pruneFunnelSnapshots } from '../research/funnel.js';
 import {
+  auditEligibility,
+  auditFinalOutcome,
+  auditRiskDecision,
+  auditSignalPass,
+  auditSignalRejection,
+  buildFeatureSnapshot,
+  onMarketTracked,
+  onTokenDiscovered,
+  persistRawFeatureObservation,
+} from '../intelligence/hooks.js';
+import { captureDueOutcomeCheckpoints } from '../intelligence/outcomes.js';
+import { ensureSourceHealthRows } from '../intelligence/source-health.js';
+import { snapshotStorageMonitor } from '../intelligence/storage.js';
+import {
   classifyTradingEligibility,
   computeActivityScore,
   hasBasicTradingData,
@@ -233,6 +247,7 @@ function execSettingsFrom(settings: PortfolioSettings): ExecutionSettings {
 
 async function jobTokenDiscovery(): Promise<void> {
   const portfolioId = await ensureDefaultPortfolio();
+  await ensureSourceHealthRows().catch(() => undefined);
   await discovery.subscribe();
   const discovered = await discovery.getRecentTokens();
   for (const token of discovered) {
@@ -241,7 +256,11 @@ async function jobTokenDiscovery(): Promise<void> {
       [token.chain, token.address, dataMode],
     );
     const id = await upsertDiscoveredToken(token);
-    if (id && existing.rows.length === 0) {
+    const isNew = Boolean(id && existing.rows.length === 0);
+    await onTokenDiscovered(token, id, isNew).catch((err) =>
+      logger.warn({ err, address: token.address }, 'Token intelligence ledger write failed'),
+    );
+    if (id && isNew) {
       await query(
         `INSERT INTO market_events (token_id, event_type, payload, observed_at, source, data_mode)
          VALUES ($1,'TOKEN_DISCOVERED',$2,NOW(),$3,$4)`,
@@ -249,8 +268,12 @@ async function jobTokenDiscovery(): Promise<void> {
           id,
           JSON.stringify({
             discoverySource: token.discoverySource,
+            allDiscoverySources: token.allDiscoverySources ?? [token.discoverySource],
+            venue: token.dexVenue ?? null,
             symbol: token.symbol,
             paidBoost: token.discoverySource === 'DEXSCREENER_BOOST',
+            dbcStatus: token.metadata?.dbcStatus ?? null,
+            migrationStatus: token.metadata?.migrationStatus ?? null,
           }),
           token.discoverySource,
           dataMode,
@@ -264,6 +287,7 @@ async function jobTokenDiscovery(): Promise<void> {
         details: {
           address: token.address,
           discoverySource: token.discoverySource,
+          venue: token.dexVenue ?? null,
           paidBoost: token.discoverySource === 'DEXSCREENER_BOOST',
         },
       });
@@ -272,6 +296,7 @@ async function jobTokenDiscovery(): Promise<void> {
         symbol: token.symbol,
         address: token.address,
         discoverySource: token.discoverySource,
+        venue: token.dexVenue ?? null,
       });
     }
   }
@@ -367,6 +392,55 @@ async function ingestQuote(token: TrackedTokenRow, quote: MarketQuote): Promise<
     poolCreatedAt: quote.pairCreatedAt ?? null,
     venue: quote.venue ?? null,
   });
+
+  const ageMinutes = tokenAgeOf(token).minutes;
+  const features = buildFeatureSnapshot({
+    liquidityUsd: quote.liquidityUsd,
+    volume5mUsd: quote.volume5mUsd,
+    volume1hUsd: quote.volume1hUsd,
+    volume24hUsd: quote.volume24hUsd,
+    marketCapUsd: quote.marketCapUsd,
+    ageMinutes,
+    priceChange5mPct: quote.priceChange5mPct,
+    priceChange1hPct: quote.priceChange1hPct,
+    buyVolume5mUsd: quote.buyVolume5mUsd,
+    sellVolume5mUsd: quote.sellVolume5mUsd,
+    liquidityStatus,
+    venue: quote.venue,
+    extra: { price: quote.priceUsd },
+  });
+  await onMarketTracked(
+    token.id,
+    {
+      price_usd: quote.priceUsd,
+      market_cap_usd: quote.marketCapUsd,
+      liquidity_usd: quote.liquidityUsd,
+      volume_24h_usd: quote.volume24hUsd,
+      volume_1h_usd: quote.volume1hUsd,
+    },
+    null,
+    ageMinutes,
+  ).catch(() => undefined);
+  await persistRawFeatureObservation(token.id, features).catch(() => undefined);
+  await auditEligibility({
+    tokenId: token.id,
+    pass: eligibility === 'TRADING_ELIGIBLE' && basicDataOk,
+    reasons: basicDataOk ? reasons : [...reasons, 'lowLiquidity'],
+    actual: {
+      liquidity: quote.liquidityUsd,
+      liquidityStatus,
+      price: quote.priceUsd,
+      volume5m: quote.volume5mUsd,
+      volume1h: quote.volume1hUsd,
+      ageMinutes,
+    },
+    required: {
+      minLiquidityUsd: 3000,
+      liquidityStatus: 'KNOWN',
+      eligibility: 'TRADING_ELIGIBLE',
+    },
+    features,
+  }).catch(() => undefined);
 
   if (liquidityStatus === 'KNOWN') {
     await query(
@@ -782,6 +856,31 @@ async function jobSignals(): Promise<void> {
     // Safety BEFORE strategy tradability
     if (safety.blocked) {
       funnel.reject('safetyFailed');
+      const safetyFeatures = buildFeatureSnapshot({
+        liquidityUsd: market.liquidity_usd,
+        volume5mUsd: market.volume_5m_usd,
+        volume1hUsd: market.volume_1h_usd,
+        volume24hUsd: market.volume_24h_usd,
+        marketCapUsd: market.market_cap_usd,
+        ageMinutes: age.minutes,
+        holders: holders?.holder_count ?? null,
+        priceChange5mPct: market.price_change_5m_pct,
+        priceChange1hPct: market.price_change_1h_pct,
+        buyVolume5mUsd: market.buy_volume_5m_usd,
+        sellVolume5mUsd: market.sell_volume_5m_usd,
+        riskScore: safety.score,
+        liquidityStatus: market.liquidity_status,
+        venue: market.venue,
+        extra: { price: market.price_usd, safetyClass: safety.safetyClass },
+      });
+      await auditSignalRejection({
+        tokenId: token.id,
+        portfolioId,
+        funnelCategory: 'safetyFailed',
+        sharedRejection: 'SAFETY_REJECTION',
+        strategyReasons: safety.reasons,
+        features: safetyFeatures,
+      }).catch(() => undefined);
       await openShadowTrade({
         portfolioId,
         tokenId: token.id,
@@ -895,15 +994,55 @@ async function jobSignals(): Promise<void> {
     }
 
     const buys = all.filter((s) => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
+    const signalFeatures = buildFeatureSnapshot({
+      liquidityUsd: market.liquidity_usd,
+      volume5mUsd: market.volume_5m_usd,
+      volume1hUsd: market.volume_1h_usd,
+      volume24hUsd: market.volume_24h_usd,
+      marketCapUsd: market.market_cap_usd,
+      ageMinutes: age.minutes,
+      holders: holders?.holder_count ?? null,
+      priceChange5mPct: market.price_change_5m_pct,
+      priceChange1hPct: market.price_change_1h_pct,
+      buyVolume5mUsd: market.buy_volume_5m_usd,
+      sellVolume5mUsd: market.sell_volume_5m_usd,
+      liquidityStatus: market.liquidity_status,
+      venue: market.venue,
+      dataConfidence: dataConf.level,
+      volatility5mPct: Math.abs(market.price_change_5m_pct),
+      extra: { price: market.price_usd, phase: phase.phase },
+    });
     if (buys.length === 0) {
       // Token-level reason: the rejection from the strategy that got furthest (highest score)
       const closest = [...rejections].sort((a, b) => b.confidence - a.confidence)[0];
-      funnel.reject(closest ? classifyStrategyRejection(closest, age.minutes) : 'strategyFailed');
+      const category = closest ? classifyStrategyRejection(closest, age.minutes) : 'strategyFailed';
+      funnel.reject(category);
+      await auditSignalRejection({
+        tokenId: token.id,
+        portfolioId,
+        funnelCategory: category,
+        strategyReasons: closest?.reasons ?? [],
+        sharedRejection: closest?.rejectionReason ?? null,
+        score: closest?.confidence ?? null,
+        features: {
+          ...signalFeatures,
+          modelScore: closest?.confidence ?? null,
+          overallScore: closest?.confidence ?? null,
+        },
+        strategyId: closest?.strategyId ?? null,
+      }).catch(() => undefined);
       continue;
     }
     funnel.stage('strategyEligible');
 
     const best = buys[0]!;
+    await auditSignalPass({
+      tokenId: token.id,
+      portfolioId,
+      score: best.confidence,
+      features: { ...signalFeatures, modelScore: best.confidence, overallScore: best.confidence },
+      strategyId: best.strategyId,
+    }).catch(() => undefined);
     const proposedSizeUsd = sizeAt(dataConf.level);
 
     const cost = estimateRoundTripCost({
@@ -1398,6 +1537,31 @@ async function executeLane(
       funnel.reject('riskFailed');
       funnel.riskReject(assessment.rejectionReason ?? 'minimumPositionSize');
       funnel.riskSample(assessment, signal.strategy_id);
+      await auditRiskDecision({
+        tokenId: signal.token_id,
+        portfolioId,
+        rejected: true,
+        riskReason: assessment.rejectionReason,
+        actual: {
+          openPositions: latest.openPositions,
+          requestedSizeUsd: assessment.requestedSizeUsd,
+          maxViableSizeUsd: assessment.maxViableSizeUsd,
+          cashUsd: latest.cashUsd,
+          detail: assessment.detail,
+        },
+        required: {
+          maxOpenPositions: riskCfg.maxOpenPositions,
+          minSizeUsd: riskCfg.minSizeUsd,
+        },
+        features: {
+          price: market.price_usd,
+          marketCap: market.market_cap_usd,
+          liquidity: market.liquidity_usd,
+        },
+        strategyId: signal.strategy_id,
+        signalId: signal.id,
+        riskDecisionId,
+      }).catch(() => undefined);
       await openShadowTrade({
         portfolioId,
         tokenId: signal.token_id,
@@ -1520,8 +1684,38 @@ async function executeLane(
       funnel.reject('riskFailed');
       funnel.riskReject(result.limitBlocked);
       await markRiskExecution(riskDecisionId, 'LIMIT_BLOCKED', result.limitBlocked);
+      await auditRiskDecision({
+        tokenId: signal.token_id,
+        portfolioId,
+        rejected: true,
+        riskReason: result.limitBlocked,
+        actual: { limitBlocked: result.limitBlocked, requestedSizeUsd: amountUsd },
+        required: { maxOpenPositions: riskCfg.maxOpenPositions },
+        features: {
+          price: market.price_usd,
+          marketCap: market.market_cap_usd,
+          liquidity: market.liquidity_usd,
+        },
+        strategyId: signal.strategy_id,
+        signalId: signal.id,
+        riskDecisionId,
+      }).catch(() => undefined);
+      await auditFinalOutcome({
+        tokenId: signal.token_id,
+        portfolioId,
+        traded: false,
+        reasonCode: result.limitBlocked === 'maxOpenPositions' ? 'MAX_OPEN_POSITIONS' : 'INSUFFICIENT_CAPACITY',
+        details: { limitBlocked: result.limitBlocked },
+      }).catch(() => undefined);
     } else if (result.success && result.orderId) {
       await markRiskExecution(riskDecisionId, 'EXECUTED', null, result.positionId ?? null);
+      await auditFinalOutcome({
+        tokenId: signal.token_id,
+        portfolioId,
+        traded: true,
+        reasonCode: 'TRADED',
+        details: { orderId: result.orderId, positionId: result.positionId, lane },
+      }).catch(() => undefined);
       funnel.stage('executed');
       await query(
         `UPDATE paper_orders SET
@@ -1859,6 +2053,12 @@ export function registerAllJobs(): void {
   registerJob('analytics', intervals.analytics, jobAnalytics);
   registerJob('daily_report', intervals.daily_report, jobDailyReport);
   registerJob('learning', intervals.learning, jobLearning);
+  registerJob('outcome_checkpoints', intervals.outcome_checkpoints, async () => {
+    await captureDueOutcomeCheckpoints();
+  });
+  registerJob('storage_monitor', intervals.storage_monitor, async () => {
+    await snapshotStorageMonitor();
+  });
   registerJob('retention', intervals.retention, async () => {
     await pruneOldData();
   });

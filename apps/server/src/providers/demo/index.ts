@@ -161,11 +161,17 @@ export class DemoGasFeeProvider implements GasFeeProvider {
   async getFeeEstimate(): Promise<GasFeeEstimate> {
     const now = Date.now();
     const h = hashSeed(7, Math.floor(now / 10_000));
+    // Deterministic demo SOL/USD — clearly labeled; not a live market price
+    const solPriceUsd = 150 + wave(1, now, 600_000, 5);
     return {
       chain: 'solana',
       baseFeeLamports: 5000,
       priorityFeeLamports: Math.floor(2000 + h * 8000),
-      solPriceUsd: 150 + wave(1, now, 600_000, 5),
+      solPriceUsd,
+      solPriceSource: 'demo-deterministic',
+      solPriceObservedAt: new Date(now),
+      solPriceStale: false,
+      usable: true,
       observedAt: new Date(now),
     };
   }

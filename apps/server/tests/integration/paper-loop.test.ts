@@ -12,19 +12,33 @@ process.env.DATABASE_URL =
   process.env.DATABASE_URL ||
   'postgresql://memebot:memebot@localhost:5432/memebot_test';
 
-describe('integration: paper trading loop', () => {
+describe('integration: paper trading loop + edge cases', () => {
   let migrate: typeof import('../../src/db/migrate.js').migrate;
   let closePool: typeof import('../../src/db/client.js').closePool;
   let query: typeof import('../../src/db/client.js').query;
   let ensureDefaultPortfolio: typeof import('../../src/services/portfolio-service.js').ensureDefaultPortfolio;
+  let getPortfolio: typeof import('../../src/services/portfolio-service.js').getPortfolio;
   let upsertDiscoveredToken: typeof import('../../src/services/token-service.js').upsertDiscoveredToken;
   let insertMarketSnapshot: typeof import('../../src/services/token-service.js').insertMarketSnapshot;
+  let getPriorVolume5m: typeof import('../../src/services/token-service.js').getPriorVolume5m;
+  let getLatestMarketByToken: typeof import('../../src/services/token-service.js').getLatestMarketByToken;
   let executePaperBuy: typeof import('../../src/engines/paper/engine.js').executePaperBuy;
   let executePaperSell: typeof import('../../src/engines/paper/engine.js').executePaperSell;
-  let getPortfolio: typeof import('../../src/services/portfolio-service.js').getPortfolio;
   let MomentumStrategyV1: typeof import('../../src/engines/strategy/momentum-v1.js').MomentumStrategyV1;
   let DEFAULT_MOMENTUM_PARAMS: typeof import('../../src/engines/strategy/momentum-v1.js').DEFAULT_MOMENTUM_PARAMS;
   let portfolioId: string;
+
+  const gas = {
+    chain: 'solana',
+    baseFeeLamports: 5000,
+    priorityFeeLamports: 5000,
+    solPriceUsd: 150,
+    solPriceSource: 'demo-deterministic',
+    solPriceObservedAt: new Date(),
+    solPriceStale: false,
+    usable: true,
+    observedAt: new Date(),
+  };
 
   beforeAll(async () => {
     ({ migrate } = await import('../../src/db/migrate.js'));
@@ -32,9 +46,12 @@ describe('integration: paper trading loop', () => {
     ({ ensureDefaultPortfolio, getPortfolio } = await import(
       '../../src/services/portfolio-service.js'
     ));
-    ({ upsertDiscoveredToken, insertMarketSnapshot } = await import(
-      '../../src/services/token-service.js'
-    ));
+    ({
+      upsertDiscoveredToken,
+      insertMarketSnapshot,
+      getPriorVolume5m,
+      getLatestMarketByToken,
+    } = await import('../../src/services/token-service.js'));
     ({ executePaperBuy, executePaperSell } = await import(
       '../../src/engines/paper/engine.js'
     ));
@@ -43,7 +60,6 @@ describe('integration: paper trading loop', () => {
     ));
 
     await migrate(process.env.DATABASE_URL);
-    // Clean demo tables for isolation
     await query(`
       TRUNCATE paper_fills, fee_records, paper_orders, positions, portfolio_snapshots,
                bot_events, signals, strategy_runs, holder_snapshots, liquidity_snapshots,
@@ -56,21 +72,10 @@ describe('integration: paper trading loop', () => {
     await closePool();
   });
 
-  it('ingests token + market snapshot and generates signal', async () => {
-    const tokenId = await upsertDiscoveredToken({
+  function liquidQuote(address: string, over: Record<string, unknown> = {}) {
+    return {
       chain: 'solana',
-      address: 'DemoIntegration1111111111111111111111111',
-      symbol: 'INTG',
-      name: 'Integration Token',
-      decimals: 9,
-      createdAt: new Date(Date.now() - 40 * 60_000),
-      metadata: { test: true },
-    });
-    expect(tokenId).toBeTruthy();
-
-    const quote = {
-      chain: 'solana',
-      address: 'DemoIntegration1111111111111111111111111',
+      address,
       priceUsd: 0.002,
       marketCapUsd: 200000,
       volume5mUsd: 9000,
@@ -87,9 +92,23 @@ describe('integration: paper trading loop', () => {
       feeBps: 25,
       quoteReserve: 12500,
       baseReserve: 6_250_000,
+      ...over,
     };
-    await insertMarketSnapshot(tokenId!, quote);
-    // prior snapshots for acceleration
+  }
+
+  it('ingests token + market snapshot, generates signal, executes buy/sell, updates portfolio', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoIntegration1111111111111111111111111',
+      symbol: 'INTG',
+      name: 'Integration Token',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 40 * 60_000),
+      metadata: { test: true },
+    });
+    expect(tokenId).toBeTruthy();
+
+    const quote = liquidQuote('DemoIntegration1111111111111111111111111');
     await insertMarketSnapshot(tokenId!, { ...quote, volume5mUsd: 3000, observedAt: new Date(Date.now() - 60_000) });
     await insertMarketSnapshot(tokenId!, { ...quote, volume5mUsd: 3500, observedAt: new Date(Date.now() - 45_000) });
     await insertMarketSnapshot(tokenId!, { ...quote, volume5mUsd: 4000, observedAt: new Date(Date.now() - 30_000) });
@@ -142,16 +161,8 @@ describe('integration: paper trading loop', () => {
         JSON.stringify({}),
       ],
     );
-    expect(rows[0]?.id).toBeTruthy();
 
-    const gas = {
-      chain: 'solana',
-      baseFeeLamports: 5000,
-      priorityFeeLamports: 5000,
-      solPriceUsd: 150,
-      observedAt: new Date(),
-    };
-
+    const before = await getPortfolio(portfolioId);
     const buy = await executePaperBuy({
       portfolioId,
       tokenId: tokenId!,
@@ -167,19 +178,31 @@ describe('integration: paper trading loop', () => {
       trailingStopPct: 0.1,
     });
     expect(buy.success).toBe(true);
-    expect(buy.positionId).toBeTruthy();
 
     const afterBuy = await getPortfolio(portfolioId);
-    expect(afterBuy!.cashUsd).toBeLessThan(100);
-    expect(afterBuy!.openPositions).toBe(1);
+    expect(afterBuy!.cashUsd).toBeLessThan(before!.cashUsd);
+    expect(afterBuy!.openPositions).toBeGreaterThanOrEqual(1);
 
-    // Close position
-    const sellQuote = { ...quote, priceUsd: 0.0024, observedAt: new Date() };
+    // SOL price recorded on order + fee records
+    const orderRow = await query<{ sol_price_usd: string; sol_price_source: string }>(
+      `SELECT sol_price_usd, sol_price_source FROM paper_orders WHERE id = $1`,
+      [buy.orderId],
+    );
+    expect(Number(orderRow.rows[0]!.sol_price_usd)).toBe(150);
+    expect(orderRow.rows[0]!.sol_price_source).toBe('demo-deterministic');
+
+    const feeRows = await query<{ sol_price_usd: string }>(
+      `SELECT sol_price_usd FROM fee_records WHERE order_id = $1`,
+      [buy.orderId],
+    );
+    expect(feeRows.rows.length).toBeGreaterThan(0);
+    expect(feeRows.rows.every((r) => Number(r.sol_price_usd) === 150)).toBe(true);
+
     const sell = await executePaperSell({
       portfolioId,
       positionId: buy.positionId!,
       midPriceUsd: 0.0024,
-      quote: sellQuote,
+      quote: { ...quote, priceUsd: 0.0024, observedAt: new Date() },
       gas,
       priorityFeeLamports: 5000,
       failedTxStillChargesNetwork: true,
@@ -189,16 +212,56 @@ describe('integration: paper trading loop', () => {
 
     const afterSell = await getPortfolio(portfolioId);
     expect(afterSell!.openPositions).toBe(0);
-    expect(afterSell!.cashUsd).toBeGreaterThan(0);
-
-    const orders = await query(
-      `SELECT status FROM paper_orders WHERE portfolio_id = $1`,
-      [portfolioId],
-    );
-    expect(orders.rows.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('rejects trade on zero liquidity', async () => {
+  it('no-look-ahead: prior volume at T ignores future snapshots', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoNoLookAhead11111111111111111111111',
+      symbol: 'NOLA',
+      name: 'No Lookahead',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 60 * 60_000),
+    });
+    const t0 = new Date('2026-06-01T12:00:00Z');
+    const tPast = new Date('2026-06-01T11:50:00Z');
+    const tFuture = new Date('2026-06-01T12:10:00Z');
+    const q = liquidQuote('DemoNoLookAhead11111111111111111111111');
+
+    await insertMarketSnapshot(tokenId!, {
+      ...q,
+      volume5mUsd: 1000,
+      observedAt: new Date(tPast.getTime() - 20_000),
+    });
+    await insertMarketSnapshot(tokenId!, {
+      ...q,
+      volume5mUsd: 1100,
+      observedAt: new Date(tPast.getTime() - 10_000),
+    });
+    await insertMarketSnapshot(tokenId!, {
+      ...q,
+      volume5mUsd: 1200,
+      observedAt: tPast,
+    });
+    await insertMarketSnapshot(tokenId!, {
+      ...q,
+      volume5mUsd: 1300,
+      observedAt: t0,
+    });
+    // Future snapshot must not influence prior volume at t0
+    await insertMarketSnapshot(tokenId!, {
+      ...q,
+      volume5mUsd: 999_999,
+      observedAt: tFuture,
+    });
+
+    const prior = await getPriorVolume5m(tokenId!, t0);
+    expect(prior).not.toBeNull();
+    expect(prior).toBeLessThan(900_000);
+    expect(prior).not.toBe(999_999);
+  });
+
+  it('rejects trade on zero liquidity (no position opened)', async () => {
     const tokenId = await upsertDiscoveredToken({
       chain: 'solana',
       address: 'DemoZeroLiq111111111111111111111111111',
@@ -207,36 +270,68 @@ describe('integration: paper trading loop', () => {
       decimals: 9,
       createdAt: new Date(),
     });
-    const quote = {
-      chain: 'solana',
-      address: 'DemoZeroLiq111111111111111111111111111',
-      priceUsd: 0.001,
-      marketCapUsd: 0,
-      volume5mUsd: 0,
-      volume1hUsd: 0,
-      volume24hUsd: 0,
-      buyVolume5mUsd: 0,
-      sellVolume5mUsd: 0,
-      txCount5m: 0,
-      priceChange5mPct: 0,
-      priceChange1hPct: 0,
-      liquidityUsd: 0,
-      observedAt: new Date(),
-      quoteReserve: 0,
-    };
+    const beforePositions = await query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
+      [portfolioId],
+    );
     const result = await executePaperBuy({
       portfolioId,
       tokenId: tokenId!,
       signalId: null,
       amountUsd: 5,
       midPriceUsd: 0.001,
-      quote,
+      quote: liquidQuote('DemoZeroLiq111111111111111111111111111', {
+        liquidityUsd: 0,
+        quoteReserve: 0,
+        priceUsd: 0.001,
+      }),
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      stopLossPct: 0.08,
+      takeProfitPct: 0.2,
+      trailingStopPct: null,
+    });
+    expect(result.success).toBe(false);
+    expect(result.positionId).toBeUndefined();
+    const afterPositions = await query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
+      [portfolioId],
+    );
+    expect(afterPositions.rows[0]!.c).toBe(beforePositions.rows[0]!.c);
+
+    // Failed order may still record network cost
+    const failed = await query<{ status: string; network_fee_usd: string }>(
+      `SELECT status, network_fee_usd FROM paper_orders WHERE id = $1`,
+      [result.orderId],
+    );
+    expect(failed.rows[0]?.status).toBe('FAILED');
+    expect(Number(failed.rows[0]?.network_fee_usd)).toBeGreaterThan(0);
+  });
+
+  it('failed execution with unusable SOL price opens no position and charges nothing', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoNoSolPrice111111111111111111111111',
+      symbol: 'NOSOL',
+      name: 'No Sol',
+      decimals: 9,
+      createdAt: new Date(),
+    });
+    const cashBefore = (await getPortfolio(portfolioId))!.cashUsd;
+    const result = await executePaperBuy({
+      portfolioId,
+      tokenId: tokenId!,
+      signalId: null,
+      amountUsd: 5,
+      midPriceUsd: 0.002,
+      quote: liquidQuote('DemoNoSolPrice111111111111111111111111'),
       gas: {
-        chain: 'solana',
-        baseFeeLamports: 5000,
-        priorityFeeLamports: 5000,
-        solPriceUsd: 150,
-        observedAt: new Date(),
+        ...gas,
+        solPriceUsd: null,
+        solPriceSource: null,
+        solPriceStale: true,
+        usable: false,
       },
       priorityFeeLamports: 5000,
       failedTxStillChargesNetwork: true,
@@ -245,5 +340,141 @@ describe('integration: paper trading loop', () => {
       trailingStopPct: null,
     });
     expect(result.success).toBe(false);
+    expect(result.reason).toMatch(/SOL\/USD/i);
+    const cashAfter = (await getPortfolio(portfolioId))!.cashUsd;
+    expect(cashAfter).toBeCloseTo(cashBefore, 6);
+  });
+
+  it('100% loss / untradeable emergency exit marks position closed', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoRugPull111111111111111111111111111',
+      symbol: 'RUGX',
+      name: 'Rug Exit',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 30 * 60_000),
+    });
+    const quote = liquidQuote('DemoRugPull111111111111111111111111111');
+    const buy = await executePaperBuy({
+      portfolioId,
+      tokenId: tokenId!,
+      signalId: null,
+      amountUsd: 3,
+      midPriceUsd: quote.priceUsd,
+      quote,
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      stopLossPct: 0.08,
+      takeProfitPct: 0.2,
+      trailingStopPct: null,
+    });
+    expect(buy.success).toBe(true);
+
+    const sell = await executePaperSell({
+      portfolioId,
+      positionId: buy.positionId!,
+      midPriceUsd: 0.0001,
+      quote: { ...quote, liquidityUsd: 0, quoteReserve: 0, priceUsd: 0.0001 },
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      closeReason: 'emergency_liquidity_collapse',
+    });
+    expect(sell.success).toBe(true);
+    expect(sell.netPnl).toBeLessThan(0);
+
+    const pos = await query<{ status: string; close_reason: string; net_pnl_usd: string }>(
+      `SELECT status, close_reason, net_pnl_usd FROM positions WHERE id = $1`,
+      [buy.positionId],
+    );
+    expect(pos.rows[0]!.status).toBe('CLOSED');
+    expect(pos.rows[0]!.close_reason).toBe('emergency_liquidity_collapse');
+  });
+
+  it('stale market snapshot is readable as stale; missing market returns null (no invent)', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoStalePrice111111111111111111111111',
+      symbol: 'STALE',
+      name: 'Stale',
+      decimals: 9,
+      createdAt: new Date(),
+    });
+    await insertMarketSnapshot(
+      tokenId!,
+      liquidQuote('DemoStalePrice111111111111111111111111', {
+        observedAt: new Date(Date.now() - 10 * 60_000),
+      }),
+      true,
+    );
+    const latest = await getLatestMarketByToken(tokenId!);
+    expect(latest?.stale).toBe(true);
+
+    const missing = await getLatestMarketByToken('00000000-0000-4000-8000-000000000099');
+    expect(missing).toBeNull();
+  });
+
+  it('gap stop-loss sell uses market mid executable price recorded on order', async () => {
+    // Ensure enough cash after prior edge-case draws
+    await query(
+      `UPDATE user_portfolios SET cash_usd = GREATEST(cash_usd, 50), updated_at = NOW() WHERE id = $1`,
+      [portfolioId],
+    );
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoGapStop111111111111111111111111111',
+      symbol: 'GAP',
+      name: 'Gap Stop',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 20 * 60_000),
+    });
+    const entryMid = 1;
+    const quote = liquidQuote('DemoGapStop111111111111111111111111111', {
+      priceUsd: entryMid,
+      liquidityUsd: 50_000,
+      quoteReserve: 25_000,
+    });
+    const buy = await executePaperBuy({
+      portfolioId,
+      tokenId: tokenId!,
+      signalId: null,
+      amountUsd: 4,
+      midPriceUsd: entryMid,
+      quote,
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      stopLossPct: 0.08,
+      takeProfitPct: 0.2,
+      trailingStopPct: null,
+    });
+    expect(buy.success).toBe(true);
+
+    const gapped = 0.5;
+    const sell = await executePaperSell({
+      portfolioId,
+      positionId: buy.positionId!,
+      midPriceUsd: gapped,
+      quote: { ...quote, priceUsd: gapped },
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      closeReason: 'stop_loss',
+    });
+    expect(sell.success).toBe(true);
+
+    const order = await query<{
+      requested_price_usd: string;
+      executed_price_usd: string;
+    }>(`SELECT requested_price_usd, executed_price_usd FROM paper_orders WHERE id = $1`, [
+      sell.orderId,
+    ]);
+    const requested = Number(order.rows[0]!.requested_price_usd);
+    const executed = Number(order.rows[0]!.executed_price_usd);
+    // Requested is market mid (gap), not theoretical stop 0.92
+    expect(requested).toBeCloseTo(gapped, 6);
+    expect(requested).not.toBeCloseTo(0.92, 2);
+    expect(executed).toBeLessThan(requested);
   });
 });

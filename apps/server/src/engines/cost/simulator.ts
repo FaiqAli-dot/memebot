@@ -3,13 +3,14 @@
  *
  * Assumptions (documented in README):
  * - DEX fee: pool fee_bps when known; otherwise venue default (Raydium 25 bps, Pump.fun-like 100 bps, unknown 30 bps).
- * - Network fee: Solana base signature fee (5000 lamports) * SOL/USD.
+ * - Network fee: Solana base signature fee (5000 lamports) * SOL/USD from SolPriceProvider.
  * - Priority fee: observed median prioritization fee (or configured default) * SOL/USD.
  * - Price impact: constant-product AMM (x*y=k) using quoteReserve/baseReserve when available;
  *   otherwise approximate impact = tradeUsd / (liquidityUsd + tradeUsd).
  * - Slippage: impact + volatility buffer from recent |priceChange5m| + size/liquidity ratio.
  * - Failed txs may still incur network+priority fees when configured.
  * - Partial fills when trade size > ~15% of liquidity (fill up to 12% of liquidity).
+ * - Live SOL/USD must be usable (not stale/null); otherwise execution fails closed.
  */
 import type { CostBreakdown, ExecutionRecord } from '@memebot/shared';
 import { round, clamp, safeDiv } from '../../utils/helpers.js';
@@ -55,8 +56,6 @@ export function constantProductPriceImpactPct(
   quoteReserveUsd: number,
 ): number {
   if (quoteReserveUsd <= 0 || amountUsd <= 0) return 100;
-  // Buying base with quote: newPrice/oldPrice - 1 ≈ amount / (reserve - amount) for small moves;
-  // exact: impact = amount / (reserve + amount) for average execution vs mid.
   return (amountUsd / (quoteReserveUsd + amountUsd)) * 100;
 }
 
@@ -76,6 +75,53 @@ export function lamportsToUsd(lamports: number, solPriceUsd: number): number {
   return (lamports / 1_000_000_000) * solPriceUsd;
 }
 
+function solMeta(gas: GasFeeEstimate): Pick<CostBreakdown, 'solPriceUsd' | 'solPriceSource'> {
+  return {
+    solPriceUsd: gas.solPriceUsd,
+    solPriceSource: gas.solPriceSource,
+  };
+}
+
+function failedResult(
+  input: SimulateTradeInput,
+  reason: string,
+  chargeNetwork: boolean,
+  networkFeeUsd: number,
+  priorityFeeUsd: number,
+): SimulateTradeResult {
+  const costs: CostBreakdown = {
+    dexFeeUsd: 0,
+    networkFeeUsd: chargeNetwork ? networkFeeUsd : 0,
+    priorityFeeUsd: chargeNetwork ? priorityFeeUsd : 0,
+    slippageCostUsd: 0,
+    priceImpactPct: 0,
+    priceImpactCostUsd: 0,
+    totalCostUsd: chargeNetwork ? networkFeeUsd + priorityFeeUsd : 0,
+    ...solMeta(input.gas),
+  };
+  return {
+    costs,
+    execution: {
+      requestedPriceUsd: input.midPriceUsd,
+      executedPriceUsd: 0,
+      requestedAmountUsd: input.requestedAmountUsd,
+      filledAmountUsd: 0,
+      tokenQuantity: 0,
+      priceImpactPct: 0,
+      slippagePct: 0,
+      dexFeeUsd: 0,
+      networkFeeUsd: costs.networkFeeUsd,
+      priorityFeeUsd: costs.priorityFeeUsd,
+      totalCostUsd: costs.totalCostUsd,
+      partial: false,
+      failed: true,
+      failureReason: reason,
+      solPriceUsd: input.gas.solPriceUsd,
+      solPriceSource: input.gas.solPriceSource,
+    },
+  };
+}
+
 export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
   const {
     side,
@@ -89,6 +135,23 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
     forceFailReason,
   } = input;
 
+  // Fail closed when SOL/USD is missing/stale — do not invent a price
+  if (
+    !gas.usable ||
+    gas.solPriceUsd == null ||
+    !Number.isFinite(gas.solPriceUsd) ||
+    gas.solPriceUsd <= 0 ||
+    gas.solPriceStale
+  ) {
+    return failedResult(
+      input,
+      'SOL/USD price unavailable or stale — cannot price network fees; trade blocked',
+      false,
+      0,
+      0,
+    );
+  }
+
   const networkFeeUsd = lamportsToUsd(gas.baseFeeLamports, gas.solPriceUsd);
   const priorityFeeUsd = lamportsToUsd(
     priorityFeeLamports || gas.priorityFeeLamports,
@@ -101,71 +164,26 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
       ? quote.quoteReserve
       : liquidityUsd / 2;
 
-  // Untradeable / zero liquidity
   if (liquidityUsd <= 0 || midPriceUsd <= 0 || !Number.isFinite(midPriceUsd)) {
-    const costs: CostBreakdown = {
-      dexFeeUsd: 0,
-      networkFeeUsd: failedTxStillChargesNetwork ? networkFeeUsd : 0,
-      priorityFeeUsd: failedTxStillChargesNetwork ? priorityFeeUsd : 0,
-      slippageCostUsd: 0,
-      priceImpactPct: 0,
-      priceImpactCostUsd: 0,
-      totalCostUsd:
-        (failedTxStillChargesNetwork ? networkFeeUsd + priorityFeeUsd : 0),
-    };
-    return {
-      costs,
-      execution: {
-        requestedPriceUsd: midPriceUsd,
-        executedPriceUsd: 0,
-        requestedAmountUsd,
-        filledAmountUsd: 0,
-        tokenQuantity: 0,
-        priceImpactPct: 0,
-        slippagePct: 0,
-        dexFeeUsd: 0,
-        networkFeeUsd: costs.networkFeeUsd,
-        priorityFeeUsd: costs.priorityFeeUsd,
-        totalCostUsd: costs.totalCostUsd,
-        partial: false,
-        failed: true,
-        failureReason: forceFailReason ?? 'Token unavailable: zero or missing liquidity',
-      },
-    };
+    return failedResult(
+      input,
+      forceFailReason ?? 'Token unavailable: zero or missing liquidity',
+      failedTxStillChargesNetwork,
+      networkFeeUsd,
+      priorityFeeUsd,
+    );
   }
 
   if (forceFail) {
-    const costs: CostBreakdown = {
-      dexFeeUsd: 0,
-      networkFeeUsd: failedTxStillChargesNetwork ? networkFeeUsd : 0,
-      priorityFeeUsd: failedTxStillChargesNetwork ? priorityFeeUsd : 0,
-      slippageCostUsd: 0,
-      priceImpactPct: 0,
-      priceImpactCostUsd: 0,
-      totalCostUsd: failedTxStillChargesNetwork ? networkFeeUsd + priorityFeeUsd : 0,
-    };
-    return {
-      costs,
-      execution: {
-        requestedPriceUsd: midPriceUsd,
-        executedPriceUsd: 0,
-        requestedAmountUsd,
-        filledAmountUsd: 0,
-        tokenQuantity: 0,
-        priceImpactPct: 0,
-        slippagePct: 0,
-        dexFeeUsd: 0,
-        networkFeeUsd: costs.networkFeeUsd,
-        priorityFeeUsd: costs.priorityFeeUsd,
-        totalCostUsd: costs.totalCostUsd,
-        partial: false,
-        failed: true,
-        failureReason: forceFailReason ?? 'Simulated execution failure',
-      },
-    };
+    return failedResult(
+      input,
+      forceFailReason ?? 'Simulated execution failure',
+      failedTxStillChargesNetwork,
+      networkFeeUsd,
+      priorityFeeUsd,
+    );
   }
 
-  // Partial fill if trade is large vs liquidity
   let fillUsd = requestedAmountUsd;
   let partial = false;
   const maxFill = liquidityUsd * 0.12;
@@ -173,35 +191,17 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
     fillUsd = Math.min(requestedAmountUsd, maxFill);
     partial = fillUsd < requestedAmountUsd;
   }
-  if (fillUsd < liquidityUsd * 0.0001 || fillUsd <= 0) {
-    const costs: CostBreakdown = {
-      dexFeeUsd: 0,
-      networkFeeUsd: failedTxStillChargesNetwork ? networkFeeUsd : 0,
-      priorityFeeUsd: failedTxStillChargesNetwork ? priorityFeeUsd : 0,
-      slippageCostUsd: 0,
-      priceImpactPct: 0,
-      priceImpactCostUsd: 0,
-      totalCostUsd: failedTxStillChargesNetwork ? networkFeeUsd + priorityFeeUsd : 0,
-    };
-    return {
-      costs,
-      execution: {
-        requestedPriceUsd: midPriceUsd,
-        executedPriceUsd: 0,
-        requestedAmountUsd,
-        filledAmountUsd: 0,
-        tokenQuantity: 0,
-        priceImpactPct: 0,
-        slippagePct: 0,
-        dexFeeUsd: 0,
-        networkFeeUsd: costs.networkFeeUsd,
-        priorityFeeUsd: costs.priorityFeeUsd,
-        totalCostUsd: costs.totalCostUsd,
-        partial: false,
-        failed: true,
-        failureReason: 'Unfillable: trade size below minimum or liquidity too low',
-      },
-    };
+  // Absolute dust floor only — do NOT scale min size with pool liquidity
+  // (that incorrectly blocked small paper trades on deep books).
+  const minFillUsd = 0.01;
+  if (fillUsd < minFillUsd || fillUsd <= 0) {
+    return failedResult(
+      input,
+      'Unfillable: trade size below minimum or liquidity too low',
+      failedTxStillChargesNetwork,
+      networkFeeUsd,
+      priorityFeeUsd,
+    );
   }
 
   const priceImpactPct = constantProductPriceImpactPct(fillUsd, quoteReserve);
@@ -223,7 +223,6 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
   const priceImpactCostUsd = fillUsd * (priceImpactPct / 100);
   const slippageCostUsd = fillUsd * (slippagePct / 100);
 
-  // Token quantity from executed price after DEX fee on notional
   const effectiveUsd = Math.max(0, fillUsd - dexFeeUsd);
   const tokenQuantity = executedPriceUsd > 0 ? effectiveUsd / executedPriceUsd : 0;
 
@@ -238,6 +237,8 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
     priceImpactPct: round(priceImpactPct, 6),
     priceImpactCostUsd: round(priceImpactCostUsd),
     totalCostUsd: round(totalCostUsd),
+    solPriceUsd: gas.solPriceUsd,
+    solPriceSource: gas.solPriceSource,
   };
 
   return {
@@ -257,6 +258,8 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
       partial,
       failed: false,
       failureReason: null,
+      solPriceUsd: gas.solPriceUsd,
+      solPriceSource: gas.solPriceSource,
     },
   };
 }
@@ -270,5 +273,7 @@ export function emptyCosts(): CostBreakdown {
     priceImpactPct: 0,
     priceImpactCostUsd: 0,
     totalCostUsd: 0,
+    solPriceUsd: null,
+    solPriceSource: null,
   };
 }

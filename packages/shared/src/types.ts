@@ -88,6 +88,9 @@ export interface CostBreakdown {
   priceImpactPct: number;
   priceImpactCostUsd: number;
   totalCostUsd: number;
+  /** SOL/USD rate used to convert lamport fees — auditable */
+  solPriceUsd: number | null;
+  solPriceSource: string | null;
 }
 
 export interface ExecutionRecord {
@@ -105,6 +108,8 @@ export interface ExecutionRecord {
   partial: boolean;
   failed: boolean;
   failureReason: string | null;
+  solPriceUsd: number | null;
+  solPriceSource: string | null;
 }
 
 export interface PaperOrderData {

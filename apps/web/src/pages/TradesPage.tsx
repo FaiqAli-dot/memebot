@@ -47,6 +47,7 @@ export function TradesPage() {
                 <th>DEX</th>
                 <th>Network</th>
                 <th>Priority</th>
+                <th>SOL/USD</th>
                 <th>Slippage</th>
                 <th>Impact</th>
                 <th></th>
@@ -65,6 +66,11 @@ export function TradesPage() {
                   <td>{money(Number(t.dex_fee_usd))}</td>
                   <td>{money(Number(t.network_fee_usd))}</td>
                   <td>{money(Number(t.priority_fee_usd))}</td>
+                  <td>
+                    {t.sol_price_usd != null
+                      ? `${money(Number(t.sol_price_usd))} (${String(t.sol_price_source ?? '—')})`
+                      : '—'}
+                  </td>
                   <td>
                     {pct(Number(t.slippage_pct))} / {money(Number(t.slippage_cost_usd))}
                   </td>
@@ -129,6 +135,12 @@ function TradeDetailBody({ detail }: { detail: Record<string, unknown> }) {
         Priority {money(Number(order.priority_fee_usd))} · Slippage {money(Number(order.slippage_cost_usd))} (
         {pct(Number(order.slippage_pct))}) · Impact {money(Number(order.price_impact_cost_usd))} (
         {pct(Number(order.price_impact_pct))})
+      </div>
+      <div>
+        SOL/USD used for fee conversion:{' '}
+        {order.sol_price_usd != null
+          ? `${money(Number(order.sol_price_usd))} via ${String(order.sol_price_source ?? '—')}`
+          : '—'}
       </div>
       {position && (
         <div className={pnlClass(Number(position.net_pnl_usd))}>

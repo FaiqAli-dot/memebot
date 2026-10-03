@@ -2,17 +2,35 @@ import type { DataMode } from '@memebot/shared';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { withRetry } from '../../utils/helpers.js';
-import type { GasFeeEstimate, GasFeeProvider, OnChainDataProvider, OnChainTokenData } from '../types.js';
+import type {
+  GasFeeEstimate,
+  GasFeeProvider,
+  OnChainDataProvider,
+  OnChainTokenData,
+  SolPriceProvider,
+} from '../types.js';
 
 /**
  * Solana RPC gas/priority fee provider.
- * Uses getRecentPrioritizationFees when available.
+ * SOL/USD comes from SolPriceProvider — never silently invents a live price.
  */
 export class SolanaRpcGasFeeProvider implements GasFeeProvider {
   readonly name = 'solana-rpc-gas';
   readonly dataMode: DataMode = 'live';
 
+  constructor(private readonly solPrice: SolPriceProvider) {}
+
   async getFeeEstimate(): Promise<GasFeeEstimate> {
+    const sol = await this.solPrice.getSolPriceUsd();
+    const solPriceUsd = sol && !sol.stale ? sol.priceUsd : sol?.priceUsd ?? null;
+    const solPriceStale = sol?.stale ?? true;
+    const usable =
+      sol != null &&
+      sol.priceUsd > 0 &&
+      Number.isFinite(sol.priceUsd) &&
+      !sol.stale;
+
+    let priorityFeeLamports = env.DEFAULT_PRIORITY_FEE_LAMPORTS;
     try {
       const body = {
         jsonrpc: '2.0',
@@ -46,28 +64,31 @@ export class SolanaRpcGasFeeProvider implements GasFeeProvider {
         .map((r) => r.prioritizationFee)
         .filter((n) => Number.isFinite(n) && n >= 0)
         .sort((a, b) => a - b);
-      const median =
-        fees.length === 0
-          ? env.DEFAULT_PRIORITY_FEE_LAMPORTS
-          : fees[Math.floor(fees.length / 2)]!;
-
-      return {
-        chain: 'solana',
-        baseFeeLamports: 5000, // Solana signature fee ~5000 lamports
-        priorityFeeLamports: Math.max(median, 1),
-        solPriceUsd: env.DEFAULT_SOL_PRICE_USD,
-        observedAt: new Date(),
-      };
+      if (fees.length > 0) {
+        priorityFeeLamports = Math.max(fees[Math.floor(fees.length / 2)]!, 1);
+      }
     } catch (err) {
-      logger.error({ err }, 'Falling back to configured priority fee');
-      return {
-        chain: 'solana',
-        baseFeeLamports: 5000,
-        priorityFeeLamports: env.DEFAULT_PRIORITY_FEE_LAMPORTS,
-        solPriceUsd: env.DEFAULT_SOL_PRICE_USD,
-        observedAt: new Date(),
-      };
+      logger.error({ err }, 'Using configured priority fee lamports (RPC unavailable)');
     }
+
+    if (!usable) {
+      logger.warn(
+        { solPriceUsd, solPriceStale, source: sol?.source ?? null },
+        'SOL/USD unavailable or stale — fee estimate not usable for new paper trades',
+      );
+    }
+
+    return {
+      chain: 'solana',
+      baseFeeLamports: 5000,
+      priorityFeeLamports,
+      solPriceUsd: usable ? solPriceUsd : null,
+      solPriceSource: sol?.source ?? null,
+      solPriceObservedAt: sol?.observedAt ?? null,
+      solPriceStale: !usable,
+      usable,
+      observedAt: new Date(),
+    };
   }
 }
 

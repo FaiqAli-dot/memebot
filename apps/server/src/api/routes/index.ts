@@ -46,6 +46,29 @@ apiRouter.get('/meta', (_req, res) => {
   res.json(meta());
 });
 
+apiRouter.get('/fees/sol-price', async (_req, res, next) => {
+  try {
+    const { createProviders } = await import('../../providers/index.js');
+    const providers = createProviders();
+    const quote = await providers.solPrice.getSolPriceUsd();
+    const gas = await providers.gasFee.getFeeEstimate();
+    res.json({
+      solPriceUsd: quote?.priceUsd ?? null,
+      source: quote?.source ?? null,
+      observedAt: quote?.observedAt?.toISOString() ?? null,
+      stale: quote?.stale ?? true,
+      usable: gas.usable,
+      dataMode: meta().dataMode,
+      note:
+        meta().dataMode === 'demo'
+          ? 'DEMO DATA — deterministic SOL/USD for fee conversion (not a live market price).'
+          : 'Live SOL/USD from DexScreener (primary) with CoinGecko fallback. Stale/unavailable blocks new paper trades.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 apiRouter.get('/portfolio', async (_req, res, next) => {
   try {
     await ensureDefaultPortfolio();

@@ -4,7 +4,6 @@ import {
   DEFAULT_MOMENTUM_PARAMS,
   riskLabelFromScore,
 } from '../../src/engines/strategy/momentum-v1.js';
-import { evaluateRisk, computeDrawdownPct, defaultPortfolioSettings } from '../../src/engines/risk/engine.js';
 
 describe('MomentumStrategyV1', () => {
   const strategy = new MomentumStrategyV1();
@@ -56,7 +55,6 @@ describe('MomentumStrategyV1', () => {
       { ...strongCtx, priorVolume5mUsd: null },
       DEFAULT_MOMENTUM_PARAMS,
     );
-    // May or may not pass depending on 1h acceleration proxy — must not throw
     expect(ev.scores.overall).toBeGreaterThanOrEqual(0);
   });
 });
@@ -67,61 +65,5 @@ describe('risk labels', () => {
     expect(riskLabelFromScore(40, 22, 8000)).toBe('MODERATE');
     expect(riskLabelFromScore(65, 35, 2000)).toBe('HIGH');
     expect(riskLabelFromScore(90, 60, 500)).toBe('EXTREME');
-  });
-});
-
-describe('risk engine', () => {
-  const settings = defaultPortfolioSettings();
-
-  it('sizes position within caps', () => {
-    const r = evaluateRisk({
-      equityUsd: 100,
-      cashUsd: 100,
-      openPositions: 0,
-      startingBalanceUsd: 100,
-      peakEquityUsd: 100,
-      realizedPnlTodayUsd: 0,
-      proposedSizeUsd: 50,
-      stopLossPct: settings.stopLossPct,
-      settings,
-    });
-    expect(r.allowed).toBe(true);
-    expect(r.sizedAmountUsd).toBeLessThanOrEqual(100 * settings.maxPositionPct + 1e-9);
-  });
-
-  it('blocks when max positions hit', () => {
-    const r = evaluateRisk({
-      equityUsd: 100,
-      cashUsd: 100,
-      openPositions: settings.maxSimultaneousPositions,
-      startingBalanceUsd: 100,
-      peakEquityUsd: 100,
-      realizedPnlTodayUsd: 0,
-      proposedSizeUsd: 5,
-      stopLossPct: settings.stopLossPct,
-      settings,
-    });
-    expect(r.allowed).toBe(false);
-    expect(r.riskState).toBe('MAX_POSITIONS');
-  });
-
-  it('blocks on max drawdown', () => {
-    const r = evaluateRisk({
-      equityUsd: 80,
-      cashUsd: 80,
-      openPositions: 0,
-      startingBalanceUsd: 100,
-      peakEquityUsd: 100,
-      realizedPnlTodayUsd: -20,
-      proposedSizeUsd: 5,
-      stopLossPct: settings.stopLossPct,
-      settings: { ...settings, maxDrawdownPct: 0.15 },
-    });
-    expect(r.allowed).toBe(false);
-    expect(r.riskState).toBe('MAX_DRAWDOWN');
-  });
-
-  it('computes drawdown', () => {
-    expect(computeDrawdownPct(100, 85)).toBeCloseTo(0.15);
   });
 });

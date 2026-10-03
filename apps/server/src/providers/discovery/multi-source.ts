@@ -1,18 +1,25 @@
 /**
  * Multi-source token discovery. DexScreener boosts are labeled PAID_BOOST — not organic.
  * Strategy must not know data origin; origin is stored on the token.
+ *
+ * Sources fail independently — one broken feed never stops the others.
  */
 import type { DataMode, DiscoverySource } from '@memebot/shared';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import type { DiscoveredToken, TokenDiscoveryProvider } from '../types.js';
+import { MeteoraDbcDiscoveryProvider } from './meteora-dbc.js';
+import { recordSourceFailure, recordSourceSuccess } from '../../intelligence/source-health.js';
 
 export interface EnrichedDiscoveredToken extends DiscoveredToken {
   discoverySource: DiscoverySource;
+  /** All sources that contributed in this poll merge (dedup helper). */
+  allDiscoverySources?: DiscoverySource[];
   poolAddress?: string | null;
   quoteToken?: string | null;
   initialLiquidityUsd?: number | null;
   creatorWallet?: string | null;
+  /** Actual trading venue when determinable (separate from discoverySource). */
   dexVenue?: string | null;
   firstLiquidityAt?: Date | null;
   migrationAt?: Date | null;
@@ -28,6 +35,28 @@ export interface StreamTokenDiscoveryProvider {
 
 function isSolAddress(addr: string): boolean {
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
+}
+
+/** Infer venue from GeckoTerminal pool name / dex id when present. */
+export function inferGeckoVenue(opts: {
+  name?: string | null;
+  dexId?: string | null;
+  address?: string | null;
+}): string {
+  const dex = (opts.dexId ?? '').toLowerCase();
+  const name = (opts.name ?? '').toLowerCase();
+  if (dex.includes('meteora') || name.includes('meteora')) {
+    if (name.includes('dbc') || dex.includes('dbc') || dex.includes('dynamic-bonding')) {
+      return 'meteora_dbc';
+    }
+    if (dex.includes('damm') || name.includes('damm')) return 'meteora_damm';
+    return 'meteora';
+  }
+  if (dex.includes('raydium') || name.includes('raydium')) return 'raydium';
+  if (dex.includes('orca') || name.includes('orca')) return 'orca';
+  if (dex.includes('pump') || name.includes('pump')) return 'pump';
+  if (dex) return dex.replace(/[^a-z0-9_.-]+/g, '_').slice(0, 32);
+  return 'unknown';
 }
 
 /** Wrap legacy discoverRecentTokens as subscribe/getRecentTokens. */
@@ -88,7 +117,7 @@ export class DexScreenerBoostDiscoveryProvider implements StreamTokenDiscoveryPr
         }));
     } catch (err) {
       logger.warn({ err }, 'DexScreener boost discovery failed');
-      return [];
+      throw err;
     }
   }
 }
@@ -128,7 +157,7 @@ export class DexScreenerNewPairDiscoveryProvider implements StreamTokenDiscovery
         }));
     } catch (err) {
       logger.warn({ err }, 'DexScreener new pair discovery failed');
-      return [];
+      throw err;
     }
   }
 }
@@ -158,9 +187,11 @@ export class GeckoNewPoolDiscoveryProvider implements StreamTokenDiscoveryProvid
             base_token_price_usd?: string;
             reserve_in_usd?: string;
             pool_created_at?: string;
+            dex_id?: string;
           };
           relationships?: {
             base_token?: { data?: { id?: string } };
+            dex?: { data?: { id?: string } };
           };
         }>;
       };
@@ -173,6 +204,15 @@ export class GeckoNewPoolDiscoveryProvider implements StreamTokenDiscoveryProvid
         const created = row.attributes?.pool_created_at
           ? new Date(row.attributes.pool_created_at)
           : null;
+        const dexId =
+          row.attributes?.dex_id ??
+          row.relationships?.dex?.data?.id?.replace(/^solana_/i, '') ??
+          null;
+        const venue = inferGeckoVenue({
+          name: row.attributes?.name,
+          dexId,
+          address: pool,
+        });
         out.push({
           chain: 'solana',
           address,
@@ -186,14 +226,18 @@ export class GeckoNewPoolDiscoveryProvider implements StreamTokenDiscoveryProvid
             ? Number(row.attributes.reserve_in_usd)
             : null,
           firstLiquidityAt: created,
-          dexVenue: 'unknown',
-          metadata: { gecko: true },
+          dexVenue: venue,
+          metadata: {
+            gecko: true,
+            geckoDexId: dexId,
+            launchMechanism: venue.startsWith('meteora') ? venue : null,
+          },
         });
       }
       return out.slice(0, 20);
     } catch (err) {
       logger.warn({ err }, 'Gecko new pool discovery failed');
-      return [];
+      throw err;
     }
   }
 }
@@ -238,8 +282,30 @@ export class DemoMultiDiscoveryProvider implements StreamTokenDiscoveryProvider 
         dexVenue: 'pump',
         metadata: { pumpStyle: true },
       },
+      {
+        chain: 'solana',
+        // Demo-only fixture shaped like a Meteora DBC pre-migration mint (NOT a real SPEC hardcode)
+        address: 'DemoMeteoraDbc11111111111111111111111111',
+        symbol: 'MDBC',
+        name: 'Demo Meteora DBC',
+        decimals: 6,
+        createdAt: new Date(now - 2 * 60_000),
+        discoverySource: 'METEORA_DBC',
+        poolAddress: 'DemoMeteoraDbcPool11111111111111111111',
+        quoteToken: 'So11111111111111111111111111111111111111112',
+        initialLiquidityUsd: 8_500,
+        firstLiquidityAt: new Date(now - 2 * 60_000),
+        creatorWallet: 'DemoMeteoraCreator1111111111111111111',
+        dexVenue: 'meteora_dbc',
+        metadata: {
+          meteoraDbc: true,
+          launchMechanism: 'meteora_dbc',
+          dbcStatus: 'PRE_BONDING_CURVE',
+          migrationStatus: 'NOT_MIGRATED',
+          preMigration: true,
+        },
+      },
     ];
-    // Also include classic demo tokens as DEMO_SYNTHETIC
     const { DemoTokenDiscoveryProvider } = await import('../demo/index.js');
     const legacy = new DemoTokenDiscoveryProvider();
     const base = await legacy.discoverRecentTokens(10);
@@ -263,41 +329,76 @@ export class AggregatedDiscoveryProvider implements StreamTokenDiscoveryProvider
   }
 
   async subscribe(): Promise<void> {
-    await Promise.all(this.providers.map((p) => p.subscribe()));
+    await Promise.all(
+      this.providers.map(async (p) => {
+        try {
+          await p.subscribe();
+        } catch (err) {
+          logger.warn({ err, provider: p.name }, 'Discovery subscribe failed');
+          await recordSourceFailure(p.name, err).catch(() => undefined);
+        }
+      }),
+    );
   }
 
   async getRecentTokens(): Promise<EnrichedDiscoveredToken[]> {
     const batches = await Promise.all(
       this.providers.map(async (p) => {
         try {
-          return await p.getRecentTokens();
+          const tokens = await p.getRecentTokens();
+          await recordSourceSuccess(p.name, tokens.length).catch(() => undefined);
+          return tokens;
         } catch (err) {
           logger.warn({ err, provider: p.name }, 'Discovery provider failed');
-          return [];
+          await recordSourceFailure(p.name, err).catch(() => undefined);
+          return [] as EnrichedDiscoveredToken[];
         }
       }),
     );
+
     const byAddr = new Map<string, EnrichedDiscoveredToken>();
     for (const batch of batches) {
       for (const t of batch) {
         const key = `${t.chain}:${t.address}`;
         const existing = byAddr.get(key);
-        // Prefer organic / pool sources over paid boosts when merging
         if (!existing) {
-          byAddr.set(key, t);
-        } else if (
-          existing.discoverySource === 'DEXSCREENER_BOOST' &&
-          t.discoverySource !== 'DEXSCREENER_BOOST'
-        ) {
           byAddr.set(key, {
             ...t,
-            metadata: {
-              ...t.metadata,
-              alsoBoosted: true,
-              boostSource: existing.discoverySource,
-            },
+            allDiscoverySources: [t.discoverySource],
           });
+          continue;
         }
+        const sources = [
+          ...new Set([
+            ...(existing.allDiscoverySources ?? [existing.discoverySource]),
+            t.discoverySource,
+          ]),
+        ];
+        // Prefer organic / pool / DBC sources over paid boosts when merging primary fields
+        const preferNew =
+          existing.discoverySource === 'DEXSCREENER_BOOST' &&
+          t.discoverySource !== 'DEXSCREENER_BOOST';
+        const preferVenue =
+          (!existing.dexVenue || existing.dexVenue === 'unknown') &&
+          t.dexVenue &&
+          t.dexVenue !== 'unknown';
+        const base = preferNew ? t : existing;
+        byAddr.set(key, {
+          ...base,
+          discoverySource: preferNew ? t.discoverySource : existing.discoverySource,
+          allDiscoverySources: sources,
+          dexVenue: preferVenue ? t.dexVenue : base.dexVenue,
+          poolAddress: base.poolAddress ?? t.poolAddress,
+          creatorWallet: base.creatorWallet ?? t.creatorWallet,
+          metadata: {
+            ...existing.metadata,
+            ...t.metadata,
+            allDiscoverySources: sources,
+            alsoBoosted:
+              sources.includes('DEXSCREENER_BOOST') &&
+              sources.some((s) => s !== 'DEXSCREENER_BOOST'),
+          },
+        });
       }
     }
     return [...byAddr.values()];
@@ -310,9 +411,13 @@ export function createDiscoveryProviders(
   if (dataMode === 'demo') {
     return new DemoMultiDiscoveryProvider();
   }
-  return new AggregatedDiscoveryProvider([
+  const providers: StreamTokenDiscoveryProvider[] = [
     new DexScreenerBoostDiscoveryProvider(),
     new DexScreenerNewPairDiscoveryProvider(),
     new GeckoNewPoolDiscoveryProvider(),
-  ]);
+  ];
+  if (env.METEORA_DBC_ENABLED) {
+    providers.push(new MeteoraDbcDiscoveryProvider());
+  }
+  return new AggregatedDiscoveryProvider(providers);
 }

@@ -17,6 +17,8 @@ export type JobName =
   | 'lifecycle'
   | 'opportunity_outcomes'
   | 'learning'
+  | 'outcome_checkpoints'
+  | 'storage_monitor'
   | 'retention';
 
 interface Job {
@@ -84,6 +86,8 @@ export function defaultIntervals(): Record<JobName, number> {
     lifecycle: env.JOB_LIFECYCLE_INTERVAL_MS,
     opportunity_outcomes: env.JOB_OPPORTUNITY_INTERVAL_MS,
     learning: 30_000,
+    outcome_checkpoints: env.JOB_OUTCOME_CHECKPOINTS_INTERVAL_MS,
+    storage_monitor: env.JOB_STORAGE_MONITOR_INTERVAL_MS,
     retention: 15 * 60_000,
   };
 }

@@ -64,6 +64,33 @@ const envSchema = z.object({
   PUMPFUN_API_BASE_URL: z.string().default('https://frontend-api.pump.fun'),
   BIRDEYE_API_KEY: z.string().optional().default(''),
   BIRDEYE_BASE_URL: z.string().default('https://public-api.birdeye.so'),
+  /** Meteora DBC discovery (keyless public RPC + optional datapi). */
+  METEORA_DBC_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  METEORA_DBC_DATAPI_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  METEORA_DBC_DATAPI_BASE_URL: z.string().default('https://dbc.datapi.meteora.ag'),
+  METEORA_DBC_REALTIME_ENABLED: z
+    .string()
+    .transform((v) => v === 'true' || v === '1')
+    .default('false'),
+  METEORA_DBC_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(25),
+  METEORA_DBC_TX_FETCH_LIMIT: z.coerce.number().int().positive().default(8),
+  METEORA_DBC_MAX_PER_POLL: z.coerce.number().int().positive().default(20),
+  METEORA_DBC_DATAPI_PAGE_SIZE: z.coerce.number().int().positive().default(40),
+  METEORA_DBC_DATAPI_MAX_AGE_HOURS: z.coerce.number().positive().default(48),
+  METEORA_DBC_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(12_000),
+  /** Optional override; empty = use SOLANA_RPC_URL (keyless public OK). */
+  METEORA_DBC_RPC_URL: z.string().optional().default(''),
+  JOB_OUTCOME_CHECKPOINTS_INTERVAL_MS: z.coerce.number().default(60_000),
+  JOB_STORAGE_MONITOR_INTERVAL_MS: z.coerce.number().default(30 * 60_000),
+  /** Soft storage budget (bytes) for Railway Free — triggers aggressive raw prune. */
+  STORAGE_SOFT_LIMIT_BYTES: z.coerce.number().int().positive().default(450_000_000),
+
   DEFAULT_PRIORITY_FEE_LAMPORTS: z.coerce.number().default(5000),
   DEFAULT_JITO_TIP_LAMPORTS: z.coerce.number().default(10_000),
   /** Demo-mode deterministic SOL/USD only — never used as a silent live fallback for trading */
@@ -170,10 +197,14 @@ const envSchema = z.object({
     .string()
     .transform((v) => v !== 'false')
     .default('true'),
-  /** High-frequency raw tables (snapshots, trade events) are pruned past this age; each token's latest row is kept */
-  RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(3),
+  /**
+   * High-frequency raw tables (snapshots, trade events, raw feature observations)
+   * are pruned past this age; each token's latest market/liquidity/holder row is kept.
+   * Spec default: 72h. Lower on Railway Free if storage pressure rises.
+   */
+  RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(72),
   /** Bot log and missed-opportunity rows are pruned past this age */
-  EVENT_RETENTION_DAYS: z.coerce.number().positive().default(3),
+  EVENT_RETENTION_DAYS: z.coerce.number().positive().default(7),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),

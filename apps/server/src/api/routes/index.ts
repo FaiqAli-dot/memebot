@@ -408,6 +408,91 @@ apiRouter.get('/missed-opportunities', async (_req, res, next) => {
   }
 });
 
+apiRouter.get('/intelligence', async (_req, res, next) => {
+  try {
+    const { getIntelligenceDashboard } = await import('../../intelligence/query.js');
+    res.json(await getIntelligenceDashboard());
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/intelligence/tokens', async (req, res, next) => {
+  try {
+    const { listIntelligenceTokens } = await import('../../intelligence/query.js');
+    const q = req.query;
+    const num = (v: unknown) =>
+      v != null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined;
+    const result = await listIntelligenceTokens({
+      q: typeof q.q === 'string' ? q.q : undefined,
+      discoverySource: typeof q.discoverySource === 'string' ? q.discoverySource : undefined,
+      venue: typeof q.venue === 'string' ? q.venue : undefined,
+      status: typeof q.status === 'string' ? q.status : undefined,
+      rejectionReason: typeof q.rejectionReason === 'string' ? q.rejectionReason : undefined,
+      traded:
+        q.traded === 'yes' || q.traded === 'no' || q.traded === 'all'
+          ? q.traded
+          : 'all',
+      signalGenerated:
+        q.signalGenerated === 'yes' || q.signalGenerated === 'no' || q.signalGenerated === 'all'
+          ? q.signalGenerated
+          : 'all',
+      minLiquidity: num(q.minLiquidity),
+      maxLiquidity: num(q.maxLiquidity),
+      minMarketCap: num(q.minMarketCap),
+      maxMarketCap: num(q.maxMarketCap),
+      from: typeof q.from === 'string' ? q.from : undefined,
+      to: typeof q.to === 'string' ? q.to : undefined,
+      limit: num(q.limit),
+      offset: num(q.offset),
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/intelligence/tokens/:id', async (req, res, next) => {
+  try {
+    const { getIntelligenceTokenDetail } = await import('../../intelligence/query.js');
+    const detail = await getIntelligenceTokenDetail(String(req.params.id));
+    if (!detail) {
+      res.status(404).json({ error: 'Token not found' });
+      return;
+    }
+    res.json(detail);
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/intelligence/storage', async (_req, res, next) => {
+  try {
+    const { getStorageMonitor } = await import('../../intelligence/storage.js');
+    res.json(await getStorageMonitor());
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/intelligence/sources', async (_req, res, next) => {
+  try {
+    const { listSourceHealth } = await import('../../intelligence/source-health.js');
+    res.json({ sources: await listSourceHealth() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/intelligence/missed', async (_req, res, next) => {
+  try {
+    const { getMissedOpportunityAnalysis } = await import('../../intelligence/query.js');
+    res.json(await getMissedOpportunityAnalysis());
+  } catch (err) {
+    next(err);
+  }
+});
+
 apiRouter.get('/regimes', async (_req, res, next) => {
   try {
     res.json({ rows: await getRegimeHistory() });

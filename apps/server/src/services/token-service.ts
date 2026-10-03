@@ -19,12 +19,39 @@ export async function upsertDiscoveredToken(
   const name = sanitizeString(token.name, 64) || symbol;
   const enriched = token as EnrichedDiscoveredToken;
   const discoverySource = enriched.discoverySource ?? 'UNKNOWN';
+  const allSources = [
+    ...new Set([
+      ...(enriched.allDiscoverySources ?? []),
+      discoverySource,
+    ]),
+  ];
+  const launchMechanism =
+    typeof enriched.metadata?.launchMechanism === 'string'
+      ? enriched.metadata.launchMechanism
+      : discoverySource === 'METEORA_DBC'
+        ? 'meteora_dbc'
+        : null;
+  const dbcStatus =
+    typeof enriched.metadata?.dbcStatus === 'string' ? enriched.metadata.dbcStatus : null;
+  const migrationStatus =
+    typeof enriched.metadata?.migrationStatus === 'string'
+      ? enriched.metadata.migrationStatus
+      : null;
+
   const { rows } = await query<{ id: string }>(
     `INSERT INTO tokens (
       chain, address, symbol, name, decimals, created_at_onchain, data_mode, metadata,
-      discovery_source, first_observed_at, migration_at, first_liquidity_at,
-      pool_address, quote_token, initial_liquidity_usd, creator_wallet, dex_venue
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15,$16)
+      discovery_source, discovery_sources, first_observed_at, last_discovered_at,
+      migration_at, first_liquidity_at,
+      pool_address, quote_token, initial_liquidity_usd, creator_wallet, dex_venue,
+      launch_mechanism, dbc_status, migration_status, dbc_pool_address, intelligence_status
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,
+      $9,$10::jsonb,NOW(),NOW(),
+      $11,$12,
+      $13,$14,$15,$16,$17,
+      $18,$19,$20,$21,'DISCOVERED'
+    )
      ON CONFLICT (chain, address, data_mode)
      DO UPDATE SET
        symbol = EXCLUDED.symbol,
@@ -36,11 +63,27 @@ export async function upsertDiscoveredToken(
            THEN EXCLUDED.discovery_source
          ELSE tokens.discovery_source
        END,
+       discovery_sources = (
+         SELECT COALESCE(jsonb_agg(DISTINCT s), '[]'::jsonb)
+         FROM jsonb_array_elements_text(
+           COALESCE(tokens.discovery_sources, '[]'::jsonb) || EXCLUDED.discovery_sources
+         ) AS s
+       ),
+       last_discovered_at = NOW(),
        pool_address = COALESCE(tokens.pool_address, EXCLUDED.pool_address),
        first_liquidity_at = COALESCE(tokens.first_liquidity_at, EXCLUDED.first_liquidity_at),
        initial_liquidity_usd = COALESCE(tokens.initial_liquidity_usd, EXCLUDED.initial_liquidity_usd),
        creator_wallet = COALESCE(tokens.creator_wallet, EXCLUDED.creator_wallet),
-       dex_venue = COALESCE(tokens.dex_venue, EXCLUDED.dex_venue)
+       dex_venue = CASE
+         WHEN tokens.dex_venue IS NULL OR tokens.dex_venue = 'unknown' THEN EXCLUDED.dex_venue
+         WHEN EXCLUDED.dex_venue = 'meteora_damm' THEN EXCLUDED.dex_venue
+         ELSE tokens.dex_venue
+       END,
+       launch_mechanism = COALESCE(tokens.launch_mechanism, EXCLUDED.launch_mechanism),
+       dbc_status = COALESCE(EXCLUDED.dbc_status, tokens.dbc_status),
+       migration_status = COALESCE(EXCLUDED.migration_status, tokens.migration_status),
+       dbc_pool_address = COALESCE(tokens.dbc_pool_address, EXCLUDED.dbc_pool_address),
+       migration_at = COALESCE(tokens.migration_at, EXCLUDED.migration_at)
      RETURNING id`,
     [
       token.chain,
@@ -52,6 +95,7 @@ export async function upsertDiscoveredToken(
       dataMode,
       JSON.stringify(token.metadata ?? {}),
       discoverySource,
+      JSON.stringify(allSources),
       enriched.migrationAt ?? null,
       enriched.firstLiquidityAt ?? null,
       enriched.poolAddress ?? null,
@@ -59,6 +103,10 @@ export async function upsertDiscoveredToken(
       enriched.initialLiquidityUsd ?? null,
       enriched.creatorWallet ?? null,
       enriched.dexVenue ?? null,
+      launchMechanism,
+      dbcStatus,
+      migrationStatus,
+      discoverySource === 'METEORA_DBC' ? enriched.poolAddress ?? null : null,
     ],
   );
   return rows[0]?.id ?? null;

@@ -24,7 +24,24 @@ async function capWal(maxWalSize: string): Promise<void> {
   }
 }
 
+/** Hosted Postgres can still be starting or recovering when the app boots. */
+async function waitForDatabase(timeoutMs = 180_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await query('SELECT 1');
+      return;
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      const e = err as { code?: string; message?: string };
+      logger.warn({ attempt, reason: e.message || e.code }, 'Database not ready; retrying in 5s');
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+  }
+}
+
 async function main(): Promise<void> {
+  await waitForDatabase();
   await migrate();
   if (env.DB_MAX_WAL_SIZE) await capWal(env.DB_MAX_WAL_SIZE);
   await closePool();

@@ -12,6 +12,8 @@ import { AnalyticsPage } from './pages/AnalyticsPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TokenDetailPage } from './pages/TokenDetailPage';
+import { ShadowPage } from './pages/ShadowPage';
+import { LabPage } from './pages/LabPage';
 
 const links = [
   ['/', 'Dashboard'],
@@ -19,6 +21,8 @@ const links = [
   ['/live', 'Live'],
   ['/positions', 'Positions'],
   ['/trades', 'Trades'],
+  ['/shadow', 'Shadow'],
+  ['/lab', 'Lab'],
   ['/strategies', 'Strategies'],
   ['/analytics', 'Analytics'],
   ['/reports', 'Reports'],
@@ -60,6 +64,7 @@ export function App() {
           <span className={`badge ${botStatus === 'RUNNING' ? 'run' : 'pause'}`}>
             {botStatus}
           </span>
+          <span className="badge">PAPER ONLY</span>
           <span className="badge">{connected ? 'LIVE WS' : 'WS…'}</span>
         </div>
         <nav className="nav">
@@ -84,6 +89,8 @@ export function App() {
           <Route path="/live" element={<LivePage />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/trades" element={<TradesPage />} />
+          <Route path="/shadow" element={<ShadowPage />} />
+          <Route path="/lab" element={<LabPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/reports" element={<ReportsPage />} />

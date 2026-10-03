@@ -29,6 +29,10 @@ import {
   getAnalytics,
   getStrategyLab,
   getTokenDetail,
+  getShadowTrades,
+  getMissedOpportunities,
+  getRegimeHistory,
+  getSystemHealth,
   meta,
 } from '../../services/query-service.js';
 import { logBotEvent } from '../../services/token-service.js';
@@ -40,6 +44,10 @@ import {
   listReports,
   rollbackReport,
 } from '../../services/report-service.js';
+import { setKillSwitch } from '../../monitoring/kill-switch.js';
+import { createStrategyCatalog } from '../../strategies/catalog.js';
+import { DEFAULT_CONFIG_ENTRIES } from '../../domain/config-registry.js';
+import { buildWalkForwardPlan } from '../../backtest/walk-forward.js';
 
 export const apiRouter = Router();
 
@@ -49,8 +57,12 @@ function portfolioId(): string {
   return env.DEFAULT_PORTFOLIO_ID;
 }
 
-apiRouter.get('/health', (_req, res) => {
-  res.json({ ok: true, dataMode: meta().dataMode });
+apiRouter.get('/health', async (_req, res, next) => {
+  try {
+    res.json({ ok: true, ...(await getSystemHealth()) });
+  } catch (err) {
+    next(err);
+  }
 });
 
 apiRouter.get('/meta', (_req, res) => {
@@ -338,5 +350,87 @@ apiRouter.post('/reports/:id/rollback', async (req, res, next) => {
     res.json(await rollbackReport(reportIdSchema.parse(req.params.id)));
   } catch (err) {
     sendReportError(err, res, next);
+  }
+});
+
+apiRouter.get('/shadow-trades', async (_req, res, next) => {
+  try {
+    res.json({
+      rows: await getShadowTrades(portfolioId()),
+      note: 'Hypothetical outcomes for rejected opportunities — not real fills.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/missed-opportunities', async (_req, res, next) => {
+  try {
+    res.json({ rows: await getMissedOpportunities(portfolioId()) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/regimes', async (_req, res, next) => {
+  try {
+    res.json({ rows: await getRegimeHistory() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/strategies/catalog', (_req, res) => {
+  const catalog = createStrategyCatalog().map((s) => ({
+    id: s.id,
+    name: s.name,
+    version: s.version,
+    activeByDefault: s.activeByDefault,
+  }));
+  res.json({ strategies: catalog, note: 'Entry strategies never emit SELL.' });
+});
+
+apiRouter.get('/config', (_req, res) => {
+  res.json({ entries: DEFAULT_CONFIG_ENTRIES });
+});
+
+apiRouter.get('/experiments/walk-forward-plan', (_req, res) => {
+  const plan = buildWalkForwardPlan({ start: new Date(Date.now() - 35 * 86_400_000) });
+  res.json({
+    plan,
+    note: 'Learning must never use future data. OOS window is untouched.',
+  });
+});
+
+apiRouter.post('/bot/kill-switch', async (req, res, next) => {
+  try {
+    const body = z
+      .object({ active: z.boolean(), reason: z.string().max(64).optional() })
+      .parse(req.body);
+    await ensureDefaultPortfolio();
+    await setKillSwitch(
+      portfolioId(),
+      body.active,
+      (body.reason as 'manual_kill_switch') ?? 'manual_kill_switch',
+    );
+    const info = await getBotStatus(portfolioId());
+    publish('kill_switch', { active: body.active });
+    publish('bot_status', info);
+    res.json(info);
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/safety/:tokenId', async (req, res, next) => {
+  try {
+    const { query } = await import('../../db/client.js');
+    const { rows } = await query(
+      `SELECT * FROM safety_assessments WHERE token_id = $1 ORDER BY assessed_at DESC LIMIT 10`,
+      [req.params.tokenId],
+    );
+    res.json({ assessments: rows });
+  } catch (err) {
+    next(err);
   }
 });

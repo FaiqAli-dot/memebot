@@ -1,6 +1,11 @@
 import type { PortfolioSettings } from '@memebot/shared';
 import { DEFAULT_MOMENTUM_PARAMS } from '../strategy/momentum-v1.js';
-import { env } from '../../config/env.js';
+import { env, realismProfile } from '../../config/env.js';
+import {
+  transitionRiskState,
+  normalizeRiskState,
+  type PortfolioRiskState,
+} from '../../risk/state-machine.js';
 
 export interface RiskCheckInput {
   equityUsd: number;
@@ -12,6 +17,9 @@ export interface RiskCheckInput {
   proposedSizeUsd: number;
   stopLossPct: number;
   settings: PortfolioSettings;
+  /** Current persisted risk state (NORMAL/CAUTION/HALTED/RECOVERY) */
+  currentRiskState?: string;
+  killSwitchActive?: boolean;
 }
 
 export interface RiskCheckResult {
@@ -19,6 +27,8 @@ export interface RiskCheckResult {
   reason: string;
   riskState: string;
   sizedAmountUsd: number;
+  sizeMultiplier: number;
+  manageExisting: boolean;
 }
 
 export function defaultPortfolioSettings(): PortfolioSettings {
@@ -40,6 +50,19 @@ export function defaultPortfolioSettings(): PortfolioSettings {
     strategyParams: { ...DEFAULT_MOMENTUM_PARAMS },
     failedTxStillChargesNetwork: env.FAILED_TX_STILL_CHARGES_NETWORK,
     priorityFeeLamports: env.DEFAULT_PRIORITY_FEE_LAMPORTS,
+    allowDuplicateTokenPositions: false,
+    realismProfile,
+    killSwitchActive: false,
+    activeStrategyIds: [
+      'momentum-breakout',
+      'early-volume-expansion',
+      'liquidity-expansion',
+    ],
+    minExpectedNetValue: env.MIN_EXPECTED_NET_VALUE,
+    jitoTipLamports: env.DEFAULT_JITO_TIP_LAMPORTS,
+    recoveryDrawdownPct: env.RECOVERY_DRAWDOWN_PCT,
+    cautionDrawdownPct: env.CAUTION_DRAWDOWN_PCT,
+    maxHoldPartialExits: false,
   };
 }
 
@@ -50,25 +73,31 @@ export function evaluateRisk(input: RiskCheckInput): RiskCheckResult {
       ? (input.peakEquityUsd - input.equityUsd) / input.peakEquityUsd
       : 0;
 
-  if (drawdownPct >= settings.maxDrawdownPct) {
-    return {
-      allowed: false,
-      reason: `Max portfolio drawdown hit (${(drawdownPct * 100).toFixed(2)}%)`,
-      riskState: 'MAX_DRAWDOWN',
-      sizedAmountUsd: 0,
-    };
-  }
-
   const dailyLossPct =
     input.startingBalanceUsd > 0
       ? Math.max(0, -input.realizedPnlTodayUsd) / input.startingBalanceUsd
       : 0;
-  if (dailyLossPct >= settings.maxDailyLossPct) {
+  const dailyLossBreached = dailyLossPct >= settings.maxDailyLossPct;
+
+  const transition = transitionRiskState({
+    currentState: input.currentRiskState ?? 'NORMAL',
+    drawdownPct,
+    maxDrawdownPct: settings.maxDrawdownPct,
+    cautionDrawdownPct: settings.cautionDrawdownPct ?? env.CAUTION_DRAWDOWN_PCT,
+    recoveryDrawdownPct: settings.recoveryDrawdownPct ?? env.RECOVERY_DRAWDOWN_PCT,
+    openPositions: input.openPositions,
+    killSwitchActive: input.killSwitchActive ?? settings.killSwitchActive,
+    dailyLossBreached,
+  });
+
+  if (!transition.allowNewEntries) {
     return {
       allowed: false,
-      reason: `Max daily loss hit (${(dailyLossPct * 100).toFixed(2)}%)`,
-      riskState: 'MAX_DAILY_LOSS',
+      reason: transition.reason,
+      riskState: transition.state,
       sizedAmountUsd: 0,
+      sizeMultiplier: 0,
+      manageExisting: transition.manageExisting,
     };
   }
 
@@ -76,37 +105,46 @@ export function evaluateRisk(input: RiskCheckInput): RiskCheckResult {
     return {
       allowed: false,
       reason: `Max simultaneous positions (${settings.maxSimultaneousPositions})`,
-      riskState: 'MAX_POSITIONS',
+      riskState: transition.state,
       sizedAmountUsd: 0,
+      sizeMultiplier: transition.sizeMultiplier,
+      manageExisting: true,
     };
   }
 
   const maxByPct = input.equityUsd * settings.maxPositionPct;
-  // Risk per trade ≈ size * stopLoss
   const maxByRisk =
     settings.stopLossPct > 0
       ? (input.equityUsd * settings.maxRiskPerTradePct) / settings.stopLossPct
       : maxByPct;
 
-  let sized = Math.min(input.proposedSizeUsd, maxByPct, maxByRisk, input.cashUsd * 0.99);
+  let sized =
+    Math.min(input.proposedSizeUsd, maxByPct, maxByRisk, input.cashUsd * 0.99) *
+    transition.sizeMultiplier;
   sized = Math.max(0, sized);
 
   if (sized < 1) {
     return {
       allowed: false,
       reason: 'Insufficient cash or sized position below minimum ($1)',
-      riskState: 'INSUFFICIENT_CASH',
+      riskState: transition.state === 'NORMAL' ? 'INSUFFICIENT_CASH' : transition.state,
       sizedAmountUsd: 0,
+      sizeMultiplier: transition.sizeMultiplier,
+      manageExisting: true,
     };
   }
 
   return {
     allowed: true,
-    reason: 'Risk check passed',
-    riskState: 'OK',
+    reason: transition.reason === 'within_normal_risk' ? 'Risk check passed' : transition.reason,
+    riskState: transition.state,
     sizedAmountUsd: sized,
+    sizeMultiplier: transition.sizeMultiplier,
+    manageExisting: true,
   };
 }
+
+export { normalizeRiskState, type PortfolioRiskState };
 
 export function computeDrawdownPct(peak: number, equity: number): number {
   if (peak <= 0) return 0;

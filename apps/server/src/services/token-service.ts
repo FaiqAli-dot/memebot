@@ -3,16 +3,38 @@ import { query } from '../db/client.js';
 import { dataMode } from '../config/env.js';
 import { sanitizeString, isSolanaAddress } from '../utils/helpers.js';
 import type { DiscoveredToken, MarketQuote, OnChainTokenData } from '../providers/types.js';
+import type { EnrichedDiscoveredToken } from '../providers/discovery/multi-source.js';
 
-export async function upsertDiscoveredToken(token: DiscoveredToken): Promise<string | null> {
+export async function upsertDiscoveredToken(
+  token: DiscoveredToken | EnrichedDiscoveredToken,
+): Promise<string | null> {
   if (dataMode === 'live' && !isSolanaAddress(token.address)) return null;
   const symbol = sanitizeString(token.symbol, 32) || 'UNK';
   const name = sanitizeString(token.name, 64) || symbol;
+  const enriched = token as EnrichedDiscoveredToken;
+  const discoverySource = enriched.discoverySource ?? 'UNKNOWN';
   const { rows } = await query<{ id: string }>(
-    `INSERT INTO tokens (chain, address, symbol, name, decimals, created_at_onchain, data_mode, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO tokens (
+      chain, address, symbol, name, decimals, created_at_onchain, data_mode, metadata,
+      discovery_source, first_observed_at, migration_at, first_liquidity_at,
+      pool_address, quote_token, initial_liquidity_usd, creator_wallet, dex_venue
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15,$16)
      ON CONFLICT (chain, address, data_mode)
-     DO UPDATE SET symbol = EXCLUDED.symbol, name = EXCLUDED.name, metadata = tokens.metadata || EXCLUDED.metadata
+     DO UPDATE SET
+       symbol = EXCLUDED.symbol,
+       name = EXCLUDED.name,
+       metadata = tokens.metadata || EXCLUDED.metadata,
+       created_at_onchain = COALESCE(tokens.created_at_onchain, EXCLUDED.created_at_onchain),
+       discovery_source = CASE
+         WHEN tokens.discovery_source = 'DEXSCREENER_BOOST' AND EXCLUDED.discovery_source != 'DEXSCREENER_BOOST'
+           THEN EXCLUDED.discovery_source
+         ELSE tokens.discovery_source
+       END,
+       pool_address = COALESCE(tokens.pool_address, EXCLUDED.pool_address),
+       first_liquidity_at = COALESCE(tokens.first_liquidity_at, EXCLUDED.first_liquidity_at),
+       initial_liquidity_usd = COALESCE(tokens.initial_liquidity_usd, EXCLUDED.initial_liquidity_usd),
+       creator_wallet = COALESCE(tokens.creator_wallet, EXCLUDED.creator_wallet),
+       dex_venue = COALESCE(tokens.dex_venue, EXCLUDED.dex_venue)
      RETURNING id`,
     [
       token.chain,
@@ -23,9 +45,32 @@ export async function upsertDiscoveredToken(token: DiscoveredToken): Promise<str
       token.createdAt,
       dataMode,
       JSON.stringify(token.metadata ?? {}),
+      discoverySource,
+      enriched.migrationAt ?? null,
+      enriched.firstLiquidityAt ?? null,
+      enriched.poolAddress ?? null,
+      enriched.quoteToken ?? null,
+      enriched.initialLiquidityUsd ?? null,
+      enriched.creatorWallet ?? null,
+      enriched.dexVenue ?? null,
     ],
   );
   return rows[0]?.id ?? null;
+}
+
+/** Prefer on-chain creation / first liquidity over first-seen for age. */
+export function effectiveAgeMinutes(token: {
+  created_at_onchain: Date | null;
+  first_liquidity_at?: Date | null;
+  first_observed_at?: Date | null;
+  discovered_at: Date;
+}): number {
+  const ts =
+    token.created_at_onchain ??
+    token.first_liquidity_at ??
+    token.first_observed_at ??
+    token.discovered_at;
+  return (Date.now() - ts.getTime()) / 60_000;
 }
 
 export async function listActiveTokenIds(limit = 100): Promise<

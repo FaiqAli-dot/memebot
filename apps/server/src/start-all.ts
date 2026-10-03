@@ -6,13 +6,27 @@ import { fork, type ChildProcess } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { migrate } from './db/migrate.js';
-import { closePool } from './db/client.js';
+import { closePool, query } from './db/client.js';
+import { env } from './config/env.js';
 import { logger } from './utils/logger.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+async function capWal(maxWalSize: string): Promise<void> {
+  try {
+    await query(`ALTER SYSTEM SET max_wal_size = '${maxWalSize}'`);
+    await query(`ALTER SYSTEM SET min_wal_size = '32MB'`);
+    await query(`ALTER SYSTEM SET wal_compression = on`);
+    await query(`SELECT pg_reload_conf()`);
+    logger.info({ maxWalSize }, 'Postgres WAL capped');
+  } catch (err) {
+    logger.warn({ err }, 'Could not cap Postgres WAL (needs superuser); continuing');
+  }
+}
+
 async function main(): Promise<void> {
   await migrate();
+  if (env.DB_MAX_WAL_SIZE) await capWal(env.DB_MAX_WAL_SIZE);
   await closePool();
 
   const children: ChildProcess[] = ['index.js', 'worker.js'].map((file) => fork(join(here, file)));

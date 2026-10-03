@@ -95,6 +95,14 @@ const envSchema = z.object({
   JOB_STORAGE_MONITOR_INTERVAL_MS: z.coerce.number().default(30 * 60_000),
   /** Soft storage budget (bytes) for Railway Free — emergency prune backstop only. */
   STORAGE_SOFT_LIMIT_BYTES: z.coerce.number().int().positive().default(450_000_000),
+  /**
+   * Optional Postgres WAL cap applied at startup via ALTER SYSTEM (needs superuser, e.g. Railway).
+   * Postgres defaults to 1GB of WAL, which alone can fill a 0.5GB volume.
+   */
+  DB_MAX_WAL_SIZE: z
+    .string()
+    .regex(/^\d+(MB|GB)$/, 'e.g. 64MB')
+    .optional(),
 
   DEFAULT_PRIORITY_FEE_LAMPORTS: z.coerce.number().default(5000),
   DEFAULT_JITO_TIP_LAMPORTS: z.coerce.number().default(10_000),

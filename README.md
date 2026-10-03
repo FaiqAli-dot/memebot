@@ -165,9 +165,10 @@ npm start
    - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
    - `NODE_ENV=production`
    - delete `TEST_DATABASE_URL`, `API_PORT` and `CORS_ORIGIN` (Railway's `PORT` is used; the UI is same-origin)
+   - for the trial's 0.5GB Postgres volume: `DB_MAX_WAL_SIZE=64MB`, `RAW_DATA_RETENTION_HOURS=1`, `STORAGE_SOFT_LIMIT_BYTES=250000000`
 4. **Settings → Networking → Generate Domain**. Open it — that's the dashboard.
 
-Raw market tables are pruned to `RAW_DATA_RETENTION_HOURS` (default 3) and logs to `EVENT_RETENTION_DAYS` (default 3) so the database stays small. The trial is a one-time $5 credit for up to 30 days; when it runs out, services stop until a plan is added.
+Raw market tables are pruned to `RAW_DATA_RETENTION_HOURS` (default 3) and logs to `EVENT_RETENTION_DAYS` (default 3) so the database stays small. Postgres keeps up to 1GB of write-ahead log by default, which alone fills a 0.5GB volume; `DB_MAX_WAL_SIZE` caps it at startup. The trial is a one-time $5 credit for up to 30 days; when it runs out, services stop until a plan is added.
 
 ## Project layout
 

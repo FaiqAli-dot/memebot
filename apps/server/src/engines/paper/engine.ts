@@ -44,6 +44,17 @@ export async function executePaperBuy(opts: {
       const totalDebit = sim.execution.filledAmountUsd + sim.costs.networkFeeUsd + sim.costs.priorityFeeUsd;
       // DEX fee and slippage are embedded in executed price / fill; network fees are extra cash out
 
+      // Race-safe duplicate-position guard (DB unique index is the hard guarantee)
+      const dup = await client.query(
+        `SELECT id FROM positions
+         WHERE portfolio_id = $1 AND token_id = $2 AND status = 'OPEN'
+         FOR UPDATE`,
+        [opts.portfolioId, opts.tokenId],
+      );
+      if (dup.rows.length > 0) {
+        return { success: false, reason: 'Duplicate open position for token (blocked)' };
+      }
+
       if (sim.execution.failed) {
         const orderId = uuid();
         await client.query(
@@ -216,6 +227,10 @@ export async function executePaperBuy(opts: {
       return { success: true, positionId, orderId };
     });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('uq_positions_open_portfolio_token') || msg.includes('duplicate key')) {
+      return { success: false, reason: 'Duplicate open position for token (blocked)' };
+    }
     logger.error({ err }, 'Paper buy failed');
     return { success: false, reason: 'DB error during paper buy' };
   }

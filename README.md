@@ -1,8 +1,10 @@
 # MemeBot
 
-**Meme Coin Paper Trading & Research**
+**Meme Coin Paper Trading & Research — Reality-First Simulator**
 
 100% virtual money. No wallets, private keys, deposits, withdrawals, or real swaps. Open the site with no login and watch a paper-trading bot scan Solana meme coins, score signals, and simulate executions with fees, slippage, and price impact.
+
+**Architectural lock:** `TRADING_MODE=PAPER`, `REAL_EXECUTION_ENABLED=false`, `WALLET_SIGNING_ENABLED=false`. The app **refuses to start** if real execution or wallet signing is enabled. See `docs/PLAN.md` and `docs/RESEARCH_BRIEF.md`.
 
 ## Architecture
 
@@ -25,7 +27,7 @@ Background Worker (jobs)
 
 Provider interfaces live under `apps/server/src/providers/` (`market`, `onchain`, `token-discovery`, `fees`, `demo`). Services consume interfaces only — no scattered HTTP calls.
 
-Engines: Strategy (`MomentumStrategyV1`), Risk, Cost/Fee Simulator, Paper Trading, Portfolio, Analytics, Scanner/Signal.
+Engines / modules: multi-source discovery, safety, flow features, regime, lifecycle phases, multi-strategy framework + EV, risk state machine (NORMAL/CAUTION/HALTED/RECOVERY), execution realism profiles, shadow trades, replay/walk-forward, learning metrics, kill switch. Legacy `MomentumStrategyV1` retained for scoring bridge.
 
 ## Requirements
 

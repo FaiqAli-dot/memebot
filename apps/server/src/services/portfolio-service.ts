@@ -175,12 +175,17 @@ export async function resetPaperAccount(portfolioId: string): Promise<void> {
         total_network_cost_usd = 0,
         total_slippage_cost_usd = 0,
         total_price_impact_cost_usd = 0,
-        risk_state = 'OK',
+        risk_state = 'NORMAL',
         bot_status = 'PAUSED',
+        kill_switch_active = FALSE,
+        risk_state_changed_at = NOW(),
+        recovery_started_at = NULL,
         updated_at = NOW()
        WHERE id = $1`,
       [portfolioId, settings.startingBalanceUsd],
     );
+    await client.query(`DELETE FROM shadow_trades WHERE portfolio_id = $1`, [portfolioId]);
+    await client.query(`DELETE FROM missed_opportunities WHERE portfolio_id = $1`, [portfolioId]);
   });
 }
 

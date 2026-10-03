@@ -73,6 +73,30 @@ export const api = {
       dataMode: string;
       note: string;
     }>('/api/fees/sol-price'),
+  shadowTrades: () =>
+    request<{ rows: unknown[]; note: string }>('/api/shadow-trades'),
+  missedOpportunities: () =>
+    request<{ rows: unknown[] }>('/api/missed-opportunities'),
+  regimes: () => request<{ rows: unknown[] }>('/api/regimes'),
+  strategyCatalog: () =>
+    request<{
+      strategies: Array<{
+        id: string;
+        name: string;
+        version: string;
+        activeByDefault: boolean;
+      }>;
+      note: string;
+    }>('/api/strategies/catalog'),
+  configRegistry: () => request<{ entries: unknown[] }>('/api/config'),
+  walkForwardPlan: () =>
+    request<{ plan: unknown; note: string }>('/api/experiments/walk-forward-plan'),
+  killSwitch: (active: boolean) =>
+    request<import('@memebot/shared').BotStatusInfo>('/api/bot/kill-switch', {
+      method: 'POST',
+      body: JSON.stringify({ active }),
+    }),
+  health: () => request<Record<string, unknown>>('/api/health'),
 };
 
 export function money(n: number | null | undefined, digits = 2): string {

@@ -27,10 +27,14 @@ export function TokenDetailPage() {
   const history = (data.marketHistory as Record<string, unknown>[]) ?? [];
   const holders = data.holders as Record<string, unknown> | null;
   const signal = data.signal as Record<string, unknown> | null;
+  const safety = (data.safety as Record<string, unknown>[]) ?? [];
+  const phases = (data.phases as Record<string, unknown>[]) ?? [];
+  const timeline = (data.timeline as Record<string, unknown>[]) ?? [];
   const explanation = (signal?.explanation ?? {}) as {
     reasons?: string[];
     warnings?: string[];
   };
+  const latestSafety = safety[0];
 
   const priceData = history.map((h) => ({
     t: new Date(String(h.observed_at)).toLocaleTimeString(),
@@ -46,7 +50,8 @@ export function TokenDetailPage() {
           {String(token.symbol)} · {String(token.name)}
         </h2>
         <div style={{ color: 'var(--muted)' }}>
-          {String(token.chain)} · {String(token.address)} · mode {String(token.data_mode).toUpperCase()}
+          {String(token.chain)} · {String(token.address)} · mode {String(token.data_mode).toUpperCase()} ·
+          source {String(token.discovery_source ?? 'UNKNOWN')}
         </div>
         <div className="grid grid-4" style={{ marginTop: '0.75rem' }}>
           <KV label="Holders" value={holders?.holder_count != null ? String(holders.holder_count) : '—'} />
@@ -55,8 +60,12 @@ export function TokenDetailPage() {
             value={holders?.top_holder_pct != null ? pct(Number(holders.top_holder_pct)) : '—'}
           />
           <KV
-            label="Top 10"
-            value={holders?.top10_holder_pct != null ? pct(Number(holders.top10_holder_pct)) : '—'}
+            label="Safety"
+            value={
+              latestSafety
+                ? `${Number(latestSafety.score).toFixed(0)} · ${String(latestSafety.safety_class)}`
+                : 'UNKNOWN'
+            }
           />
           <KV
             label="Latest liquidity"
@@ -94,34 +103,94 @@ export function TokenDetailPage() {
         </div>
       </div>
 
-      <div className="panel">
-        <h3>Why this signal?</h3>
-        {signal ? (
-          <>
-            <div>
-              Model score {Number(signal.overall_score).toFixed(1)} · risk {String(signal.risk_label)} ·{' '}
-              {String(signal.strategy_name)} {String(signal.strategy_version)}
+      <div className="grid grid-2" style={{ marginBottom: '0.75rem' }}>
+        <div className="panel">
+          <h3>Why this signal?</h3>
+          {signal ? (
+            <>
+              <div>
+                Model score {Number(signal.overall_score).toFixed(1)} · risk {String(signal.risk_label)} ·{' '}
+                {String(signal.strategy_name)} {String(signal.strategy_version)}
+              </div>
+              <ul>
+                {(explanation.reasons ?? []).map((r) => (
+                  <li key={r}>{r}</li>
+                ))}
+              </ul>
+              <ul style={{ color: 'var(--warn)' }}>
+                {(explanation.warnings ?? []).map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <div style={{ color: 'var(--muted)' }}>No signal yet for this token.</div>
+          )}
+          {latestSafety ? (
+            <div style={{ marginTop: '0.75rem' }}>
+              <strong>Safety:</strong> {String(latestSafety.safety_class)} (
+              {Number(latestSafety.score).toFixed(0)})
+              <ul>
+                {((latestSafety.reasons as string[]) ?? []).map((r) => (
+                  <li key={r}>{r}</li>
+                ))}
+              </ul>
             </div>
-            <div style={{ marginTop: '0.5rem' }}>
-              Momentum {Number(signal.momentum_score).toFixed(0)} · Liquidity{' '}
-              {Number(signal.liquidity_score).toFixed(0)} · Volume {Number(signal.volume_score).toFixed(0)} ·
-              Holder {Number(signal.holder_score).toFixed(0)} · Risk {Number(signal.risk_score).toFixed(0)}
-            </div>
-            <ul>
-              {(explanation.reasons ?? []).map((r) => (
-                <li key={r}>{r}</li>
-              ))}
-            </ul>
-            <ul style={{ color: 'var(--warn)' }}>
-              {(explanation.warnings ?? []).map((w) => (
-                <li key={w}>{w}</li>
-              ))}
-            </ul>
-          </>
-        ) : (
-          <div style={{ color: 'var(--muted)' }}>No signal yet for this token.</div>
-        )}
-        <p className="disclaimer">{String(data.scoreDisclaimer ?? SCORE_DISCLAIMER)}</p>
+          ) : null}
+          <p className="disclaimer">{String(data.scoreDisclaimer ?? SCORE_DISCLAIMER)}</p>
+        </div>
+        <div className="panel">
+          <h3>Lifecycle timeline</h3>
+          <ol style={{ margin: 0, paddingLeft: '1.2rem' }}>
+            <li>
+              TOKEN CREATED:{' '}
+              {token.created_at_onchain
+                ? new Date(String(token.created_at_onchain)).toLocaleString()
+                : 'unknown'}
+            </li>
+            <li>
+              FIRST OBSERVED:{' '}
+              {token.first_observed_at || token.discovered_at
+                ? new Date(String(token.first_observed_at ?? token.discovered_at)).toLocaleString()
+                : '—'}
+            </li>
+            <li>
+              LIQUIDITY ADDED:{' '}
+              {token.first_liquidity_at
+                ? new Date(String(token.first_liquidity_at)).toLocaleString()
+                : 'unknown'}
+            </li>
+            <li>
+              FIRST TRADES:{' '}
+              {token.first_trade_at
+                ? new Date(String(token.first_trade_at)).toLocaleString()
+                : 'unknown'}
+            </li>
+            {phases.map((p, i) => (
+              <li key={i}>
+                PHASE {String(p.phase)} @ {new Date(String(p.observed_at)).toLocaleTimeString()}
+              </li>
+            ))}
+            {latestSafety ? (
+              <li>
+                SAFETY {String(latestSafety.safety_class)}
+                {latestSafety.blocked ? ' (BLOCKED)' : ''}
+              </li>
+            ) : null}
+            {signal ? (
+              <li>
+                SIGNAL {String(signal.strategy_name)} score {Number(signal.overall_score).toFixed(0)}
+              </li>
+            ) : (
+              <li>SIGNAL / PAPER ENTRY — none yet</li>
+            )}
+            {timeline.map((e, i) => (
+              <li key={`e-${i}`}>
+                {String(e.event_type)} · {String(e.source)}
+              </li>
+            ))}
+          </ol>
+        </div>
       </div>
     </div>
   );

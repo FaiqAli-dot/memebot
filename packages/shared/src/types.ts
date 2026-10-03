@@ -1,4 +1,147 @@
-import type { BotStatus, DataMode, OrderSide, OrderStatus, PositionStatus, RiskLabel } from './constants.js';
+import type {
+  BotStatus,
+  ConfidenceLevel,
+  DataMode,
+  DiscoverySource,
+  FreshnessLevel,
+  MarketRegime,
+  OrderSide,
+  OrderStatus,
+  PositionStatus,
+  RealismProfile,
+  RejectionReason,
+  RiskLabel,
+  SafetyClass,
+  TokenPhase,
+} from './constants.js';
+
+/** Every measured feature carries provenance — never invent precision. */
+export interface MeasuredValue<T> {
+  value: T | null;
+  timestamp: string | null;
+  source: string;
+  confidence: ConfidenceLevel;
+  freshness: FreshnessLevel;
+}
+
+export interface TokenLifecycleTimestamps {
+  firstObservedAt: string;
+  createdAt: string | null;
+  migrationAt: string | null;
+  firstLiquidityAt: string | null;
+  firstTradeAt: string | null;
+  firstMeaningfulVolumeAt: string | null;
+}
+
+export interface SafetyAssessment {
+  score: number;
+  safetyClass: SafetyClass;
+  blocked: boolean;
+  reasons: string[];
+  checks: Record<string, MeasuredValue<number | boolean | string>>;
+  assessedAt: string;
+  version: string;
+}
+
+export interface FlowWindowFeatures {
+  window: string;
+  buyVolumeUsd: MeasuredValue<number>;
+  sellVolumeUsd: MeasuredValue<number>;
+  totalVolumeUsd: MeasuredValue<number>;
+  netFlowUsd: MeasuredValue<number>;
+  buySellRatio: MeasuredValue<number>;
+  buyAcceleration: MeasuredValue<number>;
+  sellAcceleration: MeasuredValue<number>;
+  uniqueBuyers: MeasuredValue<number>;
+  uniqueSellers: MeasuredValue<number>;
+  newBuyers: MeasuredValue<number>;
+  repeatBuyers: MeasuredValue<number>;
+  buyerConcentration: MeasuredValue<number>;
+  sellerConcentration: MeasuredValue<number>;
+  medianTradeSizeUsd: MeasuredValue<number>;
+  avgTradeSizeUsd: MeasuredValue<number>;
+  largestTradeUsd: MeasuredValue<number>;
+  largeBuyCount: MeasuredValue<number>;
+  largeSellCount: MeasuredValue<number>;
+  whaleFlowPct: MeasuredValue<number>;
+}
+
+export interface StrategySignal {
+  action: 'BUY' | 'NO_TRADE';
+  confidence: number;
+  expectedReturn: number | null;
+  expectedLoss: number | null;
+  expectedHoldTimeSec: number | null;
+  reasons: string[];
+  strategyId: string;
+  strategyVersion: string;
+}
+
+export interface ExpectedValueEstimate {
+  grossUpside: number | null;
+  downside: number | null;
+  executionCostUsd: number | null;
+  failureProbability: number | null;
+  timeToTargetSec: number | null;
+  expectedNetValue: number | null;
+  threshold: number;
+  passes: boolean;
+  uncertainty: ConfidenceLevel;
+  reasons: string[];
+}
+
+export interface TradeJournalEntry {
+  token: string;
+  strategy: string;
+  entryReasons: string[];
+  safetyReasons: string[];
+  marketRegime: MarketRegime | null;
+  tokenPhase: TokenPhase | null;
+  features: Record<string, unknown>;
+  expectedValue: ExpectedValueEstimate | null;
+  positionSizeUsd: number;
+  estimatedCosts: Record<string, number>;
+  executionLatencyMs: number | null;
+  fillPriceUsd: number | null;
+  exitReason: string | null;
+  netPnlUsd: number | null;
+  versions: {
+    strategyVersion: string;
+    riskVersion: string;
+    executionModelVersion: string;
+    safetyVersion: string;
+  };
+}
+
+export interface ShadowTradeSummary {
+  id: string;
+  tokenId: string;
+  rejectionReason: RejectionReason;
+  hypotheticalEntryPriceUsd: number | null;
+  hypotheticalCostUsd: number | null;
+  mfePct: number | null;
+  maePct: number | null;
+  eventualReturnPct: number | null;
+  timeToPeakSec: number | null;
+  timeToFailureSec: number | null;
+  liquidityCollapsed: boolean;
+  status: string;
+  createdAt: string;
+}
+
+export interface RegimeSnapshot {
+  regime: MarketRegime;
+  solMomentum: MeasuredValue<number>;
+  solVolatility: MeasuredValue<number>;
+  memecoinActivity: MeasuredValue<number>;
+  newTokenCount: MeasuredValue<number>;
+  activeTokenCount: MeasuredValue<number>;
+  avgLiquidityUsd: MeasuredValue<number>;
+  marketBuySellPressure: MeasuredValue<number>;
+  launchSuccessRate: MeasuredValue<number>;
+  rugFailureRate: MeasuredValue<number>;
+  observedAt: string;
+}
 
 export interface TokenInfo {
   id: string;
@@ -337,6 +480,10 @@ export interface BotStatusInfo {
   currentStrategy: string;
   riskState: string;
   lastError: string | null;
+  killSwitchActive: boolean;
+  tradingMode: 'PAPER';
+  realismProfile: RealismProfile;
+  marketRegime: MarketRegime | null;
 }
 
 export interface BotEventData {
@@ -432,6 +579,16 @@ export interface ScannerRow {
   overallScore: number | null;
   lastUpdated: string;
   dataMode: DataMode;
+  discoverySource?: DiscoverySource | string | null;
+  safetyScore?: number | null;
+  safetyClass?: SafetyClass | null;
+  tokenPhase?: TokenPhase | null;
+  marketRegime?: MarketRegime | null;
+  uniqueBuyers5m?: number | null;
+  netFlow5mUsd?: number | null;
+  expectedValue?: number | null;
+  rejectionReason?: RejectionReason | string | null;
+  buySellConfidence?: ConfidenceLevel | null;
 }
 
 export type WsEventType =
@@ -444,7 +601,11 @@ export type WsEventType =
   | 'bot_event'
   | 'scanner_updated'
   | 'position_updated'
-  | 'report_generated';
+  | 'report_generated'
+  | 'shadow_trade_updated'
+  | 'regime_updated'
+  | 'kill_switch'
+  | 'safety_blocked';
 
 export interface WsMessage<T = unknown> {
   type: WsEventType;
@@ -470,6 +631,16 @@ export interface PortfolioSettings {
   strategyParams: MomentumStrategyParams;
   failedTxStillChargesNetwork: boolean;
   priorityFeeLamports: number;
+  /** Allow multiple open positions in same token (default false). */
+  allowDuplicateTokenPositions?: boolean;
+  realismProfile?: RealismProfile;
+  killSwitchActive?: boolean;
+  activeStrategyIds?: string[];
+  minExpectedNetValue?: number;
+  jitoTipLamports?: number;
+  recoveryDrawdownPct?: number;
+  cautionDrawdownPct?: number;
+  maxHoldPartialExits?: boolean;
 }
 
 export interface MomentumStrategyParams {

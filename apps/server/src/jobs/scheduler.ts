@@ -4,9 +4,13 @@ import { logger } from '../utils/logger.js';
 export type JobName =
   | 'token_discovery'
   | 'market_data'
+  | 'trade_stream'
   | 'onchain'
+  | 'safety'
+  | 'regime'
   | 'signal'
   | 'paper_execution'
+  | 'shadow'
   | 'portfolio_valuation'
   | 'analytics'
   | 'daily_report';
@@ -63,9 +67,13 @@ export function defaultIntervals(): Record<JobName, number> {
   return {
     token_discovery: env.JOB_TOKEN_DISCOVERY_INTERVAL_MS,
     market_data: env.JOB_MARKET_DATA_INTERVAL_MS,
+    trade_stream: env.JOB_TRADE_STREAM_INTERVAL_MS,
     onchain: env.JOB_ONCHAIN_INTERVAL_MS,
+    safety: env.JOB_ONCHAIN_INTERVAL_MS,
+    regime: env.JOB_REGIME_INTERVAL_MS,
     signal: env.JOB_SIGNAL_INTERVAL_MS,
     paper_execution: env.JOB_PAPER_EXECUTION_INTERVAL_MS,
+    shadow: env.JOB_SHADOW_INTERVAL_MS,
     portfolio_valuation: env.JOB_PORTFOLIO_VALUATION_INTERVAL_MS,
     analytics: env.JOB_ANALYTICS_INTERVAL_MS,
     daily_report: 60_000,

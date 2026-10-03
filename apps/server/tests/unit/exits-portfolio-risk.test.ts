@@ -204,20 +204,42 @@ describe('risk limits: drawdown and daily loss', () => {
     expect(computeDrawdownPct(100, 85)).toBeCloseTo(0.15);
   });
 
-  it('blocks on max drawdown', () => {
+  it('enters RECOVERY when flat after max drawdown (no deadlock)', () => {
     const r = evaluateRisk({
       equityUsd: 80,
       cashUsd: 80,
       openPositions: 0,
       startingBalanceUsd: 100,
       peakEquityUsd: 100,
-      realizedPnlTodayUsd: -20,
+      // Keep daily loss under the 5% cap so only drawdown state machine applies
+      realizedPnlTodayUsd: -2,
       proposedSizeUsd: 5,
       stopLossPct: settings.stopLossPct,
       settings: { ...settings, maxDrawdownPct: 0.15 },
+      currentRiskState: 'HALTED',
+    });
+    // Flat + breached DD → RECOVERY with reduced size (not permanent deadlock)
+    expect(r.riskState).toBe('RECOVERY');
+    expect(r.allowed).toBe(true);
+    expect(r.sizeMultiplier).toBeLessThan(1);
+  });
+
+  it('halts new entries on max drawdown while positions remain open', () => {
+    const r = evaluateRisk({
+      equityUsd: 80,
+      cashUsd: 40,
+      openPositions: 2,
+      startingBalanceUsd: 100,
+      peakEquityUsd: 100,
+      realizedPnlTodayUsd: -2,
+      proposedSizeUsd: 5,
+      stopLossPct: settings.stopLossPct,
+      settings: { ...settings, maxDrawdownPct: 0.15 },
+      currentRiskState: 'NORMAL',
     });
     expect(r.allowed).toBe(false);
-    expect(r.riskState).toBe('MAX_DRAWDOWN');
+    expect(r.riskState).toBe('HALTED');
+    expect(r.manageExisting).toBe(true);
   });
 
   it('blocks on max daily loss', () => {
@@ -233,7 +255,7 @@ describe('risk limits: drawdown and daily loss', () => {
       settings: { ...settings, maxDailyLossPct: 0.05 },
     });
     expect(r.allowed).toBe(false);
-    expect(r.riskState).toBe('MAX_DAILY_LOSS');
+    expect(r.riskState).toBe('HALTED');
   });
 
   it('blocks when max positions hit', () => {
@@ -249,7 +271,6 @@ describe('risk limits: drawdown and daily loss', () => {
       settings,
     });
     expect(r.allowed).toBe(false);
-    expect(r.riskState).toBe('MAX_POSITIONS');
   });
 
   it('sizes within caps when allowed', () => {

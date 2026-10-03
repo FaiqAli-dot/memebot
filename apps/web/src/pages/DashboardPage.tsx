@@ -87,6 +87,16 @@ export function DashboardPage() {
     }
   }
 
+  async function toggleKill(active: boolean) {
+    setBusy(true);
+    try {
+      await api.killSwitch(active);
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const chartData = equity.map((e) => ({
     t: new Date(e.observedAt).toLocaleTimeString(),
     equity: e.equityUsd,
@@ -100,6 +110,13 @@ export function DashboardPage() {
         </button>
         <button className="btn" disabled={busy} onClick={() => void control('pause')}>
           PAUSE BOT
+        </button>
+        <button
+          className="btn danger"
+          disabled={busy}
+          onClick={() => void toggleKill(!(bot?.killSwitchActive ?? false))}
+        >
+          {bot?.killSwitchActive ? 'CLEAR KILL SWITCH' : 'KILL SWITCH'}
         </button>
         <button className="btn danger" disabled={busy} onClick={() => void reset('paper_account')}>
           RESET PAPER ACCOUNT
@@ -149,6 +166,10 @@ export function DashboardPage() {
             <Metric label="Signals generated" value={String(bot?.signalsGenerated ?? 0)} />
             <Metric label="Trades today" value={String(bot?.tradesToday ?? 0)} />
             <Metric label="Risk state" value={bot?.riskState ?? '—'} />
+            <Metric label="Regime" value={bot?.marketRegime ?? '—'} />
+            <Metric label="Realism" value={bot?.realismProfile ?? '—'} />
+            <Metric label="Kill switch" value={bot?.killSwitchActive ? 'ACTIVE' : 'off'} />
+            <Metric label="Trading mode" value={bot?.tradingMode ?? 'PAPER'} />
             <Metric label="Data mode" value={(bot?.dataMode ?? 'demo').toUpperCase()} />
           </div>
         </div>

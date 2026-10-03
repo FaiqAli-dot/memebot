@@ -10,7 +10,7 @@ import type {
 } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { query } from '../db/client.js';
-import { dataMode, env } from '../config/env.js';
+import { dataMode, env, realismProfile } from '../config/env.js';
 import { getPortfolio } from './portfolio-service.js';
 import { getRuntimeBotStats } from '../jobs/runners.js';
 import { MomentumStrategyV1, riskLabelFromScore } from '../engines/strategy/momentum-v1.js';
@@ -19,6 +19,8 @@ import {
   theoreticalStopPrice,
   theoreticalTakeProfitPrice,
 } from '../engines/paper/exits.js';
+import { PAPER_ONLY_DISCLAIMER } from '@memebot/shared';
+import { isKillSwitchActive } from '../monitoring/kill-switch.js';
 
 const strategy = new MomentumStrategyV1();
 
@@ -51,6 +53,8 @@ export async function getBotStatus(portfolioId: string): Promise<BotStatusInfo> 
     scan.rows[0]?.last?.toISOString() ??
     null;
 
+  const killSwitchActive = await isKillSwitchActive(portfolioId);
+
   return {
     status: p?.botStatus ?? 'PAUSED',
     dataMode,
@@ -58,9 +62,13 @@ export async function getBotStatus(portfolioId: string): Promise<BotStatusInfo> 
     tokensScanned: Math.max(stats.tokensScanned, Number(scan.rows[0]?.scanned ?? 0)),
     signalsGenerated: Math.max(stats.signalsGenerated, Number(signals.rows[0]?.c ?? 0)),
     tradesToday: Number(tradesToday.rows[0]?.c ?? 0),
-    currentStrategy: `${strategy.name} ${strategy.version}`,
-    riskState: p?.riskState ?? 'OK',
+    currentStrategy: 'multi-strategy framework-v1',
+    riskState: p?.riskState ?? 'NORMAL',
     lastError: null,
+    killSwitchActive,
+    tradingMode: 'PAPER',
+    realismProfile,
+    marketRegime: stats.latestRegime ?? null,
   };
 }
 
@@ -624,6 +632,25 @@ export async function getTokenDetail(tokenId: string) {
     `SELECT * FROM signals WHERE token_id = $1 ORDER BY created_at DESC LIMIT 1`,
     [tokenId],
   );
+  const safety = await query(
+    `SELECT score, safety_class, blocked, reasons, assessed_at, version
+     FROM safety_assessments WHERE token_id = $1 ORDER BY assessed_at DESC LIMIT 5`,
+    [tokenId],
+  );
+  const phases = await query(
+    `SELECT phase, reasons, observed_at FROM token_phases WHERE token_id = $1 ORDER BY observed_at ASC LIMIT 100`,
+    [tokenId],
+  );
+  const events = await query(
+    `SELECT event_type, payload, observed_at, source FROM market_events
+     WHERE token_id = $1 ORDER BY observed_at ASC LIMIT 200`,
+    [tokenId],
+  );
+  const trades = await query(
+    `SELECT side, amount_usd, price_usd, observed_at, source, confidence
+     FROM trade_events WHERE token_id = $1 ORDER BY observed_at DESC LIMIT 100`,
+    [tokenId],
+  );
 
   return {
     token: token.rows[0],
@@ -635,7 +662,62 @@ export async function getTokenDetail(tokenId: string) {
           scoreDisclaimer: SCORE_DISCLAIMER,
         }
       : null,
+    safety: safety.rows,
+    phases: phases.rows,
+    timeline: events.rows,
+    tradeEvents: trades.rows,
     scoreDisclaimer: SCORE_DISCLAIMER,
+  };
+}
+
+export async function getShadowTrades(portfolioId: string, limit = 100) {
+  const { rows } = await query(
+    `SELECT s.*, t.symbol, t.address
+     FROM shadow_trades s
+     JOIN tokens t ON t.id = s.token_id
+     WHERE s.portfolio_id = $1
+     ORDER BY s.opened_at DESC
+     LIMIT $2`,
+    [portfolioId, limit],
+  );
+  return rows;
+}
+
+export async function getMissedOpportunities(portfolioId: string, limit = 100) {
+  const { rows } = await query(
+    `SELECT m.*, t.symbol
+     FROM missed_opportunities m
+     JOIN tokens t ON t.id = m.token_id
+     WHERE m.portfolio_id = $1
+     ORDER BY m.observed_at DESC
+     LIMIT $2`,
+    [portfolioId, limit],
+  );
+  return rows;
+}
+
+export async function getRegimeHistory(limit = 50) {
+  const { rows } = await query(
+    `SELECT regime, payload, observed_at FROM regime_snapshots
+     WHERE data_mode = $1 ORDER BY observed_at DESC LIMIT $2`,
+    [dataMode, limit],
+  );
+  return rows;
+}
+
+export async function getSystemHealth() {
+  const { rows } = await query(
+    `SELECT component, status, metrics, observed_at FROM system_health
+     ORDER BY observed_at DESC LIMIT 20`,
+  );
+  return {
+    paperTradingOnly: true,
+    tradingMode: 'PAPER',
+    realExecutionEnabled: false,
+    walletSigningEnabled: false,
+    dataMode,
+    realismProfile,
+    recent: rows,
   };
 }
 
@@ -647,5 +729,10 @@ export function meta() {
     defaultPortfolioId: env.DEFAULT_PORTFOLIO_ID,
     scoreDisclaimer: SCORE_DISCLAIMER,
     paperTradingOnly: true,
+    paperOnlyDisclaimer: PAPER_ONLY_DISCLAIMER,
+    tradingMode: 'PAPER',
+    realExecutionEnabled: false,
+    walletSigningEnabled: false,
+    realismProfile,
   };
 }

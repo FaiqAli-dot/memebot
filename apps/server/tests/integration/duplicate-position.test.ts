@@ -13,6 +13,14 @@ describe('duplicate open position prevention', () => {
     getPool(dbUrl);
     await migrate(dbUrl);
     await ensureDefaultPortfolio();
+    // Clear dependent rows first (fee_records → paper_orders / positions)
+    await query(`DELETE FROM fee_records WHERE portfolio_id = $1`, [env.DEFAULT_PORTFOLIO_ID]);
+    await query(`DELETE FROM paper_fills WHERE order_id IN (SELECT id FROM paper_orders WHERE portfolio_id = $1)`, [
+      env.DEFAULT_PORTFOLIO_ID,
+    ]);
+    await query(`UPDATE paper_orders SET position_id = NULL WHERE portfolio_id = $1`, [
+      env.DEFAULT_PORTFOLIO_ID,
+    ]);
     await query(`DELETE FROM positions WHERE portfolio_id = $1`, [env.DEFAULT_PORTFOLIO_ID]);
     await query(`DELETE FROM paper_orders WHERE portfolio_id = $1`, [env.DEFAULT_PORTFOLIO_ID]);
   });

@@ -124,6 +124,8 @@ export async function listSourceHealth(): Promise<
     tokensDiscoveredApprox: number;
     pollingIntervalMs: number | null;
     healthy: boolean;
+    status?: string;
+    meteoraDbc?: Awaited<ReturnType<typeof import('./meteora-dbc-health.js').getMeteoraDbcHealth>>;
   }>
 > {
   await ensureSourceHealthRows();
@@ -141,12 +143,15 @@ export async function listSourceHealth(): Promise<
 
   const staleMs = Math.max(env.JOB_TOKEN_DISCOVERY_INTERVAL_MS * 10, 5 * 60_000);
   const now = Date.now();
+  const { getMeteoraDbcHealth } = await import('./meteora-dbc-health.js');
+  const meteoraDbc = await getMeteoraDbcHealth();
+
   return rows.map((r) => {
     const lastOk = r.last_success_at?.getTime() ?? 0;
     const healthy =
       !r.enabled ||
       (r.consecutive_failures < 5 && (lastOk === 0 || now - lastOk < staleMs * 3));
-    return {
+    const base = {
       sourceKey: r.source_key,
       enabled: r.enabled,
       lastSuccessAt: r.last_success_at?.toISOString() ?? null,
@@ -156,7 +161,19 @@ export async function listSourceHealth(): Promise<
       consecutiveFailures: r.consecutive_failures,
       tokensDiscoveredApprox: Number(r.tokens_discovered_approx),
       pollingIntervalMs: r.polling_interval_ms,
-      healthy,
+      healthy: r.source_key === 'meteora_dbc' ? meteoraDbc.status === 'OK' : healthy,
+      status:
+        r.source_key === 'meteora_dbc'
+          ? meteoraDbc.status
+          : !r.enabled
+            ? 'DISABLED'
+            : healthy
+              ? 'OK'
+              : 'DEGRADED',
     };
+    if (r.source_key === 'meteora_dbc') {
+      return { ...base, meteoraDbc };
+    }
+    return base;
   });
 }

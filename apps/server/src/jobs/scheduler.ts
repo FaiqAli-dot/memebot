@@ -1,5 +1,6 @@
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
+import { RETENTION_JOB_INTERVAL_MS } from '../db/retention.js';
 
 export type JobName =
   | 'token_discovery'
@@ -88,6 +89,7 @@ export function defaultIntervals(): Record<JobName, number> {
     learning: 30_000,
     outcome_checkpoints: env.JOB_OUTCOME_CHECKPOINTS_INTERVAL_MS,
     storage_monitor: env.JOB_STORAGE_MONITOR_INTERVAL_MS,
-    retention: 15 * 60_000,
+    /** Primary Free-tier protection: prune HF raw every 15 minutes. */
+    retention: RETENTION_JOB_INTERVAL_MS,
   };
 }

@@ -19,6 +19,13 @@ import type { DataMode } from '@memebot/shared';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import type { EnrichedDiscoveredToken, StreamTokenDiscoveryProvider } from './multi-source.js';
+import {
+  persistMeteoraDbcHealthDetails,
+  recordDbcInitSeen,
+  recordDbcRpcError,
+  recordDbcRpcPollSuccess,
+  type DbcDiscoveryPath,
+} from '../../intelligence/meteora-dbc-health.js';
 
 export const METEORA_DBC_PROGRAM_ID = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
 export const METEORA_DAMM_V2_PROGRAM_ID = 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG';
@@ -76,16 +83,31 @@ function rpcUrl(): string {
 }
 
 async function rpcCall<T>(method: string, params: unknown[]): Promise<T | null> {
-  const res = await fetch(rpcUrl(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    signal: AbortSignal.timeout(env.METEORA_DBC_RPC_TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`Solana RPC HTTP ${res.status}`);
-  const body = (await res.json()) as { result?: T; error?: { message?: string } };
-  if (body.error) throw new Error(body.error.message ?? 'Solana RPC error');
-  return body.result ?? null;
+  try {
+    const res = await fetch(rpcUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(env.METEORA_DBC_RPC_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      const err = new Error(`Solana RPC HTTP ${res.status}`);
+      recordDbcRpcError(err);
+      throw err;
+    }
+    const body = (await res.json()) as { result?: T; error?: { message?: string } };
+    if (body.error) {
+      const err = new Error(body.error.message ?? 'Solana RPC error');
+      recordDbcRpcError(err);
+      throw err;
+    }
+    return body.result ?? null;
+  } catch (err) {
+    if (err instanceof Error && !/Solana RPC/.test(err.message)) {
+      recordDbcRpcError(err);
+    }
+    throw err;
+  }
 }
 
 /** Anchor account: 8-byte discriminator + PoolState (see Meteora virtual_pool.rs). */
@@ -200,6 +222,7 @@ export function toEnrichedFromPoolState(
     decimals?: number;
     createdAt?: Date | null;
     quoteMint?: string | null;
+    discoveryPath?: DbcDiscoveryPath;
   },
 ): EnrichedDiscoveredToken {
   const preMigration = !state.isMigrated && state.migrationProgress === 'PRE_BONDING_CURVE';
@@ -233,6 +256,7 @@ export function toEnrichedFromPoolState(
       quoteReserve: state.quoteReserve,
       baseReserve: state.baseReserve,
       postMigrationVenue: migrated ? 'meteora_damm' : null,
+      discoveryPath: meta?.discoveryPath ?? 'rpc',
     },
   };
 }
@@ -383,7 +407,7 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
           const value = msg.params?.result?.value;
           if (!value || value.err) return;
           if (!extractInitFromLogs(value.logs ?? [])) return;
-          void this.ingestSignature(value.signature!, null);
+          void this.ingestSignature(value.signature!, null, 'realtime');
         } catch (err) {
           logger.warn({ err }, 'Meteora DBC realtime message parse failed');
         }
@@ -426,10 +450,9 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
       for (const t of fromRpc) out.set(t.address, t);
     } catch (err) {
       logger.warn({ err }, 'Meteora DBC RPC discovery failed');
+      recordDbcRpcError(err);
     }
 
-    // Datapi is identity/enrichment only — never the sole authority for "newest",
-    // but useful when RPC is rate-limited and for metadata.
     try {
       const fromDatapi = await this.pollDatapiFallback();
       for (const t of fromDatapi) {
@@ -439,7 +462,9 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
       logger.warn({ err }, 'Meteora DBC datapi fallback failed');
     }
 
-    return [...out.values()].slice(0, env.METEORA_DBC_MAX_PER_POLL);
+    const tokens = [...out.values()].slice(0, env.METEORA_DBC_MAX_PER_POLL);
+    await persistMeteoraDbcHealthDetails().catch(() => undefined);
+    return tokens;
   }
 
   private async pollRpcSignatures(): Promise<EnrichedDiscoveredToken[]> {
@@ -447,6 +472,7 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
       METEORA_DBC_PROGRAM_ID,
       { limit: env.METEORA_DBC_SIGNATURE_LIMIT },
     ]);
+    recordDbcRpcPollSuccess();
     if (!sigs?.length) return [];
 
     const fresh: RpcSignature[] = [];
@@ -455,14 +481,12 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
       if (s.err) continue;
       fresh.push(s);
     }
-    // Advance cursor to newest signature even if none were inits
     this.cursorSignature = sigs[0]!.signature;
 
-    // Process oldest→newest among the fresh window, capped for rate limits
     const batch = fresh.slice(0, env.METEORA_DBC_TX_FETCH_LIMIT).reverse();
     const tokens: EnrichedDiscoveredToken[] = [];
     for (const s of batch) {
-      const token = await this.ingestSignature(s.signature, s.blockTime ?? null);
+      const token = await this.ingestSignature(s.signature, s.blockTime ?? null, 'rpc');
       if (token) tokens.push(token);
     }
     return tokens;
@@ -471,6 +495,7 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
   private async ingestSignature(
     signature: string,
     blockTime: number | null,
+    path: DbcDiscoveryPath,
   ): Promise<EnrichedDiscoveredToken | null> {
     try {
       const tx = await rpcCall<{
@@ -518,13 +543,23 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
       const created =
         meta.createdAt ??
         (blockTime || tx.blockTime ? new Date((blockTime ?? tx.blockTime)! * 1000) : null);
-      const token = toEnrichedFromPoolState(state, { ...meta, createdAt: created });
+      const token = toEnrichedFromPoolState(state, {
+        ...meta,
+        createdAt: created,
+        discoveryPath: path,
+      });
+      recordDbcInitSeen({
+        mint: extracted.baseMint,
+        path,
+        preMigration: Boolean(token.metadata?.preMigration),
+      });
       this.seenMints.add(extracted.baseMint);
       if (this.seenMints.size > 5_000) {
-        // Bound memory: drop arbitrary older entries
         this.seenMints = new Set([...this.seenMints].slice(-2_500));
       }
-      this.realtimeBuffer.push({ token, seenAt: Date.now() });
+      if (path === 'realtime') {
+        this.realtimeBuffer.push({ token, seenAt: Date.now() });
+      }
       return token;
     } catch (err) {
       logger.warn({ err, signature }, 'Meteora DBC tx ingest failed');
@@ -636,6 +671,12 @@ export class MeteoraDbcDiscoveryProvider implements StreamTokenDiscoveryProvider
         decimals: pool.token_x?.decimals,
         createdAt: created,
         quoteMint: pool.token_y?.address ?? WSOL_MINT,
+        discoveryPath: 'datapi',
+      });
+      recordDbcInitSeen({
+        mint: baseMint,
+        path: 'datapi',
+        preMigration: Boolean(token.metadata?.preMigration),
       });
       this.seenMints.add(baseMint);
       out.push(token);

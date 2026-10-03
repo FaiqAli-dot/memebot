@@ -283,11 +283,13 @@ export async function getMissedOpportunityAnalysis(): Promise<{
 }
 
 export async function getIntelligenceDashboard(): Promise<Record<string, unknown>> {
-  const [summary, sources, storage, missed] = await Promise.all([
+  const { getMeteoraDbcHealth } = await import('./meteora-dbc-health.js');
+  const [summary, sources, storage, missed, meteoraDbc] = await Promise.all([
     getIntelligenceSummary(),
     listSourceHealth(),
     getStorageMonitor(),
     getMissedOpportunityAnalysis(),
+    getMeteoraDbcHealth(),
   ]);
-  return { summary, sources, storage, missed };
+  return { summary, sources, storage, missed, meteoraDbc };
 }

@@ -86,9 +86,14 @@ const envSchema = z.object({
   METEORA_DBC_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(12_000),
   /** Optional override; empty = use SOLANA_RPC_URL (keyless public OK). */
   METEORA_DBC_RPC_URL: z.string().optional().default(''),
+  /**
+   * If no real DBC init is seen for this many minutes, meteora_dbc health is STALE/DEGRADED.
+   * DBC launches are frequent on mainnet — long silence usually means the feed is broken.
+   */
+  METEORA_DBC_STALE_SILENCE_MINUTES: z.coerce.number().positive().default(30),
   JOB_OUTCOME_CHECKPOINTS_INTERVAL_MS: z.coerce.number().default(60_000),
   JOB_STORAGE_MONITOR_INTERVAL_MS: z.coerce.number().default(30 * 60_000),
-  /** Soft storage budget (bytes) for Railway Free — triggers aggressive raw prune. */
+  /** Soft storage budget (bytes) for Railway Free — emergency prune backstop only. */
   STORAGE_SOFT_LIMIT_BYTES: z.coerce.number().int().positive().default(450_000_000),
 
   DEFAULT_PRIORITY_FEE_LAMPORTS: z.coerce.number().default(5000),
@@ -198,13 +203,19 @@ const envSchema = z.object({
     .transform((v) => v !== 'false')
     .default('true'),
   /**
-   * High-frequency raw tables (snapshots, trade events, raw feature observations)
-   * are pruned past this age; each token's latest market/liquidity/holder row is kept.
-   * Spec default: 72h. Lower on Railway Free if storage pressure rises.
+   * High-frequency raw tables (market/liquidity/holder snapshots, safety_assessments,
+   * feature_snapshots, trade_events). Latest row per token kept where applicable.
+   * Primary Free-tier protection — default 3 hours (do not extend to 72h).
    */
-  RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(72),
+  RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(3),
+  /**
+   * Compact research raw data only: token_raw_feature_observations and
+   * outcome checkpoints (after 24h compaction). Permanent decision audits /
+   * decision feature snapshots / summaries are never pruned by this.
+   */
+  RESEARCH_DATA_RETENTION_HOURS: z.coerce.number().positive().default(72),
   /** Bot log and missed-opportunity rows are pruned past this age */
-  EVENT_RETENTION_DAYS: z.coerce.number().positive().default(7),
+  EVENT_RETENTION_DAYS: z.coerce.number().positive().default(3),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),

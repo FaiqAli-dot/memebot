@@ -7,7 +7,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 loadEnv({ path: resolve(__dirname, '../../../../.env') });
 
 process.env.DATA_MODE = 'demo';
-process.env.RAW_DATA_RETENTION_HOURS = '72';
+process.env.RAW_DATA_RETENTION_HOURS = '3';
+process.env.RESEARCH_DATA_RETENTION_HOURS = '72';
+process.env.EVENT_RETENTION_DAYS = '3';
 process.env.DATABASE_URL =
   process.env.TEST_DATABASE_URL ||
   process.env.DATABASE_URL ||
@@ -251,15 +253,16 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     expect(captured).toBeGreaterThan(0);
   });
 
-  it('14-15: raw snapshot cleanup preserves permanent intelligence records', async () => {
+  it('14-15: 3h HF prune / 72h research prune; permanent intelligence survives', async () => {
     await db.query(
       `INSERT INTO token_raw_feature_observations (token_id, features, data_mode, observed_at)
-       VALUES ($1, '{"x":1}'::jsonb, 'demo', NOW() - INTERVAL '100 hours')`,
+       VALUES ($1, '{"old":1}'::jsonb, 'demo', NOW() - INTERVAL '80 hours'),
+              ($1, '{"mid":1}'::jsonb, 'demo', NOW() - INTERVAL '10 hours')`,
       [tokenId],
     );
     await db.query(
       `INSERT INTO market_snapshots (token_id, price_usd, data_mode, observed_at)
-       VALUES ($1, 1, 'demo', NOW() - INTERVAL '100 hours'),
+       VALUES ($1, 1, 'demo', NOW() - INTERVAL '10 hours'),
               ($1, 2, 'demo', NOW() - INTERVAL '1 hours')`,
       [tokenId],
     );
@@ -278,8 +281,16 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     );
 
     const deleted = await pruneOldData();
-    expect(deleted.token_raw_feature_observations).toBeGreaterThanOrEqual(1);
+    // HF: 10h snapshot deleted (newer 1h exists); research: only 80h row
     expect(deleted.market_snapshots).toBeGreaterThanOrEqual(1);
+    expect(deleted.token_raw_feature_observations).toBe(1);
+
+    const midResearch = await db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM token_raw_feature_observations
+       WHERE token_id = $1 AND features ? 'mid'`,
+      [tokenId],
+    );
+    expect(Number(midResearch.rows[0]!.c)).toBe(1);
 
     const afterDecisions = await db.query<{ c: string }>(
       `SELECT COUNT(*)::text AS c FROM token_decision_audits WHERE token_id = $1`,
@@ -298,6 +309,11 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     expect(afterToken.rows[0]!.c).toBe(beforeToken.rows[0]!.c);
     expect(PERMANENT_RETENTION_TABLES).toContain('token_decision_audits');
     expect(PERMANENT_RETENTION_TABLES).toContain('tokens');
+
+    const { env } = await import('../../src/config/env.js');
+    expect(env.RAW_DATA_RETENTION_HOURS).toBe(3);
+    expect(env.RESEARCH_DATA_RETENTION_HOURS).toBe(72);
+    expect(env.EVENT_RETENTION_DAYS).toBe(3);
   });
 
   it('16-17: source failure isolation + aggregated polling still returns other sources', async () => {

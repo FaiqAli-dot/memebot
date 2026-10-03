@@ -478,7 +478,11 @@ apiRouter.get('/intelligence/storage', async (_req, res, next) => {
 apiRouter.get('/intelligence/sources', async (_req, res, next) => {
   try {
     const { listSourceHealth } = await import('../../intelligence/source-health.js');
-    res.json({ sources: await listSourceHealth() });
+    const { getMeteoraDbcHealth } = await import('../../intelligence/meteora-dbc-health.js');
+    res.json({
+      sources: await listSourceHealth(),
+      meteoraDbc: await getMeteoraDbcHealth(),
+    });
   } catch (err) {
     next(err);
   }

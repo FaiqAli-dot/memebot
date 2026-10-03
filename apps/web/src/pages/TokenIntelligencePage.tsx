@@ -60,6 +60,7 @@ export function TokenIntelligencePage() {
   const [rows, setRows] = useState<IntelRow[]>([]);
   const [total, setTotal] = useState(0);
   const [sources, setSources] = useState<Record<string, unknown>[]>([]);
+  const [meteoraDbc, setMeteoraDbc] = useState<Record<string, unknown> | null>(null);
   const [storage, setStorage] = useState<Record<string, unknown> | null>(null);
   const [missed, setMissed] = useState<{
     falseNegatives: Record<string, unknown>[];
@@ -94,6 +95,7 @@ export function TokenIntelligencePage() {
       ]);
       setSummary((dash.summary as Summary) ?? EMPTY_SUMMARY);
       setSources((dash.sources as Record<string, unknown>[]) ?? []);
+      setMeteoraDbc((dash.meteoraDbc as Record<string, unknown>) ?? null);
       setStorage((dash.storage as Record<string, unknown>) ?? null);
       setMissed(
         (dash.missed as {
@@ -363,6 +365,87 @@ export function TokenIntelligencePage() {
       </div>
 
       <div className="panel">
+        <h3>Meteora DBC discovery health</h3>
+        <p className="muted">
+          After deploy, status should move from UNKNOWN → OK once a real (non-demo) DBC init is
+          seen. Long silence → STALE. Endpoint:{' '}
+          <code>/api/intelligence/sources</code> (<code>meteoraDbc</code> field).
+        </p>
+        {meteoraDbc ? (
+          <>
+            <div className="stat-grid">
+              <div className="stat">
+                <div className="stat-label">Status</div>
+                <div className="stat-value">{String(meteoraDbc.status)}</div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Last RPC poll</div>
+                <div className="stat-value" style={{ fontSize: '0.75rem' }}>
+                  {meteoraDbc.lastSuccessfulRpcPollAt
+                    ? String(meteoraDbc.lastSuccessfulRpcPollAt)
+                    : '—'}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Last real init</div>
+                <div className="stat-value" style={{ fontSize: '0.75rem' }}>
+                  {meteoraDbc.lastRealDbcInitAt ? String(meteoraDbc.lastRealDbcInitAt) : '—'}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Last mint</div>
+                <div className="stat-value" style={{ fontSize: '0.7rem' }}>
+                  {meteoraDbc.lastRealDbcInitMint
+                    ? String(meteoraDbc.lastRealDbcInitMint).slice(0, 12) + '…'
+                    : '—'}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">DBC 1h / 24h</div>
+                <div className="stat-value">
+                  {String(meteoraDbc.discoveredLast1h ?? 0)} /{' '}
+                  {String(meteoraDbc.discoveredLast24h ?? 0)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">RPC / datapi / realtime (24h)</div>
+                <div className="stat-value" style={{ fontSize: '0.85rem' }}>
+                  {String(meteoraDbc.viaRpcLast24h ?? 0)} / {String(meteoraDbc.viaDatapiLast24h ?? 0)}{' '}
+                  / {String(meteoraDbc.viaRealtimeLast24h ?? 0)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Pre-mig / migrated (24h)</div>
+                <div className="stat-value">
+                  {String(meteoraDbc.preMigrationLast24h ?? 0)} /{' '}
+                  {String(meteoraDbc.migratedLast24h ?? 0)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">RPC errors / 429s (1h)</div>
+                <div className="stat-value">
+                  {String(meteoraDbc.rpcErrorsLast1h ?? 0)} / {String(meteoraDbc.rpc429sLast1h ?? 0)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Consecutive failures</div>
+                <div className="stat-value">{String(meteoraDbc.consecutiveFailures ?? 0)}</div>
+              </div>
+              <div className="stat">
+                <div className="stat-label">Stale silence</div>
+                <div className="stat-value">{String(meteoraDbc.staleSilenceMinutes ?? '—')}m</div>
+              </div>
+            </div>
+            <p className="muted" style={{ marginTop: '0.5rem' }}>
+              {String(meteoraDbc.note ?? '')}
+            </p>
+          </>
+        ) : (
+          <p className="muted">No Meteora DBC health snapshot yet.</p>
+        )}
+      </div>
+
+      <div className="panel">
         <h3>Discovery source health</h3>
         <div className="table-wrap">
           <table>
@@ -370,6 +453,7 @@ export function TokenIntelligencePage() {
               <tr>
                 <th>Source</th>
                 <th>Enabled</th>
+                <th>Status</th>
                 <th>Healthy</th>
                 <th>Last success</th>
                 <th>Last discovery</th>
@@ -384,6 +468,7 @@ export function TokenIntelligencePage() {
                 <tr key={String(s.sourceKey)}>
                   <td>{String(s.sourceKey)}</td>
                   <td>{s.enabled ? 'yes' : 'no'}</td>
+                  <td>{String(s.status ?? (s.healthy ? 'OK' : 'DEGRADED'))}</td>
                   <td>{s.healthy ? 'yes' : 'NO'}</td>
                   <td>{s.lastSuccessAt ? String(s.lastSuccessAt) : '—'}</td>
                   <td>{s.lastDiscoveryAt ? String(s.lastDiscoveryAt) : '—'}</td>
@@ -434,10 +519,34 @@ export function TokenIntelligencePage() {
                 {storage.nextCleanupAt ? String(storage.nextCleanupAt) : '—'}
               </div>
             </div>
+            <div className="stat">
+              <div className="stat-label">Cleanup every</div>
+              <div className="stat-value" style={{ fontSize: '0.85rem' }}>
+                {storage.cleanupIntervalMs != null
+                  ? `${Math.round(Number(storage.cleanupIntervalMs) / 60_000)}m`
+                  : '15m'}
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-label">Retention HF / research / logs</div>
+              <div className="stat-value" style={{ fontSize: '0.8rem' }}>
+                {String(storage.rawRetentionHours ?? 3)}h /{' '}
+                {String(storage.researchRetentionHours ?? 72)}h /{' '}
+                {String(storage.eventRetentionDays ?? 3)}d
+              </div>
+            </div>
           </div>
         ) : (
           <p className="muted">No storage snapshot yet.</p>
         )}
+        {storage?.storageGrowthEstimate != null ? (
+          <p className="muted" style={{ marginTop: '0.5rem' }}>
+            {String(
+              (storage.storageGrowthEstimate as { basis?: string }).basis ??
+                JSON.stringify(storage.storageGrowthEstimate),
+            )}
+          </p>
+        ) : null}
         {storage?.counts != null ? (
           <pre className="code-block" style={{ marginTop: '0.75rem' }}>
             {JSON.stringify(storage.counts, null, 2)}

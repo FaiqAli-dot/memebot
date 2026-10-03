@@ -108,6 +108,13 @@ export async function recordDiscoveryObservation(
         name: token.name,
         paidBoost: token.discoverySource === 'DEXSCREENER_BOOST',
         metadata: token.metadata ?? {},
+        discoveryPath:
+          typeof token.metadata?.discoveryPath === 'string'
+            ? token.metadata.discoveryPath
+            : null,
+        demoFixture: token.address.startsWith('Demo'),
+        dbcStatus: token.metadata?.dbcStatus ?? null,
+        migrationStatus: token.metadata?.migrationStatus ?? null,
       }),
       dataMode,
     ],

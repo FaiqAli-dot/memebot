@@ -41,11 +41,25 @@ export interface OnChainTokenData {
   observedAt: Date;
 }
 
+export interface SolPriceQuote {
+  priceUsd: number;
+  source: string;
+  observedAt: Date;
+  stale: boolean;
+  dataMode: DataMode;
+}
+
 export interface GasFeeEstimate {
   chain: string;
   baseFeeLamports: number;
   priorityFeeLamports: number;
-  solPriceUsd: number;
+  /** null when SOL/USD unavailable — live path must not invent a price */
+  solPriceUsd: number | null;
+  solPriceSource: string | null;
+  solPriceObservedAt: Date | null;
+  solPriceStale: boolean;
+  /** false when fees cannot safely be converted to USD */
+  usable: boolean;
   observedAt: Date;
 }
 
@@ -67,6 +81,13 @@ export interface PriceProvider {
   getPriceUsd(address: string, chain?: string): Promise<number | null>;
 }
 
+/** Native SOL/USD for fee conversion (separate from meme-token PriceProvider). */
+export interface SolPriceProvider {
+  readonly name: string;
+  readonly dataMode: DataMode;
+  getSolPriceUsd(): Promise<SolPriceQuote | null>;
+}
+
 export interface OnChainDataProvider {
   readonly name: string;
   readonly dataMode: DataMode;
@@ -78,3 +99,6 @@ export interface GasFeeProvider {
   readonly dataMode: DataMode;
   getFeeEstimate(chain?: string): Promise<GasFeeEstimate>;
 }
+
+/** Wrapped SOL mint on Solana mainnet */
+export const WSOL_MINT = 'So11111111111111111111111111111111111111112';

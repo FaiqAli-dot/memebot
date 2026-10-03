@@ -1,5 +1,9 @@
-import { createProviders, getStalePriceMaxAgeMs } from '../providers/index.js';
-import { env, dataMode } from '../config/env.js';
+import {
+  createProviders,
+  getStalePriceMaxAgeMs,
+  isGasUsableForTrading,
+} from '../providers/index.js';
+import { dataMode } from '../config/env.js';
 import { logger } from '../utils/logger.js';
 import {
   upsertDiscoveredToken,
@@ -24,11 +28,11 @@ import {
   executePaperSell,
   markPositionMarkToMarket,
 } from '../engines/paper/engine.js';
+import { evaluateExitRules } from '../engines/paper/exits.js';
 import { query } from '../db/client.js';
 import { publish } from '../ws/hub.js';
 import { registerJob, defaultIntervals, startJobs, stopJobs } from './scheduler.js';
 import type { MarketQuote } from '../providers/types.js';
-import { safeDiv } from '../utils/helpers.js';
 
 const strategy = new MomentumStrategyV1();
 const providers = createProviders();
@@ -265,6 +269,22 @@ async function jobPaperExecution(): Promise<void> {
   );
 
   const gas = await providers.gasFee.getFeeEstimate();
+  if (!isGasUsableForTrading(gas)) {
+    await logBotEvent({
+      portfolioId,
+      level: 'error',
+      category: 'fees',
+      message:
+        'SOL/USD price unavailable or stale — skipping new paper trades (fail-safe)',
+      details: {
+        solPriceUsd: gas.solPriceUsd,
+        solPriceSource: gas.solPriceSource,
+        solPriceStale: gas.solPriceStale,
+        usable: gas.usable,
+      },
+    });
+    return;
+  }
 
   // Daily realized PnL
   const dayPnl = await query<{ pnl: string }>(
@@ -283,7 +303,7 @@ async function jobPaperExecution(): Promise<void> {
         portfolioId,
         level: 'warn',
         category: 'execution',
-        message: 'Missing market data — skip trade',
+        message: 'Missing market data — skip trade (no invented price)',
         details: { tokenId: signal.token_id },
       });
       continue;
@@ -434,29 +454,27 @@ async function manageOpenPositions(
     await markPositionMarkToMarket(pos.id, market.price_usd);
     publish('position_updated', { positionId: pos.id, price: market.price_usd });
 
-    const entry = Number(pos.entry_price_usd);
-    const price = market.price_usd;
-    const pnlPct = safeDiv(price - entry, entry, 0);
-    const highest = Math.max(Number(pos.highest_price_usd), price);
-    const stop = Number(pos.stop_loss_pct);
-    const take = Number(pos.take_profit_pct);
-    const trailing = pos.trailing_stop_pct != null ? Number(pos.trailing_stop_pct) : null;
+    const marketStale =
+      market.stale ||
+      Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs();
 
-    let closeReason: string | null = null;
-    if (market.liquidity_usd <= 0 || market.liquidity_usd < settings.minLiquidityUsd * 0.1) {
-      closeReason = 'emergency_liquidity_collapse';
-    } else if (pnlPct <= -stop) {
-      closeReason = 'stop_loss';
-    } else if (pnlPct >= take) {
-      closeReason = 'take_profit';
-    } else if (trailing != null && highest > entry && (highest - price) / highest >= trailing) {
-      closeReason = 'trailing_stop';
-    } else if ((Date.now() - pos.opened_at.getTime()) / 1000 >= settings.maxHoldingTimeSec) {
-      closeReason = 'max_holding_time';
-    }
+    const decision = evaluateExitRules({
+      entryPriceUsd: Number(pos.entry_price_usd),
+      markPriceUsd: market.price_usd,
+      highestPriceUsd: Number(pos.highest_price_usd),
+      stopLossPct: Number(pos.stop_loss_pct),
+      takeProfitPct: Number(pos.take_profit_pct),
+      trailingStopPct:
+        pos.trailing_stop_pct != null ? Number(pos.trailing_stop_pct) : null,
+      openedAt: pos.opened_at,
+      now: new Date(),
+      maxHoldingTimeSec: settings.maxHoldingTimeSec,
+      liquidityUsd: market.liquidity_usd,
+      minLiquidityUsd: settings.minLiquidityUsd,
+      marketStale,
+    });
 
-    if (!closeReason) continue;
-    if (market.stale && closeReason !== 'emergency_liquidity_collapse') {
+    if (decision.deferredDueToStale) {
       await logBotEvent({
         portfolioId,
         level: 'warn',
@@ -467,10 +485,30 @@ async function manageOpenPositions(
       continue;
     }
 
+    const closeReason = decision.closeReason;
+    if (!closeReason) continue;
+
+    // Emergency exits may proceed even if SOL price is stale (mark unavailable);
+    // non-emergency exits require usable SOL/USD for fee conversion.
+    if (
+      closeReason !== 'emergency_liquidity_collapse' &&
+      !isGasUsableForTrading(gas)
+    ) {
+      await logBotEvent({
+        portfolioId,
+        level: 'error',
+        category: 'fees',
+        message:
+          'SOL/USD unavailable or stale — delaying non-emergency exit',
+        details: { positionId: pos.id, closeReason },
+      });
+      continue;
+    }
+
     const quote: MarketQuote = {
       chain: 'solana',
       address: '',
-      priceUsd: market.price_usd,
+      priceUsd: decision.exitMidPriceUsd,
       marketCapUsd: market.market_cap_usd,
       volume5mUsd: market.volume_5m_usd,
       volume1hUsd: market.volume_1h_usd,
@@ -489,10 +527,11 @@ async function manageOpenPositions(
       quoteReserve: market.quote_reserve,
     };
 
+    // Exit at market mid → simulated executable price — never theoretical stop/TP
     const result = await executePaperSell({
       portfolioId,
       positionId: pos.id,
-      midPriceUsd: market.price_usd,
+      midPriceUsd: decision.exitMidPriceUsd,
       quote,
       gas,
       priorityFeeLamports: settings.priorityFeeLamports,

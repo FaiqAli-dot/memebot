@@ -41,10 +41,14 @@ const envSchema = z.object({
     .string()
     .default('https://api.geckoterminal.com/api/v2'),
   JUPITER_BASE_URL: z.string().default('https://quote-api.jup.ag/v6'),
+  COINGECKO_BASE_URL: z.string().default('https://api.coingecko.com/api/v3'),
   BIRDEYE_API_KEY: z.string().optional().default(''),
   BIRDEYE_BASE_URL: z.string().default('https://public-api.birdeye.so'),
   DEFAULT_PRIORITY_FEE_LAMPORTS: z.coerce.number().default(5000),
+  /** Demo-mode deterministic SOL/USD only — never used as a silent live fallback for trading */
   DEFAULT_SOL_PRICE_USD: z.coerce.number().default(150),
+  SOL_PRICE_CACHE_TTL_MS: z.coerce.number().default(30_000),
+  SOL_PRICE_MAX_STALE_MS: z.coerce.number().default(120_000),
   FAILED_TX_STILL_CHARGES_NETWORK: z
     .string()
     .transform((v) => v !== 'false')

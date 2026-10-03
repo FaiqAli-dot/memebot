@@ -45,6 +45,16 @@ export const api = {
       '/api/strategies',
     ),
   token: (id: string) => request<Record<string, unknown>>(`/api/tokens/${id}`),
+  solPrice: () =>
+    request<{
+      solPriceUsd: number | null;
+      source: string | null;
+      observedAt: string | null;
+      stale: boolean;
+      usable: boolean;
+      dataMode: string;
+      note: string;
+    }>('/api/fees/sol-price'),
 };
 
 export function money(n: number | null | undefined, digits = 2): string {

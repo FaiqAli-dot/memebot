@@ -92,8 +92,11 @@ See `.env.example`. Important:
 Documented in code (`apps/server/src/engines/cost/simulator.ts`) and enforced in execution:
 
 1. **DEX fee** — Pool `fee_bps` when known; else venue default (Raydium 25 bps, Orca 30, Pump-like 100, unknown 30). Applied on fill notional.
-2. **Network fee** — ~5000 lamports base signature fee × SOL/USD.
-3. **Priority fee** — Observed median prioritization fee (or configured default) × SOL/USD.
+2. **Network fee** — ~5000 lamports base signature fee × **live SOL/USD** (demo: deterministic labeled price).
+3. **Priority fee** — Observed median prioritization fee (or configured default) × same SOL/USD.
+   - **Live SOL/USD**: DexScreener WSOL pairs (primary) → CoinGecko `simple/price` (fallback), cached (`SOL_PRICE_CACHE_TTL_MS`, default 30s).
+   - If SOL/USD is stale (`SOL_PRICE_MAX_STALE_MS`) or unavailable, **new paper trades are blocked** (BotEvent logged). `DEFAULT_SOL_PRICE_USD` is demo-only / never a silent live trading fallback.
+   - Each `paper_orders` / `fee_records` row stores `sol_price_usd` + `sol_price_source` for audit. UI shows the rate beside network/priority fees.
 4. **Price impact** — Constant-product style: `amount / (quoteReserve + amount)` when reserves/liquidity known.
 5. **Slippage** — Impact + volatility buffer from `|priceChange5m|` + size/liquidity ratio (not a flat 0.1%).
 6. **Executable price** — Buys pay mid×(1+adverse); sells receive mid×(1−adverse). Exits never use raw chart mid alone.
@@ -105,7 +108,7 @@ Documented in code (`apps/server/src/engines/cost/simulator.ts`) and enforced in
 
 - No real chain execution, wallet, or settlement finality modeling beyond fee/slippage heuristics.
 - Holder concentration depends on provider availability (often null in live mode).
-- SOL/USD for fee conversion uses configured/default price (live gas provider currently uses `DEFAULT_SOL_PRICE_USD`).
+- Live SOL/USD is fetched (DexScreener → CoinGecko); if unavailable/stale, new paper trades stop rather than inventing a price. Demo uses deterministic labeled SOL/USD.
 - Historical charts only include samples collected while running (no fabricated equity history).
 - Scores are **model scores**, not probabilities of profit. The UI states this explicitly.
 

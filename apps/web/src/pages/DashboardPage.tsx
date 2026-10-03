@@ -26,17 +26,25 @@ export function DashboardPage() {
   const [positions, setPositions] = useState<PositionData[]>([]);
   const [trades, setTrades] = useState<Record<string, unknown>[]>([]);
   const [events, setEvents] = useState<BotEventData[]>([]);
+  const [solPrice, setSolPrice] = useState<{
+    solPriceUsd: number | null;
+    source: string | null;
+    stale: boolean;
+    usable: boolean;
+    note: string;
+  } | null>(null);
   const [q, setQ] = useState('');
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [p, b, e, pos, t, ev] = await Promise.all([
+    const [p, b, e, pos, t, ev, sol] = await Promise.all([
       api.portfolio(),
       api.botStatus(),
       api.equity(),
       api.positions('OPEN'),
       api.trades(),
       api.events(q ? `?q=${encodeURIComponent(q)}&limit=80` : '?limit=80'),
+      api.solPrice(),
     ]);
     setPortfolio(p);
     setBot(b);
@@ -44,6 +52,7 @@ export function DashboardPage() {
     setPositions(pos);
     setTrades(t as Record<string, unknown>[]);
     setEvents(ev);
+    setSolPrice(sol);
   }, [q]);
 
   useEffect(() => {
@@ -114,7 +123,21 @@ export function DashboardPage() {
         <Metric label="Network/gas" value={money(portfolio?.totalNetworkCostUsd)} />
         <Metric label="Slippage cost" value={money(portfolio?.totalSlippageCostUsd)} />
         <Metric label="Price impact cost" value={money(portfolio?.totalPriceImpactCostUsd)} />
+        <Metric
+          label="SOL/USD (fee conversion)"
+          value={
+            solPrice?.solPriceUsd != null
+              ? `${money(solPrice.solPriceUsd)} · ${solPrice.source ?? '—'}${solPrice.stale ? ' · STALE' : ''}`
+              : 'unavailable'
+          }
+        />
       </div>
+      {solPrice && (
+        <p className="disclaimer" style={{ marginTop: 0, marginBottom: '0.75rem', borderTop: 'none', paddingTop: 0 }}>
+          {solPrice.note}
+          {!solPrice.usable ? ' New paper trades are blocked until SOL/USD is fresh.' : ''}
+        </p>
+      )}
 
       <div className="grid grid-2" style={{ marginBottom: '0.75rem' }}>
         <div className="panel">

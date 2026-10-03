@@ -52,8 +52,8 @@ export async function executePaperBuy(opts: {
             requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
             token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
             slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
-            execution_record, failure_reason, data_mode, filled_at
-          ) VALUES ($1,$2,$3,$4,'BUY','FAILED',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())`,
+            execution_record, failure_reason, data_mode, filled_at, sol_price_usd, sol_price_source
+          ) VALUES ($1,$2,$3,$4,'BUY','FAILED',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),$21,$22)`,
           [
             orderId,
             opts.portfolioId,
@@ -75,6 +75,8 @@ export async function executePaperBuy(opts: {
             JSON.stringify(sim.execution),
             sim.execution.failureReason,
             dataMode,
+            sim.costs.solPriceUsd,
+            sim.costs.solPriceSource,
           ],
         );
         if (sim.costs.totalCostUsd > 0 && cash >= sim.costs.totalCostUsd) {
@@ -87,9 +89,9 @@ export async function executePaperBuy(opts: {
             [opts.portfolioId, sim.costs.totalCostUsd, sim.costs.networkFeeUsd + sim.costs.priorityFeeUsd],
           );
           await client.query(
-            `INSERT INTO fee_records (portfolio_id, order_id, fee_type, amount_usd, details, data_mode)
-             VALUES ($1,$2,'network_failed_tx',$3,$4,$5)`,
-            [opts.portfolioId, orderId, sim.costs.totalCostUsd, JSON.stringify(sim.costs), dataMode],
+            `INSERT INTO fee_records (portfolio_id, order_id, fee_type, amount_usd, details, data_mode, sol_price_usd, sol_price_source)
+             VALUES ($1,$2,'network_failed_tx',$3,$4,$5,$6,$7)`,
+            [opts.portfolioId, orderId, sim.costs.totalCostUsd, JSON.stringify(sim.costs), dataMode, sim.costs.solPriceUsd, sim.costs.solPriceSource],
           );
         }
         return { success: false, orderId, reason: sim.execution.failureReason ?? 'Failed' };
@@ -111,8 +113,8 @@ export async function executePaperBuy(opts: {
           requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
           token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
           slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
-          execution_record, data_mode, filled_at
-        ) VALUES ($1,$2,$3,$4,'BUY',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())`,
+          execution_record, data_mode, filled_at, sol_price_usd, sol_price_source
+        ) VALUES ($1,$2,$3,$4,'BUY',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),$21,$22)`,
         [
           orderId,
           opts.portfolioId,
@@ -134,6 +136,8 @@ export async function executePaperBuy(opts: {
           sim.costs.totalCostUsd,
           JSON.stringify(sim.execution),
           dataMode,
+          sim.costs.solPriceUsd,
+          sim.costs.solPriceSource,
         ],
       );
 
@@ -202,9 +206,9 @@ export async function executePaperBuy(opts: {
       ] as const) {
         if (amount > 0) {
           await client.query(
-            `INSERT INTO fee_records (portfolio_id, order_id, fee_type, amount_usd, details, data_mode)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [opts.portfolioId, orderId, feeType, amount, JSON.stringify(sim.costs), dataMode],
+            `INSERT INTO fee_records (portfolio_id, order_id, fee_type, amount_usd, details, data_mode, sol_price_usd, sol_price_source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [opts.portfolioId, orderId, feeType, amount, JSON.stringify(sim.costs), dataMode, sim.costs.solPriceUsd, sim.costs.solPriceSource],
           );
         }
       }
@@ -275,8 +279,8 @@ export async function executePaperSell(opts: {
             requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
             token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
             slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
-            execution_record, failure_reason, data_mode, filled_at
-          ) VALUES ($1,$2,$3,$4,'SELL','FAILED',$5,0,$6,0,0,0,$7,$8,0,0,0,0,$9,$10,$11,$12,NOW())`,
+            execution_record, failure_reason, data_mode, filled_at, sol_price_usd, sol_price_source
+          ) VALUES ($1,$2,$3,$4,'SELL','FAILED',$5,0,$6,0,0,0,$7,$8,0,0,0,0,$9,$10,$11,$12,NOW(),$13,$14)`,
           [
             orderId,
             opts.portfolioId,
@@ -290,6 +294,8 @@ export async function executePaperSell(opts: {
             JSON.stringify(sim.execution),
             sim.execution.failureReason,
             dataMode,
+            sim.costs.solPriceUsd,
+            sim.costs.solPriceSource,
           ],
         );
         if (sim.costs.totalCostUsd > 0) {
@@ -341,8 +347,8 @@ export async function executePaperSell(opts: {
           requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
           token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
           slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
-          execution_record, data_mode, filled_at
-        ) VALUES ($1,$2,$3,$4,'SELL',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())`,
+          execution_record, data_mode, filled_at, sol_price_usd, sol_price_source
+        ) VALUES ($1,$2,$3,$4,'SELL',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),$21,$22)`,
         [
           orderId,
           opts.portfolioId,
@@ -364,6 +370,8 @@ export async function executePaperSell(opts: {
           sim.costs.totalCostUsd,
           JSON.stringify(sim.execution),
           dataMode,
+          sim.costs.solPriceUsd,
+          sim.costs.solPriceSource,
         ],
       );
 

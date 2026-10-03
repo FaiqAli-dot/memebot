@@ -14,8 +14,15 @@ import {
 } from '../strategies/catalog.js';
 import type { StrategyContext } from '../strategies/types.js';
 import { estimateExpectedValue } from '../risk/expected-value.js';
-import { estimateRoundTripCostPct } from '../execution/realism.js';
-import type { MarketRegime, TokenPhase } from '@memebot/shared';
+import { estimateRoundTripCost } from '../execution/cost-estimate.js';
+import {
+  resolveStrategyParams,
+  type ConfidenceLevel,
+  type LiquidityStatus,
+  type MarketRegime,
+  type StrategyParamsById,
+  type TokenPhase,
+} from '@memebot/shared';
 
 export interface ReplayMarketEvent extends Timestamped {
   type: 'trade' | 'snapshot' | 'safety' | 'discovery';
@@ -27,8 +34,16 @@ export interface ReplayConfig {
   seed: number;
   minExpectedNetValue: number;
   activeStrategyIds?: string[];
+  /** Per-strategy thresholds (as in portfolio settings); defaults when omitted */
+  strategyParams?: StrategyParamsById;
   startingCashUsd: number;
+  lowConfidenceMultiplier?: number;
+  /** Network base + priority + tip per transaction in USD (replay has no live SOL price) */
+  networkFeePerLegUsd?: number;
 }
+
+/** ~15k lamports per tx at ~$150 SOL; override per replay run when known. */
+const DEFAULT_REPLAY_NETWORK_FEE_PER_LEG_USD = 0.0025;
 
 export interface ReplayTrade {
   tokenId: string;
@@ -58,6 +73,7 @@ export function runDeterministicReplay(
   const rng = new SeededRng(config.seed);
   const accessor = new TimeGuardedAccessor(events, new Date(0));
   const catalog = activeStrategies(createStrategyCatalog(), config.activeStrategyIds);
+  const strategyParams = resolveStrategyParams(config.strategyParams);
   const trades: ReplayTrade[] = [];
   const regimes: ReplayResult['regimes'] = [];
   const phases: ReplayResult['phases'] = [];
@@ -172,27 +188,34 @@ export function runDeterministicReplay(
         safety,
         regime: regime.regime,
         phase: phase.phase,
-        buySellConfidence: 'LOW',
+        // Recorded measured confidence when present; otherwise insufficient evidence
+        buySellConfidence: (p.buySellConfidence as ConfidenceLevel | undefined) ?? 'LOW',
+        liquidityStatus: p.liquidityStatus as LiquidityStatus | undefined,
       };
 
-      const { best, all } = evaluateAllStrategies(catalog, ctx);
+      const { best, all } = evaluateAllStrategies(catalog, ctx, strategyParams);
       signals += all.filter((s) => s.action === 'BUY').length;
 
       if (best) {
-        const costPct = estimateRoundTripCostPct({
+        const sizeUsd = Math.min(cash * 0.05, 5);
+        const cost = estimateRoundTripCost({
+          positionSizeUsd: sizeUsd,
           liquidityUsd: ctx.liquidityUsd,
-          tradeUsd: Math.min(cash * 0.05, 5),
+          venue: (p.venue as string | undefined) ?? null,
+          absPriceChange5mPct: Math.abs(ctx.priceChange5mPct),
+          networkFeePerLegUsd: config.networkFeePerLegUsd ?? DEFAULT_REPLAY_NETWORK_FEE_PER_LEG_USD,
         });
         const evEst = estimateExpectedValue({
           signal: best,
-          estimatedExecutionCostPct: costPct,
+          cost,
           failureProbability: 0.08,
           minExpectedNetValue: config.minExpectedNetValue,
-          dataConfidence: 'LOW',
+          dataConfidence: (p.dataConfidence as ConfidenceLevel | undefined) ?? 'LOW',
+          lowConfidenceMultiplier: config.lowConfidenceMultiplier ?? 1.2,
         });
         if (evEst.passes) {
           buys++;
-          cash -= Math.min(cash * 0.05, 5) * (1 + costPct);
+          cash -= sizeUsd + cost.totalCostUsd;
           trades.push({
             tokenId: ev.tokenId,
             strategyId: best.strategyId,

@@ -4,6 +4,7 @@ import {
   computeFlowFeatures,
 } from '../../src/features/flow.js';
 import { estimateExpectedValue } from '../../src/risk/expected-value.js';
+import { estimateRoundTripCost } from '../../src/execution/cost-estimate.js';
 import { MomentumBreakoutStrategy } from '../../src/strategies/momentum-breakout.js';
 import { assessSafety, demoSafetyFromSymbol } from '../../src/safety/engine.js';
 import { detectTokenPhase } from '../../src/features/lifecycle.js';
@@ -41,15 +42,18 @@ describe('expected value', () => {
         strategyId: 't',
         strategyVersion: '1',
       },
-      estimatedExecutionCostPct: 0.04,
+      cost: estimateRoundTripCost({
+        positionSizeUsd: 50,
+        liquidityUsd: 2_000,
+        networkFeePerLegUsd: 0.003,
+      }),
       failureProbability: 0.1,
       minExpectedNetValue: 0.05,
       dataConfidence: 'LOW',
+      lowConfidenceMultiplier: 1.2,
     });
     expect(ev.passes).toBe(false);
-    expect(ev.reasons.some((r) => r.includes('threshold') || r.includes('haircut'))).toBe(
-      true,
-    );
+    expect(ev.reasons).toContain('expected_value_below_threshold');
   });
 });
 

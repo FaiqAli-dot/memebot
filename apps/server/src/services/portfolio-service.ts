@@ -6,7 +6,8 @@ import type {
 } from '@memebot/shared';
 import { query, withTransaction } from '../db/client.js';
 import { env, dataMode } from '../config/env.js';
-import { defaultPortfolioSettings } from '../engines/risk/engine.js';
+import { defaultPortfolioSettings, normalizeSettings } from '../engines/risk/engine.js';
+import { RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
 
 export async function ensureDefaultPortfolio(): Promise<string> {
   const id = env.DEFAULT_PORTFOLIO_ID;
@@ -36,6 +37,39 @@ export async function ensureDefaultPortfolio(): Promise<string> {
   );
 
   return id;
+}
+
+/**
+ * Separate RESEARCH paper portfolio for borderline (EV-shortfall) opportunities.
+ * Its trades never appear in production statistics (all stats are portfolio-scoped).
+ */
+export async function ensureResearchPortfolio(): Promise<string> {
+  const id = RESEARCH_PORTFOLIO_ID;
+  const existing = await query(`SELECT id FROM user_portfolios WHERE id = $1`, [id]);
+  if (existing.rows.length > 0) return id;
+  await query(
+    `INSERT INTO user_portfolios (
+      id, name, data_mode, starting_balance_usd, cash_usd, peak_equity_usd,
+      bot_status, settings, portfolio_type
+    ) VALUES ($1, $2, $3, $4, $4, $4, 'RUNNING', $5, 'RESEARCH')
+    ON CONFLICT (id) DO NOTHING`,
+    [
+      id,
+      'Research Paper (exploration — not production)',
+      dataMode,
+      env.INITIAL_BALANCE_USD,
+      JSON.stringify(defaultPortfolioSettings()),
+    ],
+  );
+  return id;
+}
+
+export async function getPortfolioType(portfolioId: string): Promise<'PRODUCTION' | 'RESEARCH' | null> {
+  const { rows } = await query<{ portfolio_type: 'PRODUCTION' | 'RESEARCH' }>(
+    `SELECT portfolio_type FROM user_portfolios WHERE id = $1`,
+    [portfolioId],
+  );
+  return rows[0]?.portfolio_type ?? null;
 }
 
 export async function getPortfolio(portfolioId: string): Promise<PortfolioSummary | null> {
@@ -113,24 +147,21 @@ export async function getPortfolioSettings(portfolioId: string): Promise<Portfol
     `SELECT settings FROM user_portfolios WHERE id = $1`,
     [portfolioId],
   );
-  return { ...defaultPortfolioSettings(), ...(rows[0]?.settings ?? {}) };
+  return normalizeSettings(rows[0]?.settings);
 }
 
 export async function updatePortfolioSettings(
   portfolioId: string,
   patch: Partial<Omit<PortfolioSettings, 'strategyParams'>> & {
-    strategyParams?: Partial<PortfolioSettings['strategyParams']>;
+    strategyParams?: PortfolioSettings['strategyParams'];
   },
 ): Promise<PortfolioSettings> {
   const current = await getPortfolioSettings(portfolioId);
-  const next: PortfolioSettings = {
-    ...current,
-    ...patch,
-    strategyParams: {
-      ...current.strategyParams,
-      ...(patch.strategyParams ?? {}),
-    },
-  };
+  const merged = { ...current.strategyParams };
+  for (const [strategyId, values] of Object.entries(patch.strategyParams ?? {})) {
+    merged[strategyId] = { ...(merged[strategyId] ?? {}), ...values };
+  }
+  const next = normalizeSettings({ ...current, ...patch, strategyParams: merged });
   await query(
     `UPDATE user_portfolios SET settings = $2, updated_at = NOW() WHERE id = $1`,
     [portfolioId, JSON.stringify(next)],
@@ -161,6 +192,7 @@ export async function resetPaperAccount(portfolioId: string): Promise<void> {
     await client.query(`DELETE FROM paper_fills WHERE order_id IN (SELECT id FROM paper_orders WHERE portfolio_id = $1)`, [portfolioId]);
     await client.query(`DELETE FROM fee_records WHERE portfolio_id = $1`, [portfolioId]);
     await client.query(`UPDATE paper_orders SET position_id = NULL WHERE portfolio_id = $1`, [portfolioId]);
+    await client.query(`DELETE FROM risk_decisions WHERE portfolio_id = $1`, [portfolioId]);
     await client.query(`DELETE FROM positions WHERE portfolio_id = $1`, [portfolioId]);
     await client.query(`DELETE FROM paper_orders WHERE portfolio_id = $1`, [portfolioId]);
     await client.query(`DELETE FROM portfolio_snapshots WHERE portfolio_id = $1`, [portfolioId]);
@@ -191,12 +223,18 @@ export async function resetPaperAccount(portfolioId: string): Promise<void> {
 
 export async function resetAllSimulationData(portfolioId: string): Promise<void> {
   await resetPaperAccount(portfolioId);
+  const research = await query(`SELECT id FROM user_portfolios WHERE id = $1`, [RESEARCH_PORTFOLIO_ID]);
+  if (research.rows.length > 0 && portfolioId !== RESEARCH_PORTFOLIO_ID) {
+    await resetPaperAccount(RESEARCH_PORTFOLIO_ID);
+    await setBotStatus(RESEARCH_PORTFOLIO_ID, 'RUNNING');
+  }
   await withTransaction(async (client) => {
     await client.query(`DELETE FROM bot_events WHERE portfolio_id = $1 OR data_mode = $2`, [
       portfolioId,
       dataMode,
     ]);
     await client.query(`DELETE FROM signals WHERE data_mode = $1`, [dataMode]);
+    await client.query(`DELETE FROM funnel_snapshots WHERE data_mode = $1`, [dataMode]);
     await client.query(`DELETE FROM strategy_runs WHERE data_mode = $1`, [dataMode]);
     await client.query(`DELETE FROM holder_snapshots WHERE data_mode = $1`, [dataMode]);
     await client.query(`DELETE FROM liquidity_snapshots WHERE data_mode = $1`, [dataMode]);

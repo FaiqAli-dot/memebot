@@ -2,13 +2,18 @@
  * Strategy framework — entry strategies never emit SELL.
  * Exits belong to position / execution / risk systems.
  */
-import type {
-  MarketRegime,
-  RejectionReason,
-  SafetyClass,
-  TokenPhase,
+import {
+  STRATEGY_PARAM_REGISTRY,
+  type LiquidityStatus,
+  type MarketRegime,
+  type RejectionReason,
+  type SafetyClass,
+  type StrategyParamKey,
+  type StrategyParamValues,
+  type TokenPhase,
 } from '@memebot/shared';
 import type { WindowFlow } from '../features/flow.js';
+import type { VolumeAcceleration } from '../features/market-metrics.js';
 import type { SafetyResult } from '../safety/engine.js';
 
 export interface StrategyContext {
@@ -37,6 +42,37 @@ export interface StrategyContext {
   phase?: TokenPhase;
   buySellConfidence?: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
   discoverySource?: string;
+  /** Non-overlapping volume acceleration (preferred over priorVolume5mUsd) */
+  volumeAccel?: VolumeAcceleration;
+  /** Only KNOWN liquidity passes production liquidity checks */
+  liquidityStatus?: LiquidityStatus;
+}
+
+const LEGACY_ACCEL = { minBaselineUsd: 500, maxAccel: 10 };
+
+/**
+ * Volume acceleration a strategy may act on. Returns null when the baseline is
+ * insufficient — strategies must reject rather than treat it as zero or infinite.
+ */
+export function strategyVolumeAccel(ctx: StrategyContext): { value: number | null; label: string } {
+  if (ctx.volumeAccel) {
+    const a = ctx.volumeAccel;
+    return {
+      value: a.capped,
+      label: a.capped == null ? `insufficient_data(${a.method})` : `${a.capped.toFixed(2)}(${a.method})`,
+    };
+  }
+  const prior = ctx.priorVolume5mUsd;
+  if (prior == null || prior < LEGACY_ACCEL.minBaselineUsd) {
+    return { value: null, label: 'insufficient_data(legacy)' };
+  }
+  const v = Math.min(ctx.volume5mUsd / prior, LEGACY_ACCEL.maxAccel);
+  return { value: v, label: `${v.toFixed(2)}(legacy)` };
+}
+
+export function liquidityIsKnown(ctx: StrategyContext): boolean {
+  if (ctx.liquidityStatus) return ctx.liquidityStatus === 'KNOWN' && ctx.liquidityUsd > 0;
+  return ctx.liquidityUsd > 0;
 }
 
 export interface Signal {
@@ -67,7 +103,18 @@ export interface Strategy {
   readonly name: string;
   readonly version: string;
   readonly activeByDefault: boolean;
-  evaluate(context: StrategyContext): Signal;
+  /** `params` are this strategy's resolved thresholds; omitted keys use registry defaults */
+  evaluate(context: StrategyContext, params?: StrategyParamValues): Signal;
+}
+
+/** This strategy's registered thresholds: registry defaults overlaid with `params`. */
+export function paramsFor(strategyId: string, params?: StrategyParamValues): Record<StrategyParamKey, number> {
+  const out: Partial<Record<StrategyParamKey, number>> = {};
+  for (const def of STRATEGY_PARAM_REGISTRY[strategyId]?.params ?? []) {
+    const v = params?.[def.key];
+    out[def.key] = typeof v === 'number' && Number.isFinite(v) ? v : def.default;
+  }
+  return out as Record<StrategyParamKey, number>;
 }
 
 export function noTrade(

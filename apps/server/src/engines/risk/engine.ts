@@ -1,5 +1,4 @@
-import type { PortfolioSettings } from '@memebot/shared';
-import { DEFAULT_MOMENTUM_PARAMS } from '../strategy/momentum-v1.js';
+import { defaultStrategyParams, resolveStrategyParams, type PortfolioSettings } from '@memebot/shared';
 import { env, realismProfile } from '../../config/env.js';
 import {
   transitionRiskState,
@@ -47,7 +46,7 @@ export function defaultPortfolioSettings(): PortfolioSettings {
     minTokenAgeMinutes: 5,
     maxTokenAgeMinutes: 24 * 60,
     scanIntervalMs: env.JOB_TOKEN_DISCOVERY_INTERVAL_MS,
-    strategyParams: { ...DEFAULT_MOMENTUM_PARAMS },
+    strategyParams: defaultStrategyParams(),
     failedTxStillChargesNetwork: env.FAILED_TX_STILL_CHARGES_NETWORK,
     priorityFeeLamports: env.DEFAULT_PRIORITY_FEE_LAMPORTS,
     allowDuplicateTokenPositions: false,
@@ -63,6 +62,15 @@ export function defaultPortfolioSettings(): PortfolioSettings {
     recoveryDrawdownPct: env.RECOVERY_DRAWDOWN_PCT,
     cautionDrawdownPct: env.CAUTION_DRAWDOWN_PCT,
     maxHoldPartialExits: false,
+  };
+}
+
+/** Stored settings → complete settings with per-strategy parameters resolved (one path for all readers). */
+export function normalizeSettings(stored: Partial<PortfolioSettings> | null | undefined): PortfolioSettings {
+  return {
+    ...defaultPortfolioSettings(),
+    ...(stored ?? {}),
+    strategyParams: resolveStrategyParams(stored?.strategyParams),
   };
 }
 

@@ -16,6 +16,10 @@ export const api = {
   meta: () => request<Record<string, unknown>>('/api/meta'),
   portfolio: () => request<import('@memebot/shared').PortfolioSummary>('/api/portfolio'),
   botStatus: () => request<import('@memebot/shared').BotStatusInfo>('/api/bot/status'),
+  botReadiness: () => request<import('@memebot/shared').BotReadiness>('/api/bot/readiness'),
+  learningStatus: () => request<import('@memebot/shared').LearningStatus>('/api/learning/status'),
+  week1Overview: (hours = 24) =>
+    request<import('@memebot/shared').Week1Overview>(`/api/week1/overview?hours=${hours}`),
   control: (action: 'start' | 'pause') =>
     request('/api/bot/control', { method: 'POST', body: JSON.stringify({ action }) }),
   reset: (scope: 'paper_account' | 'all_simulation') =>
@@ -120,7 +124,6 @@ export function pnlClass(n: number | null | undefined): string {
 export function wsUrl(): string {
   if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL as string;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Dev: vite proxies /ws; prod: same host assumes API serves WS or use env
-  if (import.meta.env.DEV) return `${proto}//${location.host}/ws`;
-  return `${proto}//${location.hostname}:3001/ws`;
+  // Dev: vite proxies /ws; prod: the API serves the dashboard and /ws on the same origin
+  return `${proto}//${location.host}/ws`;
 }

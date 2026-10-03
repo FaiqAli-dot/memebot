@@ -1,26 +1,47 @@
 import type pg from 'pg';
-import type {
-  DailyReport,
-  DailyReportListItem,
-  Lesson,
-  LessonStatus,
-  PortfolioSettings,
-  ReportReview,
-  ReportSummary,
+import {
+  STRATEGY_PARAM_REGISTRY,
+  type DailyReport,
+  type DailyReportListItem,
+  type FeatureStat,
+  type Lesson,
+  type LessonStatus,
+  type PortfolioSettings,
+  type ReportReview,
+  type ReportSummary,
+  type StrategyReportSection,
 } from '@memebot/shared';
 import { query, withTransaction } from '../db/client.js';
 import { dataMode, env } from '../config/env.js';
-import { defaultPortfolioSettings } from '../engines/risk/engine.js';
-import { analyzeExits, analyzeFeatures, featuresFromMarketState } from '../engines/learning/analyze.js';
+import { normalizeSettings } from '../engines/risk/engine.js';
+import {
+  analyzeExits,
+  analyzeStrategyFeatures,
+  strategyInputsFromMarketState,
+} from '../engines/learning/analyze.js';
 import { selectImportantTrades } from '../engines/learning/select.js';
 import {
   FLIP_FLOP_DAYS,
   type PastLesson,
   applyLessons,
-  deriveLessons,
+  deriveStrategyLessons,
+  exitLessons,
+  finalizeLessons,
   revertLessons,
 } from '../engines/learning/lessons.js';
 import { reviewLessons } from '../engines/learning/review.js';
+import {
+  evaluateCalibrationGate,
+  getActiveEvCalibrations,
+  runCalibrationCycle,
+  type CalibrationGate,
+} from '../learning/calibration-service.js';
+import { CALIBRATION_GRADE_QUALITY, recordMissingObservations } from '../learning/observations.js';
+import { loadObservations, type ObservationRecord } from '../learning/repository.js';
+import { getDataQuality } from '../learning/quality.js';
+import { learningModeInfo } from '../learning/mode.js';
+import { finite, mean, wilson } from '../learning/stats.js';
+import { createStrategyCatalog } from '../strategies/catalog.js';
 import { type ClosedTrade, bucketStats, holdSec, isWin } from '../engines/learning/types.js';
 import { logBotEvent } from './token-service.js';
 import { publish } from '../ws/hub.js';
@@ -69,7 +90,7 @@ export function addDays(date: string, days: number): string {
 const TRADE_SELECT = `
   SELECT p.id, p.token_id, t.symbol, p.entry_price_usd, p.highest_price_usd, p.cost_basis_usd,
          p.net_pnl_usd, p.gross_pnl_usd, p.entry_costs, p.exit_costs, p.close_reason,
-         p.opened_at, p.closed_at, s.market_state, s.overall_score
+         p.opened_at, p.closed_at, p.strategy_key, s.market_state, s.overall_score
   FROM positions p
   JOIN tokens t ON t.id = p.token_id
   LEFT JOIN signals s ON s.id = p.entry_signal_id
@@ -81,6 +102,7 @@ function mapTrade(r: Record<string, unknown>): ClosedTrade {
     positionId: String(r.id),
     tokenId: String(r.token_id),
     symbol: String(r.symbol),
+    strategyId: (r.strategy_key as string | null) ?? null,
     entryPriceUsd: Number(r.entry_price_usd),
     highestPriceUsd: Number(r.highest_price_usd),
     costBasisUsd: Number(r.cost_basis_usd),
@@ -90,11 +112,96 @@ function mapTrade(r: Record<string, unknown>): ClosedTrade {
     closeReason: (r.close_reason as string | null) ?? null,
     openedAt: new Date(r.opened_at as Date),
     closedAt: new Date(r.closed_at as Date),
-    features: featuresFromMarketState(
+    features: strategyInputsFromMarketState(
       r.market_state as Record<string, unknown> | null,
-      Number(r.overall_score ?? 0),
+      r.overall_score == null ? null : Number(r.overall_score),
     ),
   };
+}
+
+/** Calibration-grade observation → learner trade. Features are the exact entry-time strategy inputs. */
+function tradeFromObservation(o: ObservationRecord): ClosedTrade {
+  return {
+    positionId: o.positionId,
+    tokenId: o.tokenId,
+    symbol: o.symbol ?? '',
+    strategyId: o.strategyId,
+    entryPriceUsd: o.entryPriceUsd,
+    highestPriceUsd: o.entryPriceUsd,
+    costBasisUsd: o.positionSizeUsd,
+    netPnlUsd: o.netPnlUsd,
+    grossPnlUsd: o.grossPnlUsd,
+    costsUsd: o.actualCostUsd ?? 0,
+    closeReason: o.exitReason,
+    openedAt: o.entryAt,
+    closedAt: o.exitAt,
+    features: o.strategyInputs,
+  };
+}
+
+const strategyName = (() => {
+  const names = new Map(createStrategyCatalog().map((s) => [s.id, s.name]));
+  return (id: string) => STRATEGY_PARAM_REGISTRY[id]?.name ?? names.get(id) ?? id;
+})();
+
+async function latestCandidates(): Promise<Map<string, { version: string; status: string }>> {
+  const { rows } = await query<{ strategy_id: string; version: string; status: string }>(
+    `SELECT DISTINCT ON (strategy_id) strategy_id, version, status FROM calibration_versions
+     WHERE data_mode = $1 ORDER BY strategy_id, created_at DESC`,
+    [dataMode],
+  );
+  return new Map(rows.map((r) => [r.strategy_id, { version: r.version, status: r.status }]));
+}
+
+function strategySections(opts: {
+  dayObs: ObservationRecord[];
+  windowObs: ObservationRecord[];
+  lessons: Lesson[];
+  settings: PortfolioSettings;
+  active: Map<string, { version: string }>;
+  candidates: Map<string, { version: string; status: string }>;
+}): StrategyReportSection[] {
+  const ids = new Set<string>([
+    ...Object.keys(STRATEGY_PARAM_REGISTRY),
+    ...opts.windowObs.map((o) => o.strategyId),
+    ...opts.lessons.map((l) => l.strategyId).filter((s): s is string => Boolean(s)),
+  ]);
+  return [...ids].sort().map((strategyId) => {
+    const day = opts.dayObs.filter((o) => o.strategyId === strategyId);
+    const win = opts.windowObs.filter((o) => o.strategyId === strategyId);
+    const dayWins = day.filter((o) => o.win).length;
+    const winWins = win.filter((o) => o.win).length;
+    const ci = win.length ? wilson(winWins, win.length) : null;
+    const cand = opts.candidates.get(strategyId);
+    return {
+      strategyId,
+      name: strategyName(strategyId),
+      day: {
+        trades: day.length,
+        wins: dayWins,
+        losses: day.length - dayWins,
+        winRatePct: day.length ? (dayWins / day.length) * 100 : null,
+        netPnlUsd: day.reduce((a, o) => a + o.netPnlUsd, 0),
+      },
+      window: {
+        trades: win.length,
+        calibrationEligible: win.filter((o) => o.quality === CALIBRATION_GRADE_QUALITY).length,
+        winRatePct: win.length ? (winWins / win.length) * 100 : null,
+        winRateCI: ci ? { low: ci.low * 100, high: ci.high * 100 } : null,
+        avgPredictedEv: mean(finite(win.map((o) => o.predictedEv))),
+        avgRealizedReturn: mean(win.map((o) => o.netReturn)),
+        avgPositionSizeUsd: mean(win.map((o) => o.positionSizeUsd)),
+        netPnlUsd: win.reduce((a, o) => a + o.netPnlUsd, 0),
+      },
+      calibration: {
+        activeVersion: opts.active.get(strategyId)?.version ?? null,
+        latestCandidate: cand?.version ?? null,
+        latestStatus: cand?.status ?? null,
+      },
+      params: (opts.settings.strategyParams[strategyId] ?? {}) as Record<string, number>,
+      lessons: opts.lessons.filter((l) => l.strategyId === strategyId),
+    };
+  });
 }
 
 async function tradesByLocalDate(db: Db, portfolioId: string, from: string, to: string) {
@@ -139,8 +246,16 @@ function summarize(day: ClosedTrade[], window: ClosedTrade[]): ReportSummary {
 }
 
 function countLessons(lessons: Lesson[]): Record<LessonStatus, number> {
-  const counts: Record<LessonStatus, number> = { applied: 0, skipped: 0, reverted: 0 };
-  for (const l of lessons) if (l.param !== 'all') counts[l.status]++;
+  const counts: Record<LessonStatus, number> = {
+    applied: 0,
+    skipped: 0,
+    reverted: 0,
+    rejected: 0,
+    unused_parameter: 0,
+    portfolio_scope: 0,
+    validated_not_applied: 0,
+  };
+  for (const l of lessons) if (l.param !== 'all') counts[l.status] = (counts[l.status] ?? 0) + 1;
   return counts;
 }
 
@@ -178,7 +293,7 @@ async function lockedSettings(db: Db, portfolioId: string): Promise<PortfolioSet
     [portfolioId],
   );
   if (!rows[0]) throw new ReportError('Portfolio not found', 404);
-  return { ...defaultPortfolioSettings(), ...rows[0].settings };
+  return normalizeSettings(rows[0].settings);
 }
 
 async function saveSettings(db: Db, portfolioId: string, settings: PortfolioSettings) {
@@ -209,6 +324,27 @@ export async function generateDailyReport(
 ): Promise<{ report: DailyReport; created: boolean }> {
   const now = opts.now ?? new Date();
   const reportDate = opts.reportDate ?? localDateTime(now, env.REPORT_TIMEZONE).date;
+  const observationMode = env.LEARNING_OBSERVATION_MODE;
+  // Every closed trade must be an observation before the report reads them
+  await recordMissingObservations(5000);
+  // Level 3 gate: settings only change when enough new observations AND the interval passed
+  const gate: CalibrationGate = await evaluateCalibrationGate(now);
+  const windowObs = await loadObservations({
+    portfolioType: 'PRODUCTION',
+    exitAfter: new Date(now.getTime() - REPORT_WINDOW_DAYS * 86_400_000),
+    limit: 20_000,
+  });
+  const dayObs = windowObs.filter((o) => localDateTime(o.exitAt, env.REPORT_TIMEZONE).date === reportDate);
+  const gradeByStrategy = new Map<string, ClosedTrade[]>();
+  for (const o of windowObs) {
+    if (o.quality !== CALIBRATION_GRADE_QUALITY || o.exitAt > now) continue;
+    gradeByStrategy.set(o.strategyId, [...(gradeByStrategy.get(o.strategyId) ?? []), tradeFromObservation(o)]);
+  }
+  const [dataQuality, active, candidates] = await Promise.all([
+    getDataQuality(),
+    getActiveEvCalibrations(),
+    latestCandidates(),
+  ]);
 
   const result = await withTransaction(async (db) => {
     await db.query(`SELECT pg_advisory_xact_lock(hashtext('daily_report:' || $1))`, [portfolioId]);
@@ -275,17 +411,34 @@ export async function generateDailyReport(
         before,
         // A revert resets the streak so reverts can't cascade on consecutive days.
         previousVerdict: previous?.reverted === 'true' ? null : (previous?.verdict ?? null),
+        minTrades: env.MIN_NEW_OBSERVATIONS_FOR_LEARNING,
       });
     } else {
       review = reviewLessons({ targetReportId: null, since: [], before: [], previousVerdict: null });
     }
 
-    const features = analyzeFeatures(windowTrades, settingsBefore);
+    const strategyIds = [...new Set([...Object.keys(STRATEGY_PARAM_REGISTRY), ...gradeByStrategy.keys()])].sort();
+    const features: FeatureStat[] = strategyIds.flatMap((id) =>
+      analyzeStrategyFeatures(id, gradeByStrategy.get(id) ?? [], settingsBefore.strategyParams[id] ?? {}),
+    );
     const exits = analyzeExits(windowTrades, settingsBefore);
 
     let lessons: Lesson[];
     let settingsAfter: PortfolioSettings;
-    if (review.reverted && target) {
+    if (review.reverted && target && observationMode) {
+      lessons = [
+        {
+          param: 'all',
+          from: null,
+          to: null,
+          status: 'skipped',
+          reason:
+            'Performance was worse for two reports in a row after the last changes. LEARNING_OBSERVATION_MODE keeps settings frozen; roll the earlier report back manually if needed',
+          evidence: { sinceTrades: review.since.n, beforeTrades: review.before.n },
+        },
+      ];
+      settingsAfter = settingsBefore;
+    } else if (review.reverted && target) {
       const undo = revertLessons(settingsBefore, target.lessons);
       settingsAfter = undo.settings;
       lessons = [
@@ -305,6 +458,23 @@ export async function generateDailyReport(
         },
       ];
       await db.query(`UPDATE daily_reports SET rolled_back_at = NOW() WHERE id = $1`, [target.id]);
+    } else if (gate.decision !== 'PERFORMED') {
+      lessons = [
+        {
+          param: 'all',
+          from: null,
+          to: null,
+          status: 'skipped',
+          reason: `Calibration skipped: ${gate.reason}. Settings unchanged; still collecting observations`,
+          evidence: {
+            newObservations: gate.newObservations,
+            requiredObservations: gate.requiredObservations,
+            hoursSinceLast: gate.hoursSinceLast ?? 0,
+            requiredHours: gate.requiredHours,
+          },
+        },
+      ];
+      settingsAfter = settingsBefore;
     } else {
       const history = (
         await db.query<{ report_date: string; lessons: Lesson[] }>(
@@ -316,17 +486,26 @@ export async function generateDailyReport(
       ).rows.flatMap((r) =>
         r.lessons.map((l): PastLesson => ({ ...l, reportDate: r.report_date })),
       );
-      lessons = deriveLessons({
-        features,
-        exits,
-        settings: settingsBefore,
-        windowTradeCount: windowTrades.length,
-        minTrades: env.LEARNING_MIN_TRADES,
-        history,
-        reportDate,
-        enabled: env.LEARNING_ENABLED,
-      });
-      settingsAfter = applyLessons(settingsBefore, lessons);
+      // Each strategy learns only from its own calibration-grade trades; exits are shared → never applied
+      const derived = [
+        ...strategyIds.flatMap((strategyId) =>
+          deriveStrategyLessons({
+            strategyId,
+            trades: gradeByStrategy.get(strategyId) ?? [],
+            params: settingsBefore.strategyParams[strategyId] ?? {},
+            minTrades: env.LEARNING_MIN_TRADES,
+            history,
+            reportDate,
+          }),
+        ),
+        ...exitLessons(exits, settingsBefore),
+      ];
+      const applied = applyLessons(
+        settingsBefore,
+        finalizeLessons(derived, { enabled: env.LEARNING_ENABLED, observationMode }),
+      );
+      lessons = applied.lessons;
+      settingsAfter = applied.settings;
     }
 
     const changed = lessons.some((l) => l.status === 'applied' || l.status === 'reverted');
@@ -344,7 +523,16 @@ export async function generateDailyReport(
         dataMode,
         JSON.stringify(summarize(dayTrades, windowTrades)),
         JSON.stringify(selectImportantTrades(dayTrades)),
-        JSON.stringify({ features, exits, review, learningEnabled: env.LEARNING_ENABLED }),
+        JSON.stringify({
+          features,
+          exits,
+          review,
+          learningEnabled: env.LEARNING_ENABLED,
+          calibrationGate: gate,
+          mode: learningModeInfo(),
+          dataQuality,
+          strategies: strategySections({ dayObs, windowObs, lessons, settings: settingsAfter, active, candidates }),
+        }),
         JSON.stringify(lessons),
         JSON.stringify(settingsBefore),
         JSON.stringify(settingsAfter),
@@ -356,6 +544,11 @@ export async function generateDailyReport(
 
   if (result.created) {
     const { report } = result;
+    try {
+      await runCalibrationCycle(gate, { reportId: report.id, portfolioId, now });
+    } catch (err) {
+      logger.error({ err, reportId: report.id }, 'Calibration cycle failed');
+    }
     await logBotEvent({
       portfolioId,
       level: 'info',

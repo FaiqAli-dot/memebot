@@ -1,4 +1,31 @@
 export const DEFAULT_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000001';
+/** Separate paper portfolio for borderline research trades — never mixed into production stats. */
+export const RESEARCH_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000002';
+
+export const PORTFOLIO_TYPES = ['PRODUCTION', 'RESEARCH'] as const;
+export type PortfolioType = (typeof PORTFOLIO_TYPES)[number];
+
+export const SIGNAL_LANES = ['PRODUCTION', 'RESEARCH'] as const;
+export type SignalLane = (typeof SIGNAL_LANES)[number];
+
+export const TOKEN_LIFECYCLE_STATES = [
+  'DISCOVERED',
+  'TRACKING',
+  'ELIGIBLE',
+  'ACTIVE',
+  'STALE',
+  'ARCHIVED',
+] as const;
+export type TokenLifecycleState = (typeof TOKEN_LIFECYCLE_STATES)[number];
+
+export const LIQUIDITY_STATUSES = ['KNOWN', 'UNKNOWN', 'BONDING_CURVE'] as const;
+export type LiquidityStatus = (typeof LIQUIDITY_STATUSES)[number];
+
+export const TRADING_ELIGIBILITIES = ['TRADING_ELIGIBLE', 'RESEARCH_ONLY', 'UNKNOWN'] as const;
+export type TradingEligibility = (typeof TRADING_ELIGIBILITIES)[number];
+
+export const AGE_SOURCES = ['POOL_CREATED_AT', 'FIRST_OBSERVED_AT'] as const;
+export type AgeSource = (typeof AGE_SOURCES)[number];
 export const INITIAL_BALANCE_USD = 100;
 export const SOLANA_CHAIN = 'solana' as const;
 

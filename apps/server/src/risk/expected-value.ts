@@ -1,85 +1,128 @@
 /**
  * Expected value assessment — optimize for net expectancy, not win rate.
+ *
+ * PROVISIONAL RESEARCH MODEL. pWin(confidence), expectedReturn and expectedLoss are
+ * uncalibrated placeholders until enough closed paper/research trades exist to fit
+ * them empirically. The output is NOT a statistically proven expected return.
+ *
+ * Threshold:
+ *   MEDIUM/HIGH measured data confidence → minExpectedNetValue
+ *   LOW/UNKNOWN                          → minExpectedNetValue × lowConfidenceMultiplier
+ * There is no additional confidence haircut (that double penalty was removed).
+ *
+ * An optional promoted EV calibration (Level 3) maps raw EV → offset + scale × raw.
+ * Calibrations are constrained to offset ≤ 0 and scale ≤ 1, so they can only make
+ * the model more conservative, never more aggressive.
  */
-import type { ConfidenceLevel, ExpectedValueEstimate } from '@memebot/shared';
+import type { ConfidenceLevel, ExecutionCostEstimate, ExpectedValueEstimate } from '@memebot/shared';
 import type { Signal } from '../strategies/types.js';
 
-export const EV_VERSION = 'ev-v1';
+export const EV_VERSION = 'ev-v2';
+
+export interface EvCalibration {
+  version: string;
+  offset: number;
+  scale: number;
+}
 
 export interface EvInput {
   signal: Signal;
-  estimatedExecutionCostPct: number;
+  /** Round-trip cost for the actual proposed position size */
+  cost: ExecutionCostEstimate;
   failureProbability: number;
-  /** Extra uncertainty haircut 0-1 */
-  uncertaintyHaircut?: number;
   minExpectedNetValue: number;
-  dataConfidence?: ConfidenceLevel;
+  /** Measured, never hard-coded */
+  dataConfidence: ConfidenceLevel;
+  lowConfidenceMultiplier: number;
+  /** Optional explicit extra haircut (fraction); default none */
+  uncertaintyHaircut?: number;
+  /** Promoted calibration for this strategy (production only) */
+  calibration?: EvCalibration | null;
+}
+
+export function evThresholdMultiplier(dataConfidence: ConfidenceLevel, lowConfidenceMultiplier: number): number {
+  return dataConfidence === 'LOW' || dataConfidence === 'UNKNOWN' ? lowConfidenceMultiplier : 1;
+}
+
+/** Model win probability from strategy confidence (0–100). Uncalibrated placeholder. */
+export function winProbabilityFromConfidence(confidence: number): number {
+  return clamp(0.35 + (confidence / 100) * 0.25, 0.15, 0.65);
+}
+
+export function applyEvCalibration(rawEv: number, c: EvCalibration): number {
+  const offset = Math.min(0, c.offset);
+  const scale = clamp(c.scale, 0, 1);
+  const calibrated = offset + scale * rawEv;
+  return Math.min(rawEv, calibrated);
 }
 
 export function estimateExpectedValue(input: EvInput): ExpectedValueEstimate {
   const grossUpside = input.signal.expectedReturn;
   const downside = input.signal.expectedLoss;
-  const cost = input.estimatedExecutionCostPct;
+  const cost = input.cost.totalCostRate;
   const failP = clamp(input.failureProbability, 0, 0.95);
+  const multiplier = evThresholdMultiplier(input.dataConfidence, input.lowConfidenceMultiplier);
+  const threshold = round4(input.minExpectedNetValue * multiplier);
   const reasons: string[] = [];
+  const pWin = winProbabilityFromConfidence(input.signal.confidence);
+
+  const base = {
+    grossUpside,
+    downside,
+    positionSizeUsd: input.cost.positionSizeUsd,
+    executionCostRate: round6(cost),
+    executionCostUsd: round6(input.cost.totalCostUsd),
+    costBreakdown: input.cost,
+    failureProbability: failP,
+    timeToTargetSec: input.signal.expectedHoldTimeSec,
+    threshold,
+    thresholdMultiplier: multiplier,
+    dataConfidence: input.dataConfidence,
+    winProbability: pWin,
+    calibrated: false,
+  };
 
   if (grossUpside == null || downside == null) {
     return {
-      grossUpside,
-      downside,
-      executionCostUsd: null,
-      failureProbability: failP,
-      timeToTargetSec: input.signal.expectedHoldTimeSec,
+      ...base,
       expectedNetValue: null,
-      threshold: input.minExpectedNetValue,
       passes: false,
       uncertainty: 'UNKNOWN',
       reasons: ['missing_return_or_loss_estimate'],
     };
   }
 
-  // Simple EV: pWin * (upside - cost) + pLose * (-downside - cost) - failP * cost
-  const conf = input.signal.confidence / 100;
-  const pWin = clamp(0.35 + conf * 0.25, 0.15, 0.65);
+  // pWin * (upside - cost) + pLose * (-downside - cost) - failP * cost
   const pLose = 1 - pWin - failP * 0.5;
   let expectedNet =
-    pWin * (grossUpside - cost) +
-    Math.max(0, pLose) * (-downside - cost) -
-    failP * cost;
-
-  const haircut = input.uncertaintyHaircut ?? 0;
-  if (input.dataConfidence === 'LOW' || input.dataConfidence === 'UNKNOWN') {
-    expectedNet -= 0.03;
-    reasons.push('low_data_confidence_haircut');
+    pWin * (grossUpside - cost) + Math.max(0, pLose) * (-downside - cost) - failP * cost;
+  if (input.uncertaintyHaircut) {
+    expectedNet -= input.uncertaintyHaircut;
+    reasons.push('explicit_uncertainty_haircut');
   }
-  expectedNet -= haircut;
 
-  const uncertainty: ConfidenceLevel =
-    input.dataConfidence === 'HIGH' && input.signal.confidence >= 70
-      ? 'HIGH'
-      : input.dataConfidence === 'LOW' || input.signal.confidence < 45
-        ? 'LOW'
-        : 'MEDIUM';
+  let calibration: Pick<ExpectedValueEstimate, 'calibrated' | 'rawExpectedNetValue' | 'calibrationVersion'> = {
+    calibrated: false,
+  };
+  if (input.calibration) {
+    const raw = expectedNet;
+    expectedNet = applyEvCalibration(raw, input.calibration);
+    calibration = { calibrated: true, rawExpectedNetValue: round4(raw), calibrationVersion: input.calibration.version };
+    reasons.push('ev_calibrated');
+  }
 
-  // Uncertainty-aware threshold: require more edge when uncertain
-  const threshold =
-    input.minExpectedNetValue *
-    (uncertainty === 'LOW' ? 1.5 : uncertainty === 'HIGH' ? 1 : 1.2);
+  if (!input.cost.networkFeePriced) reasons.push('network_fee_unpriced');
+  if (multiplier > 1) reasons.push('low_data_confidence_threshold_multiplier');
 
-  const passes = expectedNet >= threshold;
-  if (!passes) reasons.push('expected_value_below_threshold');
-  else reasons.push('edge_exceeds_uncertainty_aware_threshold');
+  const passes = input.cost.networkFeePriced && expectedNet >= threshold;
+  reasons.push(passes ? 'edge_exceeds_threshold' : 'expected_value_below_threshold');
 
   return {
-    grossUpside,
-    downside,
-    executionCostUsd: cost,
-    failureProbability: failP,
-    timeToTargetSec: input.signal.expectedHoldTimeSec,
+    ...base,
+    ...calibration,
     expectedNetValue: round4(expectedNet),
-    threshold: round4(threshold),
     passes,
-    uncertainty,
+    uncertainty: input.dataConfidence,
     reasons,
   };
 }
@@ -90,4 +133,8 @@ function clamp(n: number, lo: number, hi: number): number {
 
 function round4(n: number): number {
   return Math.round(n * 10_000) / 10_000;
+}
+
+function round6(n: number): number {
+  return Math.round(n * 1_000_000) / 1_000_000;
 }

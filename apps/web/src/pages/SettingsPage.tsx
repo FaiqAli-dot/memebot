@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { PortfolioSettings } from '@memebot/shared';
+import { STRATEGY_PARAM_REGISTRY, type PortfolioSettings } from '@memebot/shared';
 import { api } from '../lib/api';
 
 export function SettingsPage() {
@@ -59,47 +59,39 @@ export function SettingsPage() {
           {num('takeProfitPct', 'Take profit', 0.01)}
           {num('trailingStopPct', 'Trailing stop (blank to disable)', 0.01)}
           {num('maxHoldingTimeSec', 'Max holding time (sec)', 1)}
-          {num('minLiquidityUsd', 'Min liquidity USD', 100)}
-          {num('minTokenAgeMinutes', 'Min token age (min)', 1)}
-          {num('maxTokenAgeMinutes', 'Max token age (min)', 1)}
-          {num('scanIntervalMs', 'Scan interval (ms)', 1000)}
+          {num('minLiquidityUsd', 'Emergency exit: liquidity floor USD', 100)}
           {num('priorityFeeLamports', 'Priority fee lamports', 100)}
         </div>
 
-        <h3 style={{ marginTop: '1rem' }}>Momentum Scanner v1 parameters</h3>
-        <div className="grid grid-3">
-          {(
-            [
-              ['minVolume5mUsd', 'Min 5m volume'],
-              ['minVolumeAcceleration', 'Min volume acceleration'],
-              ['minPriceChange5mPct', 'Min 5m price change %'],
-              ['minBuySellRatio', 'Min buy/sell ratio'],
-              ['minLiquidityUsd', 'Strategy min liquidity'],
-              ['minActivityTx5m', 'Min 5m tx count'],
-              ['minTokenAgeMinutes', 'Strategy min age'],
-              ['maxTokenAgeMinutes', 'Strategy max age'],
-              ['minOverallScore', 'Min overall score'],
-              ['maxTopHolderPct', 'Max top holder %'],
-            ] as const
-          ).map(([k, label]) => (
-            <label key={k} className="field" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <span style={{ color: 'var(--muted)', fontSize: '0.7rem' }}>{label}</span>
-              <input
-                type="number"
-                value={settings.strategyParams[k]}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    strategyParams: {
-                      ...settings.strategyParams,
-                      [k]: Number(e.target.value),
-                    },
-                  })
-                }
-              />
-            </label>
-          ))}
-        </div>
+        {Object.entries(STRATEGY_PARAM_REGISTRY).map(([strategyId, def]) => (
+          <div key={strategyId}>
+            <h3 style={{ marginTop: '1rem' }}>{def.name} thresholds</h3>
+            <div className="grid grid-3">
+              {def.params.map((p) => (
+                <label key={p.key} className="field" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ color: 'var(--muted)', fontSize: '0.7rem' }}>
+                    {p.label} ({p.min}–{p.max}){p.safety ? ' · safety' : ''}
+                  </span>
+                  <input
+                    type="number"
+                    min={p.min}
+                    max={p.max}
+                    value={settings.strategyParams[strategyId]?.[p.key] ?? p.default}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        strategyParams: {
+                          ...settings.strategyParams,
+                          [strategyId]: { ...settings.strategyParams[strategyId], [p.key]: Number(e.target.value) },
+                        },
+                      })
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
 
         <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.75rem' }}>
           <input

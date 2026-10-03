@@ -10,15 +10,17 @@ import {
   upsertDiscoveredToken,
   insertMarketSnapshot,
   insertHolderSnapshot,
-  listActiveTokenIds,
   getLatestMarketByToken,
-  getPriorVolume5m,
   getLatestHolders,
+  getSnapshotHistory,
   logBotEvent,
-  effectiveAgeMinutes,
+  quoteLiquidityStatus,
+  tokenAgeOf,
+  type SnapshotHistoryRow,
 } from '../services/token-service.js';
 import {
   ensureDefaultPortfolio,
+  ensureResearchPortfolio,
   getPortfolio,
   getPortfolioSettings,
   setRiskState,
@@ -31,31 +33,49 @@ import {
 } from '../engines/paper/engine.js';
 import { evaluateExitRules } from '../engines/paper/exits.js';
 import { query } from '../db/client.js';
+import { pruneOldData } from '../db/retention.js';
 import { publish } from '../ws/hub.js';
 import { runDailyReportIfDue } from '../services/report-service.js';
+import { buildEntrySnapshot, recordMissingObservations, recordTradeObservation } from '../learning/observations.js';
+import { runHealthCheckIfDue } from '../learning/health-service.js';
+import { getActiveEvCalibrations } from '../learning/calibration-service.js';
 import { registerJob, defaultIntervals, startJobs, stopJobs } from './scheduler.js';
-import type { MarketQuote } from '../providers/types.js';
+import type { GasFeeEstimate, MarketQuote } from '../providers/types.js';
 import {
   assessSafety,
   demoSafetyFromSymbol,
   SAFETY_VERSION,
+  type SafetyResult,
 } from '../safety/engine.js';
 import {
   approximateTradesFromSnapshot,
   computeFlowFeatures,
 } from '../features/flow.js';
-import { detectRegime } from '../features/regime.js';
+import { detectRegime, regimeSizeMultiplier } from '../features/regime.js';
 import { detectTokenPhase } from '../features/lifecycle.js';
+import {
+  computeMarketMetrics,
+  previousCompletedWindow,
+  type MetricSnapshot,
+} from '../features/market-metrics.js';
+import { assessBuySellConfidence, assessDataConfidence } from '../features/data-confidence.js';
 import {
   activeStrategies,
   createStrategyCatalog,
   evaluateAllStrategies,
 } from '../strategies/catalog.js';
-import type { StrategyContext } from '../strategies/types.js';
+import type { Signal, StrategyContext } from '../strategies/types.js';
 import { estimateExpectedValue } from '../risk/expected-value.js';
-import { computePositionSize } from '../risk/sizing.js';
 import {
-  estimateRoundTripCostPct,
+  assessPositionRisk,
+  referenceSizeUsd,
+  type RiskAssessment,
+  type RiskConfig,
+} from '../risk/position-risk.js';
+import { markRiskExecution, recordRiskDecision } from '../services/risk-decision-service.js';
+import { estimateRoundTripCost, networkFeePerLegUsd } from '../execution/cost-estimate.js';
+import {
+  getRealismKnobs,
   simulateRealisticTrade,
   EXECUTION_MODEL_VERSION,
 } from '../execution/realism.js';
@@ -64,14 +84,44 @@ import {
   openShadowTrade,
   updateOpenShadowTrades,
   recordMissedOpportunity,
+  type ExecutionSettings,
 } from '../research/shadow.js';
+import type { ExitParams } from '../research/exit-sim.js';
+import { recordOpportunity, processOpportunityOutcomes } from '../research/opportunities.js';
+import { classifyStrategyRejection, FunnelRecorder, pruneFunnelSnapshots } from '../research/funnel.js';
+import {
+  classifyTradingEligibility,
+  computeActivityScore,
+  hasBasicTradingData,
+  selectForEvaluation,
+  selectForPolling,
+} from '../universe/lifecycle.js';
+import {
+  applyQuoteToToken,
+  getExposureTokenIds,
+  getUniverseCounts,
+  listEvaluationCandidates,
+  listTopActiveTokens,
+  listTrackedTokens,
+  markEvaluated,
+  markPolledWithoutQuote,
+  runLifecycleTick,
+  type TrackedTokenRow,
+} from '../universe/repository.js';
 import {
   isKillSwitchActive,
   evaluateCircuitBreakers,
 } from '../monitoring/kill-switch.js';
 import { sendAlert } from '../monitoring/alerts.js';
 import { toMeasuredJson } from '../domain/measured.js';
-import type { MarketRegime, RejectionReason } from '@memebot/shared';
+import type {
+  ConfidenceLevel,
+  MarketRegime,
+  PortfolioSettings,
+  RejectionReason,
+  SignalLane,
+} from '@memebot/shared';
+import { resolveStrategyParams } from '@memebot/shared';
 
 const providers = createProviders();
 const discovery = createDiscoveryProviders(dataMode);
@@ -83,8 +133,102 @@ let tokensScanned = 0;
 let signalsGenerated = 0;
 let latestRegime: MarketRegime | null = null;
 
+let missingQuotesSinceLog = 0;
+let missingQuoteSample: string[] = [];
+let lastMissingLogAt = 0;
+
+const ACTIVE_WINDOW_SEC = 120;
+
 export function getRuntimeBotStats() {
   return { lastScanAt, tokensScanned, signalsGenerated, latestRegime };
+}
+
+type MarketRow = NonNullable<Awaited<ReturnType<typeof getLatestMarketByToken>>>;
+
+function quoteFromMarket(market: MarketRow, midPriceUsd = market.price_usd): MarketQuote {
+  return {
+    chain: 'solana',
+    address: '',
+    priceUsd: midPriceUsd,
+    marketCapUsd: market.market_cap_usd,
+    volume5mUsd: market.volume_5m_usd,
+    volume1hUsd: market.volume_1h_usd,
+    volume24hUsd: market.volume_24h_usd,
+    buyVolume5mUsd: market.buy_volume_5m_usd,
+    sellVolume5mUsd: market.sell_volume_5m_usd,
+    txCount5m: market.tx_count_5m,
+    priceChange5mPct: market.price_change_5m_pct,
+    priceChange1hPct: market.price_change_1h_pct,
+    liquidityUsd: market.liquidity_usd,
+    liquidityStatus: market.liquidity_status,
+    observedAt: market.observed_at,
+    poolAddress: market.pool_address,
+    venue: market.venue,
+    feeBps: market.fee_bps,
+    baseReserve: market.base_reserve,
+    quoteReserve: market.quote_reserve,
+  };
+}
+
+function toMetricSnapshot(s: SnapshotHistoryRow): MetricSnapshot {
+  return {
+    observedAt: s.observed_at,
+    volume5mUsd: s.volume_5m_usd,
+    volume1hUsd: s.volume_1h_usd,
+    volume24hUsd: s.volume_24h_usd,
+    txCount5m: s.tx_count_5m,
+    buys5m: s.buys_5m,
+    sells5m: s.sells_5m,
+    buys24h: s.buys_24h,
+    sells24h: s.sells_24h,
+  };
+}
+
+function exitParamsFrom(settings: PortfolioSettings): ExitParams {
+  return {
+    stopLossPct: settings.stopLossPct,
+    takeProfitPct: settings.takeProfitPct,
+    trailingStopPct: settings.trailingStopPct,
+    maxHoldSec: settings.maxHoldingTimeSec,
+    minLiquidityUsd: settings.minLiquidityUsd,
+  };
+}
+
+/** Risk limits derived from the existing portfolio settings + bankroll (no parallel config). */
+function riskConfigFrom(settings: PortfolioSettings, equityUsd: number): RiskConfig {
+  return {
+    baseSizeUsd: equityUsd * settings.maxPositionPct,
+    minSizeUsd: env.PAPER_MIN_POSITION_USD,
+    maxRiskPerTradeUsd: equityUsd * settings.maxRiskPerTradePct,
+    maxOpenPositions: settings.maxSimultaneousPositions,
+    maxPortfolioExposureUsd: equityUsd * env.MAX_PORTFOLIO_EXPOSURE_PCT,
+    maxStrategyExposureUsd: equityUsd * env.MAX_STRATEGY_EXPOSURE_PCT,
+    maxTokenExposureUsd: equityUsd * env.MAX_TOKEN_EXPOSURE_PCT,
+    confidenceMultipliers: {
+      HIGH: env.RISK_SIZE_HIGH_MULTIPLIER,
+      MEDIUM: env.RISK_SIZE_MEDIUM_MULTIPLIER,
+      LOW: env.RISK_SIZE_LOW_MULTIPLIER,
+    },
+    strongEvMargin: env.RISK_STRONG_EV_MARGIN,
+    strongEvMultiplier: env.RISK_SIZE_STRONG_EV_MULTIPLIER,
+    researchMultiplier: env.RISK_SIZE_RESEARCH_MULTIPLIER,
+    volHighPct: env.RISK_VOL_HIGH_PCT,
+    volVeryHighPct: env.RISK_VOL_VERY_HIGH_PCT,
+    volExtremePct: env.RISK_VOL_EXTREME_PCT,
+    highVolMultiplier: env.RISK_SIZE_HIGH_VOL_MULTIPLIER,
+    veryHighVolMultiplier: env.RISK_SIZE_VERY_HIGH_VOL_MULTIPLIER,
+    maxEntryPriceImpactPct: env.MAX_ENTRY_PRICE_IMPACT_PCT,
+    maxRoundTripCostRate: env.MAX_ROUND_TRIP_COST_RATE,
+  };
+}
+
+function execSettingsFrom(settings: PortfolioSettings): ExecutionSettings {
+  return {
+    profile: settings.realismProfile ?? realismProfile,
+    priorityFeeLamports: settings.priorityFeeLamports,
+    jitoTipLamports: settings.jitoTipLamports ?? env.DEFAULT_JITO_TIP_LAMPORTS,
+    failedTxStillChargesNetwork: settings.failedTxStillChargesNetwork,
+  };
 }
 
 async function jobTokenDiscovery(): Promise<void> {
@@ -134,49 +278,128 @@ async function jobTokenDiscovery(): Promise<void> {
   lastScanAt = new Date();
 }
 
+/**
+ * Market data over the tracked universe (not the newest-N window): exposures are
+ * always polled, then new discoveries, then by activity and least-recently-polled.
+ */
 async function jobMarketData(): Promise<void> {
-  const tokens = await listActiveTokenIds(50);
-  if (tokens.length === 0) return;
+  const exposures = await getExposureTokenIds();
+  const tracked = await listTrackedTokens(exposures);
+  if (tracked.length === 0) return;
+  const selected = selectForPolling(
+    tracked.map((t) => ({
+      ...t,
+      mustInclude: exposures.has(t.id),
+      activityScore: Number(t.activity_score),
+      lastPolledAt: t.last_polled_at,
+    })),
+    env.MARKET_DATA_CAP_PER_TICK,
+  );
+  const tokens = selected.map((s) => s.item);
   const quotes = await providers.marketData.getMarketQuotes(tokens.map((t) => t.address));
   const byAddr = new Map(quotes.map((q) => [q.address, q]));
   tokensScanned = tokens.length;
 
+  const missing: TrackedTokenRow[] = [];
+  let failed = 0;
   for (const token of tokens) {
     const quote = byAddr.get(token.address);
     if (!quote) {
-      await logBotEvent({
-        level: 'warn',
-        category: 'market_data',
-        message: `Missing market data for ${token.symbol}`,
-        details: { address: token.address },
-      });
+      missing.push(token);
       continue;
     }
-    const age = Date.now() - quote.observedAt.getTime();
-    const stale = age > getStalePriceMaxAgeMs();
-    await insertMarketSnapshot(token.id, quote, stale);
-
-    // Lifecycle timestamp updates
-    if (quote.liquidityUsd > 0) {
-      await query(
-        `UPDATE tokens SET
-          first_liquidity_at = COALESCE(first_liquidity_at, $2),
-          first_trade_at = COALESCE(first_trade_at, $2),
-          first_meaningful_volume_at = CASE
-            WHEN first_meaningful_volume_at IS NULL AND $3 >= 1000 THEN $2
-            ELSE first_meaningful_volume_at
-          END
-         WHERE id = $1`,
-        [token.id, quote.observedAt, quote.volume5mUsd],
-      );
+    try {
+      await ingestQuote(token, quote);
+    } catch (err) {
+      failed++;
+      logger.warn({ err, token: token.symbol }, 'Market snapshot ingest failed');
     }
   }
-  publish('scanner_updated', { count: quotes.length });
+  if (failed > 0) logger.warn({ failed, polled: tokens.length }, 'Some market snapshots failed this tick');
+
+  await markPolledWithoutQuote(missing.map((t) => t.id));
+  // Profile-only tokens (no pair yet) are normal; aggregate instead of one event per token
+  missingQuotesSinceLog += missing.length;
+  missingQuoteSample = [...missingQuoteSample, ...missing.map((t) => t.symbol)].slice(-10);
+  if (missingQuotesSinceLog > 0 && Date.now() - lastMissingLogAt > 60_000) {
+    await logBotEvent({
+      level: 'info',
+      category: 'market_data',
+      message: `No market pair yet for ${missingQuotesSinceLog} polled token(s) in the last minute`,
+      details: { sample: missingQuoteSample, polledThisTick: tokens.length },
+    });
+    missingQuotesSinceLog = 0;
+    missingQuoteSample = [];
+    lastMissingLogAt = Date.now();
+  }
+  publish('scanner_updated', { count: quotes.length, polled: tokens.length });
+}
+
+async function ingestQuote(token: TrackedTokenRow, quote: MarketQuote): Promise<void> {
+  const ageMs = Date.now() - quote.observedAt.getTime();
+  const stale = ageMs > getStalePriceMaxAgeMs();
+  await insertMarketSnapshot(token.id, quote, stale);
+
+  const liquidityStatus = quoteLiquidityStatus(quote);
+  const { eligibility, reasons } = classifyTradingEligibility(liquidityStatus);
+  const basicDataOk = hasBasicTradingData({
+    priceUsd: quote.priceUsd,
+    liquidityStatus,
+    liquidityUsd: quote.liquidityUsd,
+    volume5mUsd: quote.volume5mUsd,
+    volume1hUsd: quote.volume1hUsd,
+  });
+  await applyQuoteToToken({
+    tokenId: token.id,
+    observedAt: quote.observedAt,
+    liquidityStatus,
+    eligibility,
+    eligibilityReasons: reasons,
+    activityScore: computeActivityScore({
+      liquidityUsd: liquidityStatus === 'KNOWN' ? quote.liquidityUsd : null,
+      volume5mUsd: quote.volume5mUsd,
+      txCount5m: quote.txCount5m,
+      priceChange5mPct: quote.priceChange5mPct,
+      volumeAccelCapped: null,
+      dataAgeSec: ageMs / 1000,
+    }),
+    basicDataOk,
+    poolCreatedAt: quote.pairCreatedAt ?? null,
+    venue: quote.venue ?? null,
+  });
+
+  if (liquidityStatus === 'KNOWN') {
+    await query(
+      `UPDATE tokens SET
+        first_liquidity_at = COALESCE(first_liquidity_at, $2),
+        first_trade_at = COALESCE(first_trade_at, $2),
+        first_meaningful_volume_at = CASE
+          WHEN first_meaningful_volume_at IS NULL AND $3::numeric >= 1000 THEN $2
+          ELSE first_meaningful_volume_at
+        END
+       WHERE id = $1`,
+      [token.id, quote.observedAt, quote.volume5mUsd],
+    );
+  }
+}
+
+async function jobLifecycle(): Promise<void> {
+  const res = await runLifecycleTick({
+    maxAgeHours: env.TOKEN_TRACKING_MAX_AGE_HOURS,
+    staleAfterSec: env.TOKEN_STALE_AFTER_SEC,
+    archiveStaleAfterMin: env.TOKEN_ARCHIVE_STALE_AFTER_MIN,
+    activeWindowSec: ACTIVE_WINDOW_SEC,
+    trackingCap: env.TOKEN_TRACKING_CAP,
+  });
+  if (Object.keys(res.transitions).length > 0 || res.archivedByCap > 0) {
+    logger.debug({ ...res }, 'Lifecycle transitions');
+  }
+  if (Math.random() < 0.01) await pruneFunnelSnapshots();
 }
 
 /** Event-driven trade stream (demo synthesis + polling reconciliation). */
 async function jobTradeStream(): Promise<void> {
-  const tokens = await listActiveTokenIds(30);
+  const tokens = await listTopActiveTokens(30, ['ELIGIBLE', 'ACTIVE']);
   for (const token of tokens) {
     const market = await getLatestMarketByToken(token.id);
     if (!market) continue;
@@ -241,7 +464,7 @@ async function jobTradeStream(): Promise<void> {
 }
 
 async function jobOnchain(): Promise<void> {
-  const tokens = await listActiveTokenIds(20);
+  const tokens = await listTopActiveTokens(20, ['ELIGIBLE', 'ACTIVE']);
   for (const token of tokens) {
     try {
       const data = await providers.onChain.getHolderData(token.address);
@@ -252,40 +475,48 @@ async function jobOnchain(): Promise<void> {
   }
 }
 
+function safetyInputFor(
+  token: { id: string; symbol: string },
+  market: MarketRow,
+  holders: Awaited<ReturnType<typeof getLatestHolders>>,
+) {
+  const input =
+    dataMode === 'demo'
+      ? demoSafetyFromSymbol(token.symbol, market.liquidity_usd, holders?.top_holder_pct ?? null)
+      : {
+          tokenId: token.id,
+          mintAuthorityActive: null,
+          freezeAuthorityActive: null,
+          isToken2022: null,
+          transferRestricted: null,
+          liquidityUsd: market.liquidity_usd,
+          liquidityChangePct5m: null,
+          lpLockedOrBurned: null,
+          top1HolderPct: holders?.top_holder_pct ?? null,
+          top5HolderPct: null,
+          top10HolderPct: holders?.top10_holder_pct ?? null,
+          top20HolderPct: null,
+          creatorHoldingPct: null,
+          creatorPriorRugs: null,
+          creatorPriorLaunches: null,
+          sniperConcentrationPct: null,
+          bundledLaunchSuspected: null,
+          artificialVolumeSuspected: null,
+          sellable: null,
+          buyButNotSell: null,
+          observedAt: market.observed_at,
+        };
+  input.tokenId = token.id;
+  return input;
+}
+
 async function jobSafety(): Promise<void> {
-  const tokens = await listActiveTokenIds(40);
+  const tokens = await listTopActiveTokens(100, ['ELIGIBLE', 'ACTIVE']);
   for (const token of tokens) {
     const market = await getLatestMarketByToken(token.id);
     if (!market) continue;
     const holders = await getLatestHolders(token.id);
-    const input =
-      dataMode === 'demo'
-        ? demoSafetyFromSymbol(token.symbol, market.liquidity_usd, holders?.top_holder_pct ?? null)
-        : {
-            tokenId: token.id,
-            mintAuthorityActive: null,
-            freezeAuthorityActive: null,
-            isToken2022: null,
-            transferRestricted: null,
-            liquidityUsd: market.liquidity_usd,
-            liquidityChangePct5m: null,
-            lpLockedOrBurned: null,
-            top1HolderPct: holders?.top_holder_pct ?? null,
-            top5HolderPct: null,
-            top10HolderPct: holders?.top10_holder_pct ?? null,
-            top20HolderPct: null,
-            creatorHoldingPct: null,
-            creatorPriorRugs: null,
-            creatorPriorLaunches: null,
-            sniperConcentrationPct: null,
-            bundledLaunchSuspected: null,
-            artificialVolumeSuspected: null,
-            sellable: null,
-            buyButNotSell: null,
-            observedAt: market.observed_at,
-          };
-    input.tokenId = token.id;
-    const result = assessSafety(input);
+    const result = assessSafety(safetyInputFor(token, market, holders));
     await query(
       `INSERT INTO safety_assessments (
         token_id, score, safety_class, blocked, reasons, checks, version, assessed_at, data_mode
@@ -318,11 +549,12 @@ async function jobSafety(): Promise<void> {
 }
 
 async function jobRegime(): Promise<void> {
-  const tokens = await listActiveTokenIds(50);
+  const tokens = await listTopActiveTokens(100);
   let totalVol = 0;
   let totalBuy = 0;
   let totalSell = 0;
   let liqSum = 0;
+  let liqN = 0;
   let n = 0;
   for (const token of tokens) {
     const m = await getLatestMarketByToken(token.id);
@@ -330,7 +562,10 @@ async function jobRegime(): Promise<void> {
     totalVol += m.volume_5m_usd;
     totalBuy += m.buy_volume_5m_usd;
     totalSell += m.sell_volume_5m_usd;
-    liqSum += m.liquidity_usd;
+    if (m.liquidity_status === 'KNOWN') {
+      liqSum += m.liquidity_usd;
+      liqN++;
+    }
     n++;
   }
   const activity = n > 0 ? totalVol / Math.max(n, 1) / 100 : 0;
@@ -341,7 +576,7 @@ async function jobRegime(): Promise<void> {
     memecoinActivityScore: activity,
     newTokenCount1h: n,
     activeTokenCount: n,
-    avgLiquidityUsd: n > 0 ? liqSum / n : null,
+    avgLiquidityUsd: liqN > 0 ? liqSum / liqN : null,
     marketBuySellPressure: pressure,
     launchSuccessRate: null,
     rugFailureRate: null,
@@ -363,7 +598,7 @@ async function jobRegime(): Promise<void> {
   publish('regime_updated', { regime: result.regime, reasons: result.reasons });
 }
 
-async function latestSafety(tokenId: string) {
+async function latestSafety(tokenId: string): Promise<SafetyResult | null> {
   const { rows } = await query<{
     score: string;
     safety_class: string;
@@ -386,12 +621,48 @@ async function latestSafety(tokenId: string) {
     checks: {},
     version: r.version,
     assessedAt: r.assessed_at,
-  };
+  } as SafetyResult;
 }
 
+async function researchTradesToday(portfolioId: string): Promise<number> {
+  const { rows } = await query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM positions WHERE portfolio_id = $1 AND opened_at >= date_trunc('day', NOW())`,
+    [portfolioId],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+async function recentResearchSignal(tokenId: string, cooldownSec: number): Promise<boolean> {
+  const { rows } = await query(
+    `SELECT 1 FROM signals WHERE token_id = $1 AND lane = 'RESEARCH' AND data_mode = $2
+       AND created_at > NOW() - ($3::text || ' seconds')::interval LIMIT 1`,
+    [tokenId, dataMode, String(cooldownSec)],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Signal pipeline over the evaluation budget:
+ * market data → basic quality → safety → strategy → data confidence → EV (actual size).
+ * Every stage is counted in a funnel snapshot so zero trades is explainable.
+ */
 async function jobSignals(): Promise<void> {
   const portfolioId = await ensureDefaultPortfolio();
+  const researchId = env.RESEARCH_EXPLORATION_ENABLED ? await ensureResearchPortfolio() : null;
+  const now = new Date();
+  const funnel = new FunnelRecorder();
+  const evCalibrations = await getActiveEvCalibrations();
+  const universe = await getUniverseCounts(env.TOKEN_STALE_AFTER_SEC);
+  funnel.setStage('discovered', universe.discoveredLast10m);
+  funnel.setStage('tracked', universe.tracked);
+  funnel.setStage('freshMarketData', universe.freshMarketData);
+  funnel.setStage('knownLiquidity', universe.byLiquidityStatus.KNOWN ?? 0);
+  funnel.setStage('researchOnly', universe.byEligibility.RESEARCH_ONLY ?? 0);
+  funnel.details.universe = universe;
+
   if (await isKillSwitchActive(portfolioId)) {
+    funnel.details.blocked = 'kill_switch';
+    await funnel.persist('signal', now);
     await logBotEvent({
       portfolioId,
       level: 'warn',
@@ -402,56 +673,87 @@ async function jobSignals(): Promise<void> {
   }
 
   const settings = await getPortfolioSettings(portfolioId);
-  const tokens = await listActiveTokenIds(50);
-  const strategies = activeStrategies(strategyCatalog, settings.activeStrategyIds);
-  let generated = 0;
+  const candidates = await listEvaluationCandidates(env.TOKEN_STALE_AFTER_SEC);
+  const selected = selectForEvaluation(
+    candidates.map((c) => ({ ...c, activityScore: Number(c.activity_score), lastEvaluatedAt: c.last_evaluated_at })),
+    env.TOKEN_EVALUATION_CAP_PER_TICK,
+    env.TOKEN_EVALUATION_ROTATION_SHARE,
+  );
+  const tokens = selected.map((s) => s.item);
+  funnel.details.selection = {
+    eligibleCandidates: candidates.length,
+    evaluated: tokens.length,
+    cap: env.TOKEN_EVALUATION_CAP_PER_TICK,
+    priority: selected.filter((s) => s.reason === 'priority').length,
+    rotation: selected.filter((s) => s.reason === 'rotation').length,
+  };
+  await markEvaluated(tokens.map((t) => t.id));
 
+  const strategies = activeStrategies(strategyCatalog, settings.activeStrategyIds);
+  const strategyParams = resolveStrategyParams(settings.strategyParams);
+  let generated = 0;
   const runId = (
     await query<{ id: string }>(
       `INSERT INTO strategy_runs (strategy_name, strategy_version, portfolio_id, data_mode, started_at)
        VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
-      ['multi-strategy', 'framework-v1', portfolioId, dataMode],
+      ['multi-strategy', 'framework-v2', portfolioId, dataMode],
     )
   ).rows[0]!.id;
 
-  const { rows: tokMeta } = await query<{
-    id: string;
-    address: string;
-    symbol: string;
-    chain: string;
-    created_at_onchain: Date | null;
-    discovered_at: Date;
-    first_liquidity_at: Date | null;
-    first_observed_at: Date | null;
-    discovery_source: string;
-  }>(
-    `SELECT id, address, symbol, chain, created_at_onchain, discovered_at,
-            first_liquidity_at, first_observed_at, discovery_source
-     FROM tokens WHERE data_mode = $1 ORDER BY discovered_at DESC LIMIT 50`,
-    [dataMode],
-  );
-  const metaById = new Map(tokMeta.map((t) => [t.id, t]));
+  const history = await getSnapshotHistory(tokens.map((t) => t.id), now);
+  const gas = await providers.gasFee.getFeeEstimate();
+  const exec = execSettingsFrom(settings);
+  const knobs = getRealismKnobs(exec.profile);
+  const netLeg = networkFeePerLegUsd(gas, {
+    priorityFeeLamports: exec.priorityFeeLamports,
+    jitoTipLamports: exec.jitoTipLamports * knobs.jitoTipMult,
+  });
+  const exitParams = exitParamsFrom(settings);
+  const portfolio = await getPortfolio(portfolioId);
+  const riskCfg = riskConfigFrom(settings, portfolio?.equityUsd ?? settings.startingBalanceUsd);
+  const regimeMult = latestRegime ? regimeSizeMultiplier(latestRegime) : 1;
+  const staleSec = getStalePriceMaxAgeMs() / 1000;
+  const minEv = settings.minExpectedNetValue ?? env.MIN_EXPECTED_NET_VALUE;
+  funnel.details.ev = { minExpectedNetValue: minEv, lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER };
 
   for (const token of tokens) {
+    funnel.stage('evaluated');
     const market = await getLatestMarketByToken(token.id);
     if (!market) continue;
-    if (market.stale) {
-      await logBotEvent({
-        portfolioId,
-        level: 'warn',
-        category: 'signal',
-        message: `Stale price — skip signal for ${token.symbol}`,
-      });
+    const snapshotAgeSec = (now.getTime() - market.observed_at.getTime()) / 1000;
+    if (market.stale || snapshotAgeSec > staleSec) {
+      funnel.reject('staleData');
+      continue;
+    }
+    if (market.liquidity_status !== 'KNOWN') {
+      funnel.reject('unknownLiquidity');
       continue;
     }
 
     const holders = await getLatestHolders(token.id);
-    const priorVol = await getPriorVolume5m(token.id, market.observed_at);
-    const meta = metaById.get(token.id);
-    const ageMinutes = meta
-      ? effectiveAgeMinutes(meta)
-      : (Date.now() - token.discovered_at.getTime()) / 60_000;
-
+    const age = tokenAgeOf(token, now);
+    const hist = (history.get(token.id) ?? []).map(toMetricSnapshot);
+    const current: MetricSnapshot = {
+      observedAt: market.observed_at,
+      volume5mUsd: market.volume_5m_usd,
+      volume1hUsd: market.volume_1h_usd,
+      volume24hUsd: market.volume_24h_usd,
+      txCount5m: market.tx_count_5m,
+      buys5m: market.buys_5m,
+      sells5m: market.sells_5m,
+      buys24h: market.buys_24h,
+      sells24h: market.sells_24h,
+    };
+    const metrics = computeMarketMetrics({
+      current,
+      history: hist,
+      ageMinutes: age.minutes,
+      config: { minBaselineUsd: env.VOLUME_ACCEL_MIN_BASELINE_USD, maxAccel: env.VOLUME_ACCEL_MAX },
+    });
+    const prevWindow = previousCompletedWindow(
+      hist.filter((s) => s.observedAt.getTime() < current.observedAt.getTime()),
+      current,
+    );
     const ticks = approximateTradesFromSnapshot({
       buyVolume5mUsd: market.buy_volume_5m_usd,
       sellVolume5mUsd: market.sell_volume_5m_usd,
@@ -460,44 +762,34 @@ async function jobSignals(): Promise<void> {
       observedAt: market.observed_at,
     });
     const flow = computeFlowFeatures(ticks);
-    const safety = (await latestSafety(token.id)) ??
-      assessSafety(
-        dataMode === 'demo'
-          ? demoSafetyFromSymbol(token.symbol, market.liquidity_usd, holders?.top_holder_pct ?? null)
-          : {
-              tokenId: token.id,
-              mintAuthorityActive: null,
-              freezeAuthorityActive: null,
-              isToken2022: null,
-              transferRestricted: null,
-              liquidityUsd: market.liquidity_usd,
-              liquidityChangePct5m: null,
-              lpLockedOrBurned: null,
-              top1HolderPct: holders?.top_holder_pct ?? null,
-              top5HolderPct: null,
-              top10HolderPct: holders?.top10_holder_pct ?? null,
-              top20HolderPct: null,
-              creatorHoldingPct: null,
-              creatorPriorRugs: null,
-              creatorPriorLaunches: null,
-              sniperConcentrationPct: null,
-              bundledLaunchSuspected: null,
-              artificialVolumeSuspected: null,
-              sellable: null,
-              buyButNotSell: null,
-            },
-      );
+    const quote = quoteFromMarket(market);
+
+    // Reference size for EV/shadows: the tier-sized amount before EV tier and portfolio
+    // limits are known. The authoritative risk decision happens at execution time.
+    const absChange5m = Math.abs(market.price_change_5m_pct);
+    const sizeAt = (conf: ConfidenceLevel) => referenceSizeUsd(riskCfg, conf, absChange5m, regimeMult);
+
+    const safety = (await latestSafety(token.id)) ?? assessSafety(safetyInputFor(token, market, holders));
+    const shadowSim = {
+      quote,
+      gas,
+      positionSizeUsd: sizeAt('MEDIUM'),
+      exit: exitParams,
+      quoteAgeMs: snapshotAgeSec * 1000,
+      ...exec,
+    };
 
     // Safety BEFORE strategy tradability
     if (safety.blocked) {
+      funnel.reject('safetyFailed');
       await openShadowTrade({
         portfolioId,
         tokenId: token.id,
         rejectionReason: 'SAFETY_REJECTION',
         rejectionDetails: { reasons: safety.reasons, class: safety.safetyClass },
-        entryPriceUsd: market.price_usd,
-        sizeUsd: null,
-        costUsd: null,
+        cooldownSec: env.SHADOW_REENTRY_COOLDOWN_SECONDS,
+        sim: shadowSim,
+        now,
       });
       await recordMissedOpportunity({
         portfolioId,
@@ -508,19 +800,14 @@ async function jobSignals(): Promise<void> {
       });
       continue;
     }
+    funnel.stage('safetyPassed');
 
-    const accel =
-      priorVol && priorVol > 0
-        ? market.volume_5m_usd / priorVol
-        : market.volume_1h_usd > 0
-          ? (market.volume_5m_usd * 12) / market.volume_1h_usd
-          : 1;
     const phase = detectTokenPhase({
-      ageMinutes,
+      ageMinutes: age.minutes,
       priceChange2mPct: market.price_change_5m_pct,
       priceChange5mPct: market.price_change_5m_pct,
       priceChange1hPct: market.price_change_1h_pct,
-      volumeAcceleration: accel,
+      volumeAcceleration: metrics.volumeAcceleration.capped,
       liquidityUsd: market.liquidity_usd,
       liquidityChangePct: null,
       uniqueBuyers5m: flow['5m']?.uniqueBuyers.value ?? null,
@@ -535,12 +822,37 @@ async function jobSignals(): Promise<void> {
       [token.id, phase.phase, JSON.stringify(phase.reasons), dataMode],
     );
 
+    const dataConf = assessDataConfidence({
+      liquidityStatus: market.liquidity_status,
+      liquidityUsd: market.liquidity_usd,
+      snapshotAgeSec,
+      staleAfterSec: staleSec,
+      volume5mUsd: market.volume_5m_usd,
+      volume1hUsd: market.volume_1h_usd,
+      txCount5m: market.tx_count_5m,
+      buys5m: market.buys_5m,
+      sells5m: market.sells_5m,
+      ageSource: age.source,
+      observations10m: metrics.observations10m,
+      volumeAccelConfidence: metrics.volumeAcceleration.confidence,
+      agreeingProviders: 1,
+    });
+    const buySellConf = assessBuySellConfidence({
+      buys5m: market.buys_5m,
+      sells5m: market.sells_5m,
+      buys1h: market.buys_1h,
+      sells1h: market.sells_1h,
+      txCount5m: market.tx_count_5m,
+      snapshotAgeSec,
+      staleAfterSec: staleSec,
+    });
+
     const ctx: StrategyContext = {
       tokenId: token.id,
       address: token.address,
       symbol: token.symbol,
       chain: token.chain,
-      ageMinutes,
+      ageMinutes: age.minutes,
       priceUsd: market.price_usd,
       liquidityUsd: market.liquidity_usd,
       volume5mUsd: market.volume_5m_usd,
@@ -553,62 +865,163 @@ async function jobSignals(): Promise<void> {
       holderCount: holders?.holder_count ?? null,
       topHolderPct: holders?.top_holder_pct ?? null,
       observedAt: market.observed_at,
-      priorVolume5mUsd: priorVol,
+      priorVolume5mUsd: prevWindow?.volume5mUsd ?? null,
       flow,
       safety,
       regime: latestRegime ?? undefined,
       phase: phase.phase,
-      buySellConfidence: 'LOW',
-      discoverySource: meta?.discovery_source,
+      buySellConfidence: buySellConf.level,
+      discoverySource: token.discovery_source ?? undefined,
+      volumeAccel: metrics.volumeAcceleration,
+      liquidityStatus: market.liquidity_status,
     };
 
-    const { best, all } = evaluateAllStrategies(strategies, ctx);
-
-    // Shadow every rejection meeting basic discovery criteria
-    for (const sig of all) {
-      if (sig.action === 'NO_TRADE' && market.liquidity_usd >= 1000) {
-        await openShadowTrade({
-          portfolioId,
-          tokenId: token.id,
-          strategyId: sig.strategyId,
-          rejectionReason: (sig.rejectionReason ?? 'UNKNOWN') as RejectionReason,
-          rejectionDetails: { reasons: sig.reasons },
-          entryPriceUsd: market.price_usd,
-          sizeUsd: null,
-          costUsd: estimateRoundTripCostPct({
-            liquidityUsd: market.liquidity_usd,
-            tradeUsd: 5,
-            venue: market.venue,
-          }),
-        });
-      }
+    const { all } = evaluateAllStrategies(strategies, ctx, strategyParams);
+    const rejections = all.filter((s) => s.action === 'NO_TRADE');
+    for (const sig of rejections) {
+      const category = classifyStrategyRejection(sig, age.minutes);
+      funnel.rejectStrategy(sig.strategyId, category);
+      if (category === 'unknownLiquidity' || category === 'lowLiquidity') continue;
+      await openShadowTrade({
+        portfolioId,
+        tokenId: token.id,
+        strategyId: sig.strategyId,
+        rejectionReason: (sig.rejectionReason ?? 'UNKNOWN') as RejectionReason,
+        rejectionDetails: { reasons: sig.reasons, category },
+        cooldownSec: env.SHADOW_REENTRY_COOLDOWN_SECONDS,
+        sim: shadowSim,
+        now,
+      });
     }
 
-    if (!best) continue;
+    const buys = all.filter((s) => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
+    if (buys.length === 0) {
+      // Token-level reason: the rejection from the strategy that got furthest (highest score)
+      const closest = [...rejections].sort((a, b) => b.confidence - a.confidence)[0];
+      funnel.reject(closest ? classifyStrategyRejection(closest, age.minutes) : 'strategyFailed');
+      continue;
+    }
+    funnel.stage('strategyEligible');
 
-    const costPct = estimateRoundTripCostPct({
+    const best = buys[0]!;
+    const proposedSizeUsd = sizeAt(dataConf.level);
+
+    const cost = estimateRoundTripCost({
+      positionSizeUsd: proposedSizeUsd,
       liquidityUsd: market.liquidity_usd,
-      tradeUsd: 5,
       venue: market.venue,
+      feeBps: market.fee_bps,
+      absPriceChange5mPct: Math.abs(market.price_change_5m_pct),
+      networkFeePerLegUsd: netLeg,
+      adverseSelectionRatePerLeg: snapshotAgeSec > 2 ? 0.002 * knobs.adverseSelectionMult : 0,
     });
-    const ev = estimateExpectedValue({
-      signal: best,
-      estimatedExecutionCostPct: costPct,
-      failureProbability: realismProfile === 'CONSERVATIVE' ? 0.18 : 0.08,
-      minExpectedNetValue: settings.minExpectedNetValue ?? env.MIN_EXPECTED_NET_VALUE,
-      dataConfidence: 'LOW',
-    });
+    const evFor = (sig: Signal) =>
+      estimateExpectedValue({
+        signal: sig,
+        cost,
+        failureProbability: knobs.failureRate,
+        minExpectedNetValue: minEv,
+        dataConfidence: dataConf.level,
+        lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER,
+        calibration: evCalibrations.get(sig.strategyId) ?? null,
+      });
 
-    if (!ev.passes) {
+    const ev = evFor(best);
+    // Research eligibility is judged on the uncalibrated model (calibration is production-only)
+    const researchEv = ev.rawExpectedNetValue ?? ev.expectedNetValue;
+    const shortfall = researchEv != null ? ev.threshold - researchEv : null;
+    const researchEligible =
+      !ev.passes &&
+      researchId != null &&
+      shortfall != null &&
+      shortfall <= env.RESEARCH_MAX_EV_SHORTFALL &&
+      cost.networkFeePriced &&
+      dataConf.checks.filter((c) => c.critical).every((c) => c.ok);
+    const decision = ev.passes ? 'SIGNAL' : researchEligible ? 'RESEARCH_SIGNAL' : 'EV_REJECTED';
+
+    for (const sig of buys) {
+      const sigEv = sig === best ? ev : evFor(sig);
+      if (sigEv.expectedNetValue != null) {
+        funnel.evCandidate({
+          tokenId: token.id,
+          symbol: token.symbol,
+          strategyId: sig.strategyId,
+          expectedNetValue: sigEv.expectedNetValue,
+          threshold: sigEv.threshold,
+          dataConfidence: dataConf.level,
+          executionCostRate: sigEv.executionCostRate,
+          positionSizeUsd: sigEv.positionSizeUsd,
+        });
+      }
+      await recordOpportunity({
+        tokenId: token.id,
+        strategyId: sig.strategyId,
+        strategyVersion: sig.strategyVersion,
+        decision: sig === best ? decision : sigEv.passes ? 'EV_PASS_NOT_SELECTED' : 'EV_REJECTED',
+        observedAt: market.observed_at,
+        priceUsd: market.price_usd,
+        liquidityUsd: market.liquidity_usd,
+        liquidityStatus: market.liquidity_status,
+        volume5mUsd: market.volume_5m_usd,
+        volume1hUsd: market.volume_1h_usd,
+        buys5m: market.buys_5m,
+        sells5m: market.sells_5m,
+        txCount5m: market.tx_count_5m,
+        uniqueBuyers: null,
+        uniqueSellers: null,
+        marketRegime: latestRegime,
+        tokenAgeMin: age.minutes,
+        ageSource: age.source,
+        sinceFirstObservedSec: token.first_observed_at
+          ? Math.round((now.getTime() - token.first_observed_at.getTime()) / 1000)
+          : null,
+        dataConfidence: dataConf.level,
+        buySellConfidence: buySellConf.level,
+        volumeAccelRaw: metrics.volumeAcceleration.raw,
+        volumeAccelCapped: metrics.volumeAcceleration.capped,
+        volumeAccelConfidence: metrics.volumeAcceleration.confidence,
+        expectedValue: sigEv,
+        evNet: sigEv.expectedNetValue,
+        evThreshold: sigEv.threshold,
+        executionCostRate: sigEv.executionCostRate,
+        executionCostUsd: sigEv.executionCostUsd,
+        positionSizeUsd: sigEv.positionSizeUsd,
+        features: {
+          confidence: sig.confidence,
+          reasons: sig.reasons,
+          phase: phase.phase,
+          priceChange5mPct: market.price_change_5m_pct,
+          priceChange1hPct: market.price_change_1h_pct,
+          dataConfidenceChecks: dataConf.checks,
+          buySellConfidenceReasons: buySellConf.reasons,
+          volumeAccel: metrics.volumeAcceleration,
+          txAccel: metrics.transactionAcceleration,
+          buyAccel: metrics.buyAcceleration,
+          sellAccel: metrics.sellAcceleration,
+          volume1mUsd: metrics.volume1mUsd,
+          buys1m: metrics.buys1m,
+          sells1m: metrics.sells1m,
+        },
+        exitParams,
+        cooldownSec: env.OPPORTUNITY_COOLDOWN_SECONDS,
+      });
+    }
+
+    let lane: SignalLane | null = null;
+    if (ev.passes) {
+      funnel.stage('evPassed');
+      lane = 'PRODUCTION';
+    } else {
+      funnel.reject('evFailed');
       await openShadowTrade({
         portfolioId,
         tokenId: token.id,
         strategyId: best.strategyId,
         rejectionReason: 'EXPECTED_VALUE_TOO_LOW',
         rejectionDetails: { ev, reasons: best.reasons },
-        entryPriceUsd: market.price_usd,
-        sizeUsd: 5,
-        costUsd: costPct * 5,
+        cooldownSec: env.SHADOW_REENTRY_COOLDOWN_SECONDS,
+        sim: { ...shadowSim, positionSizeUsd: proposedSizeUsd },
+        now,
       });
       await recordMissedOpportunity({
         portfolioId,
@@ -617,8 +1030,11 @@ async function jobSignals(): Promise<void> {
         filterName: 'expected_value',
         evidence: { ev },
       });
-      continue;
+      if (researchEligible && !(await recentResearchSignal(token.id, env.OPPORTUNITY_COOLDOWN_SECONDS))) {
+        lane = 'RESEARCH';
+      }
     }
+    if (!lane) continue;
 
     const scores = best.scores ?? {
       momentum: best.confidence,
@@ -634,8 +1050,8 @@ async function jobSignals(): Promise<void> {
         token_id, strategy_name, strategy_version, side,
         momentum_score, liquidity_score, volume_score, holder_score, risk_score, overall_score,
         risk_label, explanation, market_state, data_mode,
-        action, confidence, expected_value, strategy_id
-      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16)
+        action, confidence, expected_value, lane, position_size_usd, data_confidence
+      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16,$17,$18)
       RETURNING id`,
       [
         token.id,
@@ -648,45 +1064,58 @@ async function jobSignals(): Promise<void> {
         scores.risk,
         scores.overall,
         best.riskLabel ?? 'MODERATE',
-        JSON.stringify({ reasons: best.reasons, warnings: [], factors: { ev } }),
+        JSON.stringify({ reasons: best.reasons, warnings: [], factors: { ev }, lane }),
         JSON.stringify({
           ...ctx,
           flow: undefined,
+          volumeAccel: metrics.volumeAcceleration,
           safety: { score: safety.score, class: safety.safetyClass, reasons: safety.reasons },
           phase: phase.phase,
           regime: latestRegime,
+          dataConfidence: dataConf.level,
+          ageSource: age.source,
+          strategyParams: strategyParams[best.strategyId] ?? {},
         }),
         dataMode,
         best.confidence,
         JSON.stringify(ev),
-        best.strategyId,
+        lane,
+        proposedSizeUsd,
+        dataConf.level,
       ],
     );
 
-    generated++;
-    signalsGenerated++;
+    if (lane === 'PRODUCTION') {
+      generated++;
+      signalsGenerated++;
+    }
     await logBotEvent({
-      portfolioId,
+      portfolioId: lane === 'RESEARCH' ? researchId : portfolioId,
       level: 'info',
       category: 'signal',
-      message: `Signal ${best.strategyId} for ${token.symbol}`,
+      message: `${lane === 'RESEARCH' ? 'Research signal' : 'Signal'} ${best.strategyId} for ${token.symbol}`,
       details: {
         signalId: rows[0]!.id,
+        lane,
         confidence: best.confidence,
         expectedNetValue: ev.expectedNetValue,
+        threshold: ev.threshold,
         disclaimer: 'Model score, not a probability of profit',
       },
     });
-    publish('signal_generated', {
-      signalId: rows[0]!.id,
-      tokenId: token.id,
-      symbol: token.symbol,
-      strategyId: best.strategyId,
-      confidence: best.confidence,
-      scores,
-    });
+    if (lane === 'PRODUCTION') {
+      publish('signal_generated', {
+        signalId: rows[0]!.id,
+        tokenId: token.id,
+        symbol: token.symbol,
+        strategyId: best.strategyId,
+        confidence: best.confidence,
+        scores,
+      });
+    }
   }
 
+  await funnel.persist('signal', now);
   await query(
     `UPDATE strategy_runs SET finished_at = NOW(), tokens_evaluated = $2, signals_generated = $3 WHERE id = $1`,
     [runId, tokens.length, generated],
@@ -694,17 +1123,76 @@ async function jobSignals(): Promise<void> {
 }
 
 async function jobPaperExecution(): Promise<void> {
-  const portfolioId = await ensureDefaultPortfolio();
+  const productionId = await ensureDefaultPortfolio();
+  const production = await getPortfolio(productionId);
+  if (!production) return;
+  await executeLane(productionId, 'PRODUCTION', production.botStatus);
+  if (env.RESEARCH_EXPLORATION_ENABLED) {
+    const researchId = await ensureResearchPortfolio();
+    // Research follows the production bot status / kill switch
+    await executeLane(researchId, 'RESEARCH', production.botStatus, productionId);
+  }
+}
+
+/** Capital committed to open positions (cost basis) — same measure the atomic buy check uses. */
+async function openExposure(
+  portfolioId: string,
+  strategyKey: string | null,
+  tokenId: string,
+): Promise<{ portfolio: number; strategy: number; token: number }> {
+  const { rows } = await query<{ portfolio: string; strategy: string; token: string }>(
+    `SELECT COALESCE(SUM(cost_basis_usd), 0) AS portfolio,
+            COALESCE(SUM(cost_basis_usd) FILTER (WHERE strategy_key = $2), 0) AS strategy,
+            COALESCE(SUM(cost_basis_usd) FILTER (WHERE token_id = $3), 0) AS token
+     FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
+    [portfolioId, strategyKey, tokenId],
+  );
+  return {
+    portfolio: Number(rows[0]?.portfolio ?? 0),
+    strategy: Number(rows[0]?.strategy ?? 0),
+    token: Number(rows[0]?.token ?? 0),
+  };
+}
+
+function signalFromStored(row: {
+  confidence: string | null;
+  overall_score: string;
+  strategy_id: string | null;
+  strategy_version: string;
+  expected_value: unknown;
+}): Signal | null {
+  const ev = (row.expected_value ?? {}) as { grossUpside?: number; downside?: number; timeToTargetSec?: number };
+  if (ev.grossUpside == null || ev.downside == null) return null;
+  return {
+    action: 'BUY',
+    confidence: Number(row.confidence ?? row.overall_score),
+    expectedReturn: ev.grossUpside,
+    expectedLoss: ev.downside,
+    expectedHoldTimeSec: ev.timeToTargetSec ?? null,
+    reasons: [],
+    strategyId: row.strategy_id ?? 'unknown',
+    strategyVersion: row.strategy_version,
+  };
+}
+
+async function executeLane(
+  portfolioId: string,
+  lane: SignalLane,
+  botStatus: string,
+  controlPortfolioId: string = portfolioId,
+): Promise<void> {
   const portfolio = await getPortfolio(portfolioId);
   if (!portfolio) return;
   const settings = await getPortfolioSettings(portfolioId);
 
   await manageOpenPositions(portfolioId, settings);
 
-  if (portfolio.botStatus === 'KILLED' || (await isKillSwitchActive(portfolioId))) {
+  if (botStatus === 'KILLED' || (await isKillSwitchActive(controlPortfolioId))) return;
+  if (botStatus !== 'RUNNING') return;
+
+  if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= env.RESEARCH_MAX_TRADES_PER_DAY) {
     return;
   }
-  if (portfolio.botStatus !== 'RUNNING') return;
 
   const { rows: signals } = await query<{
     id: string;
@@ -714,12 +1202,17 @@ async function jobPaperExecution(): Promise<void> {
     expected_value: unknown;
     strategy_id: string | null;
     strategy_version: string;
+    data_confidence: ConfidenceLevel | null;
+    market_state: Record<string, unknown> | null;
+    created_at: Date;
   }>(
     `SELECT s.id, s.token_id, s.overall_score, s.confidence, s.expected_value,
-            s.strategy_id, s.strategy_version
+            s.strategy_name AS strategy_id, s.strategy_version, s.data_confidence,
+            s.market_state, s.created_at
      FROM signals s
      WHERE s.data_mode = $1
        AND s.side = 'BUY'
+       AND s.lane = $3
        AND s.created_at > NOW() - INTERVAL '10 minutes'
        AND NOT EXISTS (
          SELECT 1 FROM paper_orders o WHERE o.signal_id = s.id AND o.portfolio_id = $2
@@ -729,11 +1222,20 @@ async function jobPaperExecution(): Promise<void> {
        )
      ORDER BY COALESCE(s.confidence, s.overall_score) DESC
      LIMIT 5`,
-    [dataMode, portfolioId],
+    [dataMode, portfolioId, lane],
   );
+  if (signals.length === 0) return;
+
+  const funnel = new FunnelRecorder();
+  funnel.details.lane = lane;
+  funnel.details.signalsConsidered = signals.length;
+  const persist = () => funnel.persist(`execution_${lane.toLowerCase()}`);
 
   const gas = await providers.gasFee.getFeeEstimate();
   if (!isGasUsableForTrading(gas)) {
+    funnel.reject('executionFailed', signals.length);
+    funnel.details.blocked = 'sol_usd_unavailable';
+    await persist();
     await logBotEvent({
       portfolioId,
       level: 'error',
@@ -748,6 +1250,16 @@ async function jobPaperExecution(): Promise<void> {
     return;
   }
 
+  const exec = execSettingsFrom(settings);
+  const knobs = getRealismKnobs(exec.profile);
+  const netLeg = networkFeePerLegUsd(gas, {
+    priorityFeeLamports: exec.priorityFeeLamports,
+    jitoTipLamports: exec.jitoTipLamports * knobs.jitoTipMult,
+  });
+  const exitParams = exitParamsFrom(settings);
+  const minEv = settings.minExpectedNetValue ?? env.MIN_EXPECTED_NET_VALUE;
+  const evCalibrations = await getActiveEvCalibrations();
+
   const dayPnl = await query<{ pnl: string }>(
     `SELECT COALESCE(SUM(realized_pnl_usd),0) AS pnl FROM positions
      WHERE portfolio_id = $1 AND closed_at >= date_trunc('day', NOW())`,
@@ -756,48 +1268,44 @@ async function jobPaperExecution(): Promise<void> {
 
   for (const signal of signals) {
     const latest = await getPortfolio(portfolioId);
-    if (!latest || latest.botStatus !== 'RUNNING') break;
+    if (!latest) break;
+    if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= env.RESEARCH_MAX_TRADES_PER_DAY) {
+      funnel.details.researchDailyCapReached = true;
+      break;
+    }
 
     // Per-signal duplicate check (fixes race across loop iterations)
     const openDup = await query(
       `SELECT id FROM positions WHERE portfolio_id = $1 AND token_id = $2 AND status = 'OPEN'`,
       [portfolioId, signal.token_id],
     );
-    if (openDup.rows.length > 0) {
-      await openShadowTrade({
-        portfolioId,
-        tokenId: signal.token_id,
-        signalId: signal.id,
-        rejectionReason: 'DUPLICATE_POSITION',
-        entryPriceUsd: null,
-        sizeUsd: null,
-        costUsd: null,
-      });
-      continue;
-    }
+    if (openDup.rows.length > 0) continue;
 
     const market = await getLatestMarketByToken(signal.token_id);
     if (!market) continue;
     if (market.stale || Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs()) {
+      funnel.reject('staleData');
       await logBotEvent({
         portfolioId,
         level: 'warn',
         category: 'execution',
         message: "Stale price — don't trade",
-        details: { tokenId: signal.token_id },
+        details: { tokenId: signal.token_id, lane },
       });
-      await openShadowTrade({
+      await recordMissedOpportunity({
         portfolioId,
         tokenId: signal.token_id,
-        signalId: signal.id,
         rejectionReason: 'STALE_DATA',
-        entryPriceUsd: market.price_usd,
-        sizeUsd: null,
-        costUsd: null,
+        filterName: 'execution_freshness',
       });
       continue;
     }
-    if (market.liquidity_usd <= 0) continue;
+    if (market.liquidity_status !== 'KNOWN' || market.liquidity_usd <= 0) {
+      funnel.reject('unknownLiquidity');
+      continue;
+    }
+    const quote = quoteFromMarket(market);
+    const quoteAgeMs = Date.now() - market.observed_at.getTime();
 
     const risk = evaluateRisk({
       equityUsd: latest.equityUsd,
@@ -814,74 +1322,138 @@ async function jobPaperExecution(): Promise<void> {
     });
 
     await setRiskState(portfolioId, risk.riskState);
-    await query(
-      `UPDATE user_portfolios SET risk_state_changed_at = NOW() WHERE id = $1`,
-      [portfolioId],
-    );
+    await query(`UPDATE user_portfolios SET risk_state_changed_at = NOW() WHERE id = $1`, [portfolioId]);
 
-    if (!risk.allowed) {
-      const reason: RejectionReason =
-        risk.riskState === 'HALTED' ? 'RISK_LIMIT' : 'RISK_LIMIT';
+    const stored = signalFromStored(signal);
+    if (!stored) {
+      funnel.reject('evFailed');
+      continue;
+    }
+    const signalEv = (signal.expected_value ?? {}) as { expectedNetValue?: number | null; threshold?: number };
+
+    // Drawdown / daily-loss / kill state machine decides whether entries are allowed and
+    // its size multiplier. Open-position count and cash are handled by the risk sizer.
+    const stateAllows =
+      risk.allowed || risk.reason.startsWith('Max simultaneous') || risk.reason.startsWith('Insufficient cash');
+    const exposure = await openExposure(portfolioId, signal.strategy_id, signal.token_id);
+    const costAt = (sizeUsd: number) =>
+      estimateRoundTripCost({
+        positionSizeUsd: sizeUsd,
+        liquidityUsd: market.liquidity_usd,
+        venue: market.venue,
+        feeBps: market.fee_bps,
+        absPriceChange5mPct: Math.abs(market.price_change_5m_pct),
+        networkFeePerLegUsd: netLeg,
+        adverseSelectionRatePerLeg: quoteAgeMs > 2000 ? 0.002 * knobs.adverseSelectionMult : 0,
+      });
+    const riskCfg = riskConfigFrom(settings, latest.equityUsd);
+    const assessment: RiskAssessment = assessPositionRisk(
+      {
+        lane,
+        dataConfidence: signal.data_confidence ?? 'LOW',
+        expectedNetValue: signalEv.expectedNetValue ?? null,
+        evThreshold: signalEv.threshold ?? minEv,
+        liquidityStatus: market.liquidity_status,
+        liquidityUsd: market.liquidity_usd,
+        absPriceChange5mPct: Math.abs(market.price_change_5m_pct),
+        stopLossPct: settings.stopLossPct,
+        regimeMultiplier: latestRegime ? regimeSizeMultiplier(latestRegime) : 1,
+        costAt,
+      },
+      {
+        cashUsd: latest.cashUsd,
+        openPositions: latest.openPositions,
+        portfolioExposureUsd: exposure.portfolio,
+        strategyExposureUsd: exposure.strategy,
+        tokenExposureUsd: exposure.token,
+        riskStateAllowsEntries: stateAllows,
+        riskStateMultiplier: stateAllows ? Math.max(risk.sizeMultiplier, 0) : 0,
+      },
+      riskCfg,
+    );
+    funnel.stage('riskEvaluated');
+    const riskDecisionId = await recordRiskDecision(assessment, {
+      portfolioId,
+      signalId: signal.id,
+      tokenId: signal.token_id,
+      strategyId: signal.strategy_id,
+      lane,
+      stopLossPct: settings.stopLossPct,
+      expectedNetValue: signalEv.expectedNetValue ?? null,
+      evThreshold: signalEv.threshold ?? null,
+      dataConfidence: signal.data_confidence,
+    });
+
+    const shadowSim = {
+      quote,
+      gas,
+      positionSizeUsd: Math.max(riskCfg.minSizeUsd, assessment.finalSizeUsd || assessment.maxViableSizeUsd),
+      exit: exitParams,
+      quoteAgeMs,
+      ...exec,
+    };
+
+    if (assessment.decision === 'REJECTED') {
+      funnel.stage('riskRejected');
+      funnel.reject('riskFailed');
+      funnel.riskReject(assessment.rejectionReason ?? 'minimumPositionSize');
+      funnel.riskSample(assessment, signal.strategy_id);
       await openShadowTrade({
         portfolioId,
         tokenId: signal.token_id,
         signalId: signal.id,
-        rejectionReason: reason,
-        rejectionDetails: { ...risk },
-        entryPriceUsd: market.price_usd,
-        sizeUsd: null,
-        costUsd: null,
+        strategyId: signal.strategy_id,
+        rejectionReason: 'RISK_LIMIT',
+        rejectionDetails: {
+          reason: assessment.rejectionReason,
+          detail: assessment.detail,
+          requestedSizeUsd: assessment.requestedSizeUsd,
+          maxViableSizeUsd: assessment.maxViableSizeUsd,
+          lane,
+        },
+        cooldownSec: env.SHADOW_REENTRY_COOLDOWN_SECONDS,
+        sim: shadowSim,
       });
       continue;
     }
+    funnel.stage(assessment.decision === 'RESIZED' ? 'riskResized' : 'riskSized');
+    funnel.riskSample(assessment, signal.strategy_id);
 
-    const exposurePct =
-      latest.equityUsd > 0 ? latest.investedValueUsd / latest.equityUsd : 0;
-    const sizing = computePositionSize({
-      equityUsd: latest.equityUsd,
-      cashUsd: latest.cashUsd,
-      maxPositionPct: settings.maxPositionPct,
-      maxRiskPerTradePct: settings.maxRiskPerTradePct,
-      stopLossPct: settings.stopLossPct,
-      confidence: Number(signal.confidence ?? signal.overall_score),
-      liquidityUsd: market.liquidity_usd,
-      volatilityPct: Math.abs(market.price_change_5m_pct),
-      regime: latestRegime,
-      phase: null,
-      portfolioExposurePct: exposurePct,
-      maxPortfolioExposurePct: 0.5,
-      priceImpactPct: (risk.sizedAmountUsd / Math.max(market.liquidity_usd, 1)) * 100,
-      expectedNetValue:
-        signal.expected_value && typeof signal.expected_value === 'object'
-          ? ((signal.expected_value as { expectedNetValue?: number }).expectedNetValue ?? null)
-          : null,
-      riskStateSizeMult: risk.sizeMultiplier,
+    const amountUsd = assessment.finalSizeUsd;
+    const finalCost = assessment.cost ?? costAt(amountUsd);
+    // Re-check EV with the FINAL position size (costs depend on size)
+    const finalEv = estimateExpectedValue({
+      signal: stored,
+      cost: finalCost,
+      failureProbability: knobs.failureRate,
+      minExpectedNetValue: minEv,
+      dataConfidence: signal.data_confidence ?? 'LOW',
+      lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER,
+      calibration: lane === 'PRODUCTION' ? (evCalibrations.get(signal.strategy_id ?? '') ?? null) : null,
     });
-
-    const amountUsd = Math.min(risk.sizedAmountUsd, sizing.sizedAmountUsd);
-    if (amountUsd < 1) continue;
-
-    const quote: MarketQuote = {
-      chain: 'solana',
-      address: '',
-      priceUsd: market.price_usd,
-      marketCapUsd: market.market_cap_usd,
-      volume5mUsd: market.volume_5m_usd,
-      volume1hUsd: market.volume_1h_usd,
-      volume24hUsd: 0,
-      buyVolume5mUsd: market.buy_volume_5m_usd,
-      sellVolume5mUsd: market.sell_volume_5m_usd,
-      txCount5m: market.tx_count_5m,
-      priceChange5mPct: market.price_change_5m_pct,
-      priceChange1hPct: market.price_change_1h_pct,
-      liquidityUsd: market.liquidity_usd,
-      observedAt: market.observed_at,
-      poolAddress: market.pool_address,
-      venue: market.venue,
-      feeBps: market.fee_bps,
-      baseReserve: market.base_reserve,
-      quoteReserve: market.quote_reserve,
-    };
+    const evOk =
+      lane === 'PRODUCTION'
+        ? finalEv.passes
+        : finalEv.expectedNetValue != null &&
+          finalCost.networkFeePriced &&
+          finalEv.threshold - finalEv.expectedNetValue <= env.RESEARCH_MAX_EV_SHORTFALL;
+    if (!evOk) {
+      funnel.reject('evFailed');
+      await markRiskExecution(riskDecisionId, 'EV_FAILED_AT_FINAL_SIZE', finalEv.reasons.join(','));
+      await openShadowTrade({
+        portfolioId,
+        tokenId: signal.token_id,
+        signalId: signal.id,
+        strategyId: signal.strategy_id,
+        rejectionReason: 'EXPECTED_VALUE_TOO_LOW',
+        rejectionDetails: { ev: finalEv, stage: 'final_size', lane },
+        cooldownSec: env.SHADOW_REENTRY_COOLDOWN_SECONDS,
+        sim: { ...shadowSim, positionSizeUsd: amountUsd },
+      });
+      continue;
+    }
+    funnel.stage('riskPassed');
+    funnel.stage('executionAttempted');
 
     // Realistic sim for audit trail (paper engine still uses base simulator for cash)
     const realistic = simulateRealisticTrade({
@@ -892,10 +1464,10 @@ async function jobPaperExecution(): Promise<void> {
       gas,
       priorityFeeLamports: settings.priorityFeeLamports,
       failedTxStillChargesNetwork: settings.failedTxStillChargesNetwork,
-      profile: settings.realismProfile ?? realismProfile,
+      profile: exec.profile,
       rng,
-      jitoTipLamports: settings.jitoTipLamports ?? env.DEFAULT_JITO_TIP_LAMPORTS,
-      quoteAgeMs: Date.now() - market.observed_at.getTime(),
+      jitoTipLamports: exec.jitoTipLamports,
+      quoteAgeMs,
     });
 
     if (realistic.execution.failed) {
@@ -904,9 +1476,8 @@ async function jobPaperExecution(): Promise<void> {
         level: 'error',
         category: 'execution',
         message: `Realistic sim failure: ${realistic.failureMode}`,
-        details: { latency: realistic.latency, failureMode: realistic.failureMode },
+        details: { latency: realistic.latency, failureMode: realistic.failureMode, lane },
       });
-      // Still attempt paper path with force via normal engine — charge failed-tx costs
     }
 
     const result = await executePaperBuy({
@@ -922,9 +1493,36 @@ async function jobPaperExecution(): Promise<void> {
       stopLossPct: settings.stopLossPct,
       takeProfitPct: settings.takeProfitPct,
       trailingStopPct: settings.trailingStopPct,
+      risk: {
+        maxOpenPositions: riskCfg.maxOpenPositions,
+        maxPortfolioExposureUsd: riskCfg.maxPortfolioExposureUsd,
+        maxStrategyExposureUsd: riskCfg.maxStrategyExposureUsd,
+        strategyKey: signal.strategy_id,
+        riskDecisionId,
+        riskTier: assessment.riskTier,
+        requestedSizeUsd: assessment.requestedSizeUsd,
+        maxPlannedLossUsd: assessment.maximumPlannedLossUsd,
+        expectedNetValue: finalEv.expectedNetValue,
+      },
+      entrySnapshot: buildEntrySnapshot({
+        signalMarketState: signal.market_state,
+        signalAt: signal.created_at,
+        signalOverallScore: Number(signal.overall_score),
+        market,
+        quoteAgeMs,
+        regime: latestRegime,
+        dataConfidence: signal.data_confidence,
+        maxHoldSec: settings.maxHoldingTimeSec,
+      }),
     });
 
-    if (result.success && result.orderId) {
+    if (result.limitBlocked) {
+      funnel.reject('riskFailed');
+      funnel.riskReject(result.limitBlocked);
+      await markRiskExecution(riskDecisionId, 'LIMIT_BLOCKED', result.limitBlocked);
+    } else if (result.success && result.orderId) {
+      await markRiskExecution(riskDecisionId, 'EXECUTED', null, result.positionId ?? null);
+      funnel.stage('executed');
       await query(
         `UPDATE paper_orders SET
           signal_ts = NOW() - ($2 || ' milliseconds')::interval,
@@ -949,7 +1547,7 @@ async function jobPaperExecution(): Promise<void> {
           realistic.fillProbability,
           realistic.jitoTipUsd,
           EXECUTION_MODEL_VERSION,
-          `signal:${signal.id}`,
+          `signal:${signal.id}:${portfolioId}`,
         ],
       );
       if (result.positionId) {
@@ -962,9 +1560,19 @@ async function jobPaperExecution(): Promise<void> {
           [
             result.positionId,
             JSON.stringify({
-              entryReasons: ['signal_passed_ev_and_risk'],
+              entryReasons: [lane === 'RESEARCH' ? 'research_ev_within_shortfall' : 'signal_passed_ev_and_risk'],
+              lane,
+              ev: finalEv,
               safetyVersion: SAFETY_VERSION,
-              sizing: sizing.multipliers,
+              risk: {
+                decision: assessment.decision,
+                tier: assessment.riskTier,
+                multipliers: assessment.multipliers,
+                requestedSizeUsd: assessment.requestedSizeUsd,
+                finalSizeUsd: assessment.finalSizeUsd,
+                bindingConstraint: assessment.bindingConstraint,
+                maximumPlannedLossUsd: assessment.maximumPlannedLossUsd,
+              },
               latency: realistic.latency,
             }),
             signal.strategy_version,
@@ -978,48 +1586,52 @@ async function jobPaperExecution(): Promise<void> {
         portfolioId,
         level: 'info',
         category: 'execution',
-        message: 'Paper BUY executed',
-        details: { ...result, latencyMs: realistic.latency.totalMs },
+        message: lane === 'RESEARCH' ? 'Research paper BUY executed' : 'Paper BUY executed',
+        details: { ...result, lane, latencyMs: realistic.latency.totalMs },
       });
-      publish('trade_opened', result);
-      publish('portfolio_updated', await getPortfolio(portfolioId));
+      if (lane === 'PRODUCTION') {
+        publish('trade_opened', result);
+        publish('portfolio_updated', await getPortfolio(portfolioId));
+      }
     } else {
+      funnel.reject('executionFailed');
+      await markRiskExecution(riskDecisionId, 'EXECUTION_FAILED', result.reason ?? null);
       await logBotEvent({
         portfolioId,
         level: 'error',
         category: 'execution',
         message: `Paper BUY failed: ${result.reason}`,
-        details: result,
+        details: { ...result, lane },
       });
     }
 
-    await evaluateCircuitBreakers({
-      portfolioId,
-      netPnlUsd: latest.totalPnlUsd,
-      startingBalanceUsd: latest.startingBalanceUsd,
-      recentSlippagePct: realistic.execution.slippagePct,
-      providerOutages: 0,
-      staleCritical: false,
-    });
+    if (lane === 'PRODUCTION') {
+      await evaluateCircuitBreakers({
+        portfolioId,
+        netPnlUsd: latest.totalPnlUsd,
+        startingBalanceUsd: latest.startingBalanceUsd,
+        recentSlippagePct: realistic.execution.slippagePct,
+        providerOutages: 0,
+        staleCritical: false,
+      });
+    }
   }
+  await persist();
 }
 
 async function jobShadow(): Promise<void> {
   const portfolioId = await ensureDefaultPortfolio();
-  const tokens = await listActiveTokenIds(50);
-  const priceByToken = new Map<string, { priceUsd: number; liquidityUsd: number }>();
-  for (const t of tokens) {
-    const m = await getLatestMarketByToken(t.id);
-    if (m) priceByToken.set(t.id, { priceUsd: m.price_usd, liquidityUsd: m.liquidity_usd });
-  }
-  const n = await updateOpenShadowTrades(portfolioId, priceByToken);
-  if (n > 0) publish('shadow_trade_updated', { updated: n });
+  const settings = await getPortfolioSettings(portfolioId);
+  const gas: GasFeeEstimate = await providers.gasFee.getFeeEstimate();
+  const res = await updateOpenShadowTrades({ gas, exec: execSettingsFrom(settings) });
+  if (res.updated > 0 || res.closed > 0) publish('shadow_trade_updated', res);
 }
 
-async function manageOpenPositions(
-  portfolioId: string,
-  settings: Awaited<ReturnType<typeof getPortfolioSettings>>,
-): Promise<void> {
+async function jobOpportunityOutcomes(): Promise<void> {
+  await processOpportunityOutcomes();
+}
+
+async function manageOpenPositions(portfolioId: string, settings: PortfolioSettings): Promise<void> {
   const { rows: positions } = await query<{
     id: string;
     token_id: string;
@@ -1033,12 +1645,11 @@ async function manageOpenPositions(
     cost_basis_usd: string;
     mfe_pct: string | null;
     mae_pct: string | null;
-  }>(
-    `SELECT * FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
-    [portfolioId],
-  );
+  }>(`SELECT * FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`, [portfolioId]);
+  if (positions.length === 0) return;
 
   const gas = await providers.gasFee.getFeeEstimate();
+  const isProduction = portfolioId === env.DEFAULT_PORTFOLIO_ID;
 
   for (const pos of positions) {
     const market = await getLatestMarketByToken(pos.token_id);
@@ -1047,44 +1658,49 @@ async function manageOpenPositions(
     await markPositionMarkToMarket(pos.id, market.price_usd);
     const entry = Number(pos.entry_price_usd);
     const ret = entry > 0 ? (market.price_usd - entry) / entry : 0;
-    const mfe = Math.max(Number(pos.mfe_pct ?? 0), ret * 100);
-    const mae = Math.min(Number(pos.mae_pct ?? 0), ret * 100);
-    await query(`UPDATE positions SET mfe_pct = $2, mae_pct = $3 WHERE id = $1`, [
-      pos.id,
-      mfe,
-      mae,
-    ]);
+    const prevMfe = Number(pos.mfe_pct ?? 0);
+    const prevMae = Number(pos.mae_pct ?? 0);
+    const mfe = Math.max(prevMfe, ret * 100);
+    const mae = Math.min(prevMae, ret * 100);
+    await query(
+      `UPDATE positions SET mfe_pct = $2, mae_pct = $3,
+         mfe_at = CASE WHEN $4 THEN $6 ELSE mfe_at END,
+         mae_at = CASE WHEN $5 THEN $6 ELSE mae_at END
+       WHERE id = $1`,
+      [pos.id, mfe, mae, mfe > prevMfe, mae < prevMae, market.observed_at],
+    );
 
     const costBasis = Number(pos.cost_basis_usd);
     const unrealizedPnlUsd = Number(pos.quantity) * market.price_usd - costBasis;
-    publish('position_updated', {
-      positionId: pos.id,
-      tokenId: pos.token_id,
-      price: market.price_usd,
-      priceUsd: market.price_usd,
-      observedAt: market.observed_at.toISOString(),
-      highestPriceUsd: Math.max(Number(pos.highest_price_usd), market.price_usd),
-      unrealizedPnlUsd,
-      unrealizedPnlPct: costBasis > 0 ? (unrealizedPnlUsd / costBasis) * 100 : 0,
-    });
+    if (isProduction) {
+      publish('position_updated', {
+        positionId: pos.id,
+        tokenId: pos.token_id,
+        price: market.price_usd,
+        priceUsd: market.price_usd,
+        observedAt: market.observed_at.toISOString(),
+        highestPriceUsd: Math.max(Number(pos.highest_price_usd), market.price_usd),
+        unrealizedPnlUsd,
+        unrealizedPnlPct: costBasis > 0 ? (unrealizedPnlUsd / costBasis) * 100 : 0,
+      });
+    }
 
     const marketStale =
-      market.stale ||
-      Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs();
+      market.stale || Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs();
 
-    // LIQUIDITY_EMERGENCY can override price exits (already first in evaluateExitRules)
+    // LIQUIDITY_EMERGENCY can override price exits (already first in evaluateExitRules).
+    // Unknown liquidity is not treated as collapse (it is not evidence of zero).
     const decision = evaluateExitRules({
       entryPriceUsd: Number(pos.entry_price_usd),
       markPriceUsd: market.price_usd,
       highestPriceUsd: Number(pos.highest_price_usd),
       stopLossPct: Number(pos.stop_loss_pct),
       takeProfitPct: Number(pos.take_profit_pct),
-      trailingStopPct:
-        pos.trailing_stop_pct != null ? Number(pos.trailing_stop_pct) : null,
+      trailingStopPct: pos.trailing_stop_pct != null ? Number(pos.trailing_stop_pct) : null,
       openedAt: pos.opened_at,
       now: new Date(),
       maxHoldingTimeSec: settings.maxHoldingTimeSec,
-      liquidityUsd: market.liquidity_usd,
+      liquidityUsd: market.liquidity_status === 'KNOWN' ? market.liquidity_usd : Number.POSITIVE_INFINITY,
       minLiquidityUsd: settings.minLiquidityUsd,
       marketStale,
     });
@@ -1093,17 +1709,10 @@ async function manageOpenPositions(
     const closeReason = decision.closeReason;
     if (!closeReason) continue;
 
-    if (
-      closeReason !== 'emergency_liquidity_collapse' &&
-      !isGasUsableForTrading(gas)
-    ) {
-      continue;
-    }
+    if (closeReason !== 'emergency_liquidity_collapse' && !isGasUsableForTrading(gas)) continue;
 
     if (closeReason === 'emergency_liquidity_collapse') {
-      await query(`UPDATE positions SET exit_state = 'LIQUIDITY_EMERGENCY' WHERE id = $1`, [
-        pos.id,
-      ]);
+      await query(`UPDATE positions SET exit_state = 'LIQUIDITY_EMERGENCY' WHERE id = $1`, [pos.id]);
       await sendAlert({
         severity: 'error',
         title: 'Liquidity emergency exit',
@@ -1112,33 +1721,11 @@ async function manageOpenPositions(
       });
     }
 
-    const quote: MarketQuote = {
-      chain: 'solana',
-      address: '',
-      priceUsd: decision.exitMidPriceUsd,
-      marketCapUsd: market.market_cap_usd,
-      volume5mUsd: market.volume_5m_usd,
-      volume1hUsd: market.volume_1h_usd,
-      volume24hUsd: 0,
-      buyVolume5mUsd: market.buy_volume_5m_usd,
-      sellVolume5mUsd: market.sell_volume_5m_usd,
-      txCount5m: market.tx_count_5m,
-      priceChange5mPct: market.price_change_5m_pct,
-      priceChange1hPct: market.price_change_1h_pct,
-      liquidityUsd: market.liquidity_usd,
-      observedAt: market.observed_at,
-      poolAddress: market.pool_address,
-      venue: market.venue,
-      feeBps: market.fee_bps,
-      baseReserve: market.base_reserve,
-      quoteReserve: market.quote_reserve,
-    };
-
     const result = await executePaperSell({
       portfolioId,
       positionId: pos.id,
       midPriceUsd: decision.exitMidPriceUsd,
-      quote,
+      quote: quoteFromMarket(market, decision.exitMidPriceUsd),
       gas,
       priorityFeeLamports: settings.priorityFeeLamports,
       failedTxStillChargesNetwork: settings.failedTxStillChargesNetwork,
@@ -1146,6 +1733,11 @@ async function manageOpenPositions(
     });
 
     if (result.success) {
+      try {
+        await recordTradeObservation(pos.id);
+      } catch (err) {
+        logger.warn({ err, positionId: pos.id }, 'Trade observation deferred to the learning job');
+      }
       await logBotEvent({
         portfolioId,
         level: 'info',
@@ -1153,14 +1745,15 @@ async function manageOpenPositions(
         message: `Paper SELL executed (${closeReason})`,
         details: result,
       });
-      publish('trade_closed', { ...result, positionId: pos.id, closeReason });
-      publish('portfolio_updated', await getPortfolio(portfolioId));
+      if (isProduction) {
+        publish('trade_closed', { ...result, positionId: pos.id, closeReason });
+        publish('portfolio_updated', await getPortfolio(portfolioId));
+      }
     }
   }
 }
 
-async function jobPortfolioValuation(): Promise<void> {
-  const portfolioId = await ensureDefaultPortfolio();
+async function valuePortfolio(portfolioId: string): Promise<void> {
   const portfolio = await getPortfolio(portfolioId);
   if (!portfolio) return;
 
@@ -1203,8 +1796,13 @@ async function jobPortfolioValuation(): Promise<void> {
       dataMode,
     ],
   );
+}
 
+async function jobPortfolioValuation(): Promise<void> {
+  const portfolioId = await ensureDefaultPortfolio();
+  await valuePortfolio(portfolioId);
   publish('portfolio_updated', await getPortfolio(portfolioId));
+  if (env.RESEARCH_EXPLORATION_ENABLED) await valuePortfolio(await ensureResearchPortfolio());
 }
 
 async function jobAnalytics(): Promise<void> {
@@ -1226,10 +1824,29 @@ async function jobDailyReport(): Promise<void> {
   await runDailyReportIfDue(await ensureDefaultPortfolio());
 }
 
+/** Level 1 safety net (observations missed at close) + Level 2 health check every N observations. */
+async function jobLearning(): Promise<void> {
+  await recordMissingObservations();
+  const outcome = await runHealthCheckIfDue(await ensureDefaultPortfolio());
+  if (outcome) {
+    logger.info(
+      {
+        healthCheckId: outcome.id,
+        newObservations: outcome.newObservations,
+        anomalies: outcome.result.anomalies.length,
+        emitted: outcome.emitted.length,
+        protection: outcome.protectionAction,
+      },
+      'Learning health check completed',
+    );
+  }
+}
+
 export function registerAllJobs(): void {
   const intervals = defaultIntervals();
   registerJob('token_discovery', intervals.token_discovery, jobTokenDiscovery);
   registerJob('market_data', intervals.market_data, jobMarketData);
+  registerJob('lifecycle', intervals.lifecycle, jobLifecycle);
   registerJob('trade_stream', intervals.trade_stream, jobTradeStream);
   registerJob('onchain', intervals.onchain, jobOnchain);
   registerJob('safety', intervals.safety, jobSafety);
@@ -1237,9 +1854,14 @@ export function registerAllJobs(): void {
   registerJob('signal', intervals.signal, jobSignals);
   registerJob('paper_execution', intervals.paper_execution, jobPaperExecution);
   registerJob('shadow', intervals.shadow, jobShadow);
+  registerJob('opportunity_outcomes', intervals.opportunity_outcomes, jobOpportunityOutcomes);
   registerJob('portfolio_valuation', intervals.portfolio_valuation, jobPortfolioValuation);
   registerJob('analytics', intervals.analytics, jobAnalytics);
   registerJob('daily_report', intervals.daily_report, jobDailyReport);
+  registerJob('learning', intervals.learning, jobLearning);
+  registerJob('retention', intervals.retention, async () => {
+    await pruneOldData();
+  });
 }
 
 export { startJobs, stopJobs, providers };

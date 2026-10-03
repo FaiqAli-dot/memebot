@@ -3,6 +3,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { env } from './config/env.js';
 import { logger } from './utils/logger.js';
 import { migrate } from './db/migrate.js';
@@ -34,16 +37,23 @@ async function main(): Promise<void> {
     }),
   );
 
-  app.get('/', (_req, res) => {
-    res.json({
-      name: 'MemeBot API',
-      subtitle: 'Meme Coin Paper Trading & Research',
-      docs: '/api/meta',
-      paperTradingOnly: true,
-    });
-  });
-
   app.use('/api', apiRouter);
+
+  // Production: serve the built dashboard from the same origin (API, WS and UI share one URL)
+  const webDist = resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
+  if (existsSync(join(webDist, 'index.html'))) {
+    app.use(express.static(webDist, { index: false, maxAge: '1h' }));
+    app.get(/^\/(?!api\/|ws$).*/, (_req, res) => res.sendFile(join(webDist, 'index.html')));
+  } else {
+    app.get('/', (_req, res) => {
+      res.json({
+        name: 'MemeBot API',
+        subtitle: 'Meme Coin Paper Trading & Research',
+        docs: '/api/meta',
+        paperTradingOnly: true,
+      });
+    });
+  }
   app.use(notFound);
   app.use(errorHandler);
 

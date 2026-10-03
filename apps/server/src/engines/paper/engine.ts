@@ -2,9 +2,21 @@ import { v4 as uuid } from 'uuid';
 import type { CostBreakdown, ExecutionRecord } from '@memebot/shared';
 import { query, withTransaction, isDbAvailable } from '../../db/client.js';
 import { dataMode } from '../../config/env.js';
-import { simulateTrade, emptyCosts } from '../cost/simulator.js';
+import { simulateTrade, emptyCosts, sellProceedsUsd } from '../cost/simulator.js';
 import type { GasFeeEstimate, MarketQuote } from '../../providers/types.js';
 import { logger } from '../../utils/logger.js';
+
+export interface PaperBuyRisk {
+  maxOpenPositions: number;
+  maxPortfolioExposureUsd: number;
+  maxStrategyExposureUsd: number;
+  strategyKey: string | null;
+  riskDecisionId?: string | null;
+  riskTier?: string | null;
+  requestedSizeUsd?: number | null;
+  maxPlannedLossUsd?: number | null;
+  expectedNetValue?: number | null;
+}
 
 export async function executePaperBuy(opts: {
   portfolioId: string;
@@ -19,7 +31,17 @@ export async function executePaperBuy(opts: {
   stopLossPct: number;
   takeProfitPct: number;
   trailingStopPct: number | null;
-}): Promise<{ success: boolean; positionId?: string; orderId?: string; reason?: string }> {
+  /** Aggregate limits re-checked under the portfolio row lock (race-safe) */
+  risk?: PaperBuyRisk;
+  /** Entry-time inputs for learning; written once with the position */
+  entrySnapshot?: Record<string, unknown>;
+}): Promise<{
+  success: boolean;
+  positionId?: string;
+  orderId?: string;
+  reason?: string;
+  limitBlocked?: 'maxOpenPositions' | 'portfolioExposure' | 'strategyExposure';
+}> {
   if (!isDbAvailable()) {
     return { success: false, reason: 'Database unavailable — new executions stopped' };
   }
@@ -53,6 +75,32 @@ export async function executePaperBuy(opts: {
       );
       if (dup.rows.length > 0) {
         return { success: false, reason: 'Duplicate open position for token (blocked)' };
+      }
+
+      if (opts.risk) {
+        const r = opts.risk;
+        const agg = await client.query<{ n: string; exposure: string; strategy_exposure: string }>(
+          `SELECT COUNT(*) AS n,
+                  COALESCE(SUM(cost_basis_usd), 0) AS exposure,
+                  COALESCE(SUM(cost_basis_usd) FILTER (WHERE strategy_key = $2), 0) AS strategy_exposure
+           FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
+          [opts.portfolioId, r.strategyKey],
+        );
+        const n = Number(agg.rows[0]?.n ?? 0);
+        const exposure = Number(agg.rows[0]?.exposure ?? 0);
+        const strategyExposure = Number(agg.rows[0]?.strategy_exposure ?? 0);
+        const eps = 1e-6;
+        if (n >= r.maxOpenPositions) {
+          return { success: false, reason: 'Max open positions (atomic check)', limitBlocked: 'maxOpenPositions' };
+        }
+        // Positions store cost_basis_usd = fill + fees, so compare the same quantity
+        const added = Math.max(opts.amountUsd, totalDebit);
+        if (exposure + added > r.maxPortfolioExposureUsd + eps) {
+          return { success: false, reason: 'Portfolio exposure limit (atomic check)', limitBlocked: 'portfolioExposure' };
+        }
+        if (r.strategyKey && strategyExposure + added > r.maxStrategyExposureUsd + eps) {
+          return { success: false, reason: 'Strategy exposure limit (atomic check)', limitBlocked: 'strategyExposure' };
+        }
       }
 
       if (sim.execution.failed) {
@@ -188,6 +236,31 @@ export async function executePaperBuy(opts: {
         orderId,
         positionId,
       ]);
+
+      if (opts.entrySnapshot) {
+        await client.query(`UPDATE positions SET entry_snapshot = $2 WHERE id = $1`, [
+          positionId,
+          JSON.stringify(opts.entrySnapshot),
+        ]);
+      }
+
+      if (opts.risk) {
+        await client.query(
+          `UPDATE positions SET
+             risk_decision_id = $2, strategy_key = $3, risk_tier = $4,
+             requested_size_usd = $5, max_planned_loss_usd = $6, expected_net_value = $7
+           WHERE id = $1`,
+          [
+            positionId,
+            opts.risk.riskDecisionId ?? null,
+            opts.risk.strategyKey,
+            opts.risk.riskTier ?? null,
+            opts.risk.requestedSizeUsd ?? null,
+            opts.risk.maxPlannedLossUsd ?? null,
+            opts.risk.expectedNetValue ?? null,
+          ],
+        );
+      }
 
       await client.query(
         `UPDATE user_portfolios SET
@@ -350,8 +423,7 @@ export async function executePaperSell(opts: {
         return { success: false, orderId, reason: sim.execution.failureReason ?? 'Sell failed' };
       }
 
-      // Proceeds from sell minus network/priority (DEX/slippage already in executed price)
-      const proceeds = sim.execution.filledAmountUsd - sim.costs.networkFeeUsd - sim.costs.priorityFeeUsd;
+      const proceeds = sellProceedsUsd(sim);
       const costBasis = Number(pos.cost_basis_usd);
       const grossPnl = sim.execution.filledAmountUsd - costBasis;
       const netPnl = proceeds - costBasis;

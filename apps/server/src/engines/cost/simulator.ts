@@ -264,6 +264,18 @@ export function simulateTrade(input: SimulateTradeInput): SimulateTradeResult {
   };
 }
 
+/**
+ * Cash received from a simulated SELL: tokens sold at the adverse executed price,
+ * minus DEX fee and per-transaction network/priority costs.
+ */
+export function sellProceedsUsd(sim: SimulateTradeResult): number {
+  if (sim.execution.failed) return 0;
+  const { filledAmountUsd, executedPriceUsd, requestedPriceUsd } = sim.execution;
+  const valueAtExecuted =
+    requestedPriceUsd > 0 ? filledAmountUsd * (executedPriceUsd / requestedPriceUsd) : 0;
+  return valueAtExecuted - sim.costs.dexFeeUsd - sim.costs.networkFeeUsd - sim.costs.priorityFeeUsd;
+}
+
 export function emptyCosts(): CostBreakdown {
   return {
     dexFeeUsd: 0,

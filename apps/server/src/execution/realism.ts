@@ -202,16 +202,3 @@ export function simulateRealisticTrade(input: RealisticSimInput): RealisticSimRe
     realismProfile: input.profile,
   };
 }
-
-export function estimateRoundTripCostPct(opts: {
-  liquidityUsd: number;
-  tradeUsd: number;
-  venue?: string | null;
-}): number {
-  const sizeRatio = opts.tradeUsd / Math.max(opts.liquidityUsd, 1);
-  const impact = sizeRatio / (1 + sizeRatio);
-  const dex =
-    (opts.venue ?? '').toLowerCase().includes('pump') ? 0.01 : 0.003;
-  const network = 0.002; // rough on small size
-  return impact * 2 + dex * 2 + network;
-}

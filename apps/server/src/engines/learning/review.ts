@@ -12,6 +12,8 @@ export interface ReviewInput {
   /** Trades closed in the window before the target report. */
   before: ClosedTrade[];
   previousVerdict: ReportReview['verdict'] | null;
+  /** Trades required on each side before a verdict (and therefore a revert) is possible */
+  minTrades?: number;
 }
 
 /**
@@ -24,7 +26,8 @@ export function reviewLessons(input: ReviewInput): ReportReview {
   if (!input.targetReportId) {
     return { targetReportId: null, verdict: 'none', since, before, reverted: false };
   }
-  if (since.n < MIN_BUCKET_TRADES || before.n < MIN_BUCKET_TRADES) {
+  const minTrades = input.minTrades ?? MIN_BUCKET_TRADES;
+  if (since.n < minTrades || before.n < minTrades) {
     return { targetReportId: input.targetReportId, verdict: 'inconclusive', since, before, reverted: false };
   }
 

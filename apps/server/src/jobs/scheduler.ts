@@ -13,7 +13,11 @@ export type JobName =
   | 'shadow'
   | 'portfolio_valuation'
   | 'analytics'
-  | 'daily_report';
+  | 'daily_report'
+  | 'lifecycle'
+  | 'opportunity_outcomes'
+  | 'learning'
+  | 'retention';
 
 interface Job {
   name: JobName;
@@ -77,5 +81,9 @@ export function defaultIntervals(): Record<JobName, number> {
     portfolio_valuation: env.JOB_PORTFOLIO_VALUATION_INTERVAL_MS,
     analytics: env.JOB_ANALYTICS_INTERVAL_MS,
     daily_report: 60_000,
+    lifecycle: env.JOB_LIFECYCLE_INTERVAL_MS,
+    opportunity_outcomes: env.JOB_OPPORTUNITY_INTERVAL_MS,
+    learning: 30_000,
+    retention: 15 * 60_000,
   };
 }

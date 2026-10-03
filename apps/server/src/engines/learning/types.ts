@@ -1,22 +1,14 @@
-import type { BucketStat } from '@memebot/shared';
+import type { BucketStat, StrategyInputs } from '@memebot/shared';
 
-/** Entry-time features reconstructed from `signals.market_state` — no post-entry data. */
-export interface TradeFeatures {
-  priceChange5mPct: number;
-  buySellRatio: number;
-  volumeAcceleration: number;
-  liquidityUsd: number;
-  txCount5m: number;
-  volume5mUsd: number;
-  overallScore: number;
-  topHolderPct: number | null;
-  ageMinutes: number | null;
-}
+/** Entry-time strategy inputs (as compared against thresholds at signal time) — no post-entry data. */
+export type TradeFeatures = StrategyInputs;
 
 export interface ClosedTrade {
   positionId: string;
   tokenId: string;
   symbol: string;
+  /** Owning strategy (positions.strategy_key); null for legacy rows */
+  strategyId: string | null;
   entryPriceUsd: number;
   highestPriceUsd: number;
   costBasisUsd: number;

@@ -1,4 +1,4 @@
-import type { DataMode } from '@memebot/shared';
+import type { DataMode, LiquidityStatus } from '@memebot/shared';
 
 export interface DiscoveredToken {
   chain: string;
@@ -23,7 +23,18 @@ export interface MarketQuote {
   txCount5m: number;
   priceChange5mPct: number;
   priceChange1hPct: number;
+  /** 0 when the provider reports none — check liquidityStatus before trusting it */
   liquidityUsd: number;
+  /** KNOWN / UNKNOWN / BONDING_CURVE (pump.fun has no AMM pool liquidity) */
+  liquidityStatus?: LiquidityStatus;
+  buys5m?: number | null;
+  sells5m?: number | null;
+  buys1h?: number | null;
+  sells1h?: number | null;
+  buys24h?: number | null;
+  sells24h?: number | null;
+  /** Pool/pair creation time from the provider (authoritative age source) */
+  pairCreatedAt?: Date | null;
   observedAt: Date;
   poolAddress?: string | null;
   venue?: string | null;

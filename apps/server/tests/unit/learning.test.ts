@@ -1,15 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { defaultPortfolioSettings } from '../../src/engines/risk/engine.js';
 import { selectImportantTrades, MAX_IMPORTANT_TRADES } from '../../src/engines/learning/select.js';
-import { analyzeExits, analyzeFeatures, featuresFromMarketState } from '../../src/engines/learning/analyze.js';
+import { strategyInputsFromMarketState } from '../../src/engines/learning/analyze.js';
 import {
   MAX_CHANGES_PER_DAY,
   applyLessons,
-  deriveLessons,
+  deriveStrategyLessons,
+  finalizeLessons,
   revertLessons,
-  type DeriveInput,
+  type PastLesson,
 } from '../../src/engines/learning/lessons.js';
-import { LEARNING_BOUNDS, MAX_STEP_PCT } from '../../src/engines/learning/bounds.js';
+import { MAX_STEP_PCT } from '../../src/engines/learning/bounds.js';
+import { strategyParamDef, type StrategyParamValues } from '@memebot/shared';
 import { reviewLessons } from '../../src/engines/learning/review.js';
 import type { ClosedTrade, TradeFeatures } from '../../src/engines/learning/types.js';
 import { addDays, isReportDue, localDateTime } from '../../src/services/report-service.js';
@@ -44,6 +46,7 @@ function trade(over: Partial<ClosedTrade> & { features?: Partial<TradeFeatures> 
     closeReason: 'take_profit',
     openedAt: opened,
     closedAt: new Date(opened.getTime() + 120_000),
+    strategyId: 'momentum-breakout',
     features: features === null ? null : { ...baseFeatures, ...features },
     ...rest,
   };
@@ -53,19 +56,23 @@ const win = (o: Parameters<typeof trade>[0] = {}) => trade({ netPnlUsd: 0.5, ...
 const loss = (o: Parameters<typeof trade>[0] = {}) =>
   trade({ netPnlUsd: -0.4, closeReason: 'stop_loss', ...o });
 
-function deriveInput(trades: ClosedTrade[], over: Partial<DeriveInput> = {}): DeriveInput {
-  const settings = defaultPortfolioSettings();
-  return {
-    features: analyzeFeatures(trades, settings),
-    exits: analyzeExits(trades, settings),
-    settings,
-    windowTradeCount: trades.length,
-    minTrades: 20,
-    history: [],
+/** Alternating near-limit losers and clear winners, so both the 70% and the 30% show the edge. */
+function edgeTrades(n: number, near: Partial<TradeFeatures>, rest: Partial<TradeFeatures> = {}): ClosedTrade[] {
+  return Array.from({ length: n }, (_, i) => (i % 2 === 0 ? loss({ features: near }) : win({ features: rest })));
+}
+
+function derive(
+  trades: ClosedTrade[],
+  over: { params?: StrategyParamValues; history?: PastLesson[]; minTrades?: number } = {},
+) {
+  return deriveStrategyLessons({
+    strategyId: 'momentum-breakout',
+    trades,
+    params: over.params ?? {},
+    minTrades: over.minTrades ?? 20,
+    history: over.history ?? [],
     reportDate: '2026-10-03',
-    enabled: true,
-    ...over,
-  };
+  });
 }
 
 describe('selectImportantTrades', () => {
@@ -92,16 +99,17 @@ describe('selectImportantTrades', () => {
   });
 });
 
-describe('featuresFromMarketState', () => {
-  it('derives ratios from the stored strategy context', () => {
-    const f = featuresFromMarketState(
+describe('strategyInputsFromMarketState', () => {
+  it('rebuilds exactly the inputs strategies compare against (capped volume acceleration)', () => {
+    const f = strategyInputsFromMarketState(
       {
         priceUsd: 1,
         priceChange5mPct: 4,
         buyVolume5mUsd: 600,
         sellVolume5mUsd: 300,
         volume5mUsd: 900,
-        priorVolume5mUsd: 450,
+        priorVolume5mUsd: 100,
+        volumeAccel: { raw: 9, capped: 2.5, method: 'non_overlapping' },
         liquidityUsd: 20_000,
         txCount5m: 30,
         topHolderPct: null,
@@ -110,102 +118,92 @@ describe('featuresFromMarketState', () => {
       66,
     )!;
     expect(f.buySellRatio).toBe(2);
-    expect(f.volumeAcceleration).toBe(2);
+    expect(f.volumeAcceleration).toBe(2.5);
     expect(f.overallScore).toBe(66);
     expect(f.topHolderPct).toBeNull();
-    expect(featuresFromMarketState({}, 50)).toBeNull();
+    expect(strategyInputsFromMarketState({}, null)!.volumeAcceleration).toBeNull();
+    expect(strategyInputsFromMarketState(null, 50)).toBeNull();
   });
 });
 
-describe('deriveLessons', () => {
-  it('changes nothing when there are too few trades', () => {
-    const trades = [win(), loss(), win()];
-    const lessons = deriveLessons(deriveInput(trades));
+describe('deriveStrategyLessons', () => {
+  it('changes nothing when there are too few calibration-grade trades', () => {
+    const lessons = derive([win(), loss(), win()]);
     expect(lessons).toHaveLength(1);
     expect(lessons[0]!.param).toBe('all');
     expect(lessons[0]!.status).toBe('skipped');
+    expect(lessons[0]!.reason).toMatch(/TRUE_ENTRY_SNAPSHOT/);
   });
 
   it('tightens a filter by at most one step when trades near the limit lose', () => {
     // Default minPriceChange5mPct = 1.5; candidate = 1.65. Near-limit trades lose, the rest win.
-    const near = Array.from({ length: 10 }, () => loss({ features: { priceChange5mPct: 1.55 } }));
-    const rest = Array.from({ length: 12 }, () => win({ features: { priceChange5mPct: 6 } }));
-    const lessons = deriveLessons(deriveInput([...near, ...rest]));
+    const lessons = derive(edgeTrades(60, { priceChange5mPct: 1.55 }, { priceChange5mPct: 6 }));
     const l = lessons.find((x) => x.param === 'minPriceChange5mPct')!;
     expect(l.status).toBe('applied');
+    expect(l.strategyId).toBe('momentum-breakout');
     expect(l.from).toBe(1.5);
     expect(l.to).toBeCloseTo(1.65, 5);
     expect((l.to! - l.from!) / l.from!).toBeLessThanOrEqual(MAX_STEP_PCT + 1e-9);
   });
 
   it('respects hard bounds', () => {
-    const settings = defaultPortfolioSettings();
-    settings.strategyParams.minOverallScore = LEARNING_BOUNDS.minOverallScore.max;
-    const near = Array.from({ length: 10 }, () => loss({ features: { overallScore: 86 } }));
-    const rest = Array.from({ length: 12 }, () => win({ features: { overallScore: 99 } }));
-    const trades = [...near, ...rest];
-    const lessons = deriveLessons({
-      ...deriveInput(trades),
-      features: analyzeFeatures(trades, settings),
-      settings,
+    const max = strategyParamDef('momentum-breakout', 'minOverallScore')!.max;
+    const lessons = derive(edgeTrades(60, { overallScore: max + 1 }, { overallScore: 99 }), {
+      params: { minOverallScore: max },
     });
     const l = lessons.find((x) => x.param === 'minOverallScore')!;
     expect(l.status).toBe('skipped');
-    expect(l.reason).toMatch(/safety limit/);
-    expect(applyLessons(settings, lessons).strategyParams.minOverallScore).toBe(85);
+    expect(l.reason).toMatch(/already at its limit/);
   });
 
-  it('does not reverse a recent change (no flip-flop)', () => {
-    const near = Array.from({ length: 10 }, () => loss({ features: { priceChange5mPct: 1.55 } }));
-    const rest = Array.from({ length: 12 }, () => win({ features: { priceChange5mPct: 6 } }));
-    const lessons = deriveLessons(
-      deriveInput([...near, ...rest], {
-        history: [
-          { reportDate: '2026-10-01', param: 'minPriceChange5mPct', from: 1.7, to: 1.5, status: 'applied' },
-        ],
-      }),
-    );
-    const l = lessons.find((x) => x.param === 'minPriceChange5mPct')!;
+  it('does not reverse a recent change of the same strategy (no flip-flop)', () => {
+    const trades = edgeTrades(60, { priceChange5mPct: 1.55 }, { priceChange5mPct: 6 });
+    const moved: PastLesson = {
+      reportDate: '2026-10-01',
+      strategyId: 'momentum-breakout',
+      param: 'minPriceChange5mPct',
+      from: 1.7,
+      to: 1.5,
+      status: 'applied',
+    };
+    const l = derive(trades, { history: [moved] }).find((x) => x.param === 'minPriceChange5mPct')!;
     expect(l.status).toBe('skipped');
     expect(l.reason).toMatch(/other way/);
+    // A different strategy's history does not block it
+    const other = derive(trades, { history: [{ ...moved, strategyId: 'liquidity-expansion' }] });
+    expect(other.find((x) => x.param === 'minPriceChange5mPct')!.status).toBe('applied');
   });
 
   it(`applies at most ${MAX_CHANGES_PER_DAY} changes per day`, () => {
-    const near = Array.from({ length: 10 }, () =>
-      loss({
-        features: {
-          priceChange5mPct: 1.55,
-          buySellRatio: 1.15,
-          volumeAcceleration: 1.35,
-          txCount5m: 15,
-          overallScore: 56,
-        },
-      }),
-    );
-    const rest = Array.from({ length: 12 }, () => win());
-    const lessons = deriveLessons(deriveInput([...near, ...rest]));
+    const near = { priceChange5mPct: 1.55, buySellRatio: 1.15, volumeAcceleration: 1.35, txCount5m: 15, overallScore: 56 };
+    const lessons = finalizeLessons(derive(edgeTrades(60, near)), { enabled: true, observationMode: false });
     expect(lessons.filter((l) => l.status === 'applied')).toHaveLength(MAX_CHANGES_PER_DAY);
     expect(lessons.some((l) => l.reason.includes('daily limit'))).toBe(true);
   });
 
   it('only reports when learning is disabled', () => {
-    const near = Array.from({ length: 10 }, () => loss({ features: { priceChange5mPct: 1.55 } }));
-    const rest = Array.from({ length: 12 }, () => win({ features: { priceChange5mPct: 6 } }));
-    const lessons = deriveLessons(deriveInput([...near, ...rest], { enabled: false }));
-    expect(lessons.every((l) => l.status === 'skipped')).toBe(true);
+    const lessons = finalizeLessons(derive(edgeTrades(60, { priceChange5mPct: 1.55 }, { priceChange5mPct: 6 })), {
+      enabled: false,
+      observationMode: false,
+    });
+    expect(lessons.some((l) => l.status === 'applied')).toBe(false);
   });
 
-  it('revertLessons restores only the changed settings', () => {
-    const settings = defaultPortfolioSettings();
-    const changed = applyLessons(settings, [
-      { param: 'stopLossPct', from: 0.08, to: 0.088, status: 'applied', reason: 'r', evidence: {} },
-    ]);
-    expect(changed.stopLossPct).toBe(0.088);
+  it('revertLessons restores only the changed strategy setting', () => {
+    const lesson = {
+      strategyId: 'momentum-breakout',
+      param: 'minPriceChange5mPct' as const,
+      from: 1.5,
+      to: 1.65,
+      status: 'applied' as const,
+      reason: 'r',
+      evidence: {},
+    };
+    const { settings: changed } = applyLessons(defaultPortfolioSettings(), [lesson]);
+    expect(changed.strategyParams['momentum-breakout']!.minPriceChange5mPct).toBe(1.65);
     const tweaked = { ...changed, maxPositionPct: 0.07 };
-    const { settings: restored, reverted } = revertLessons(tweaked, [
-      { param: 'stopLossPct', from: 0.08, to: 0.088, status: 'applied', reason: 'r', evidence: {} },
-    ]);
-    expect(restored.stopLossPct).toBe(0.08);
+    const { settings: restored, reverted } = revertLessons(tweaked, [lesson]);
+    expect(restored.strategyParams['momentum-breakout']!.minPriceChange5mPct).toBe(1.5);
     expect(restored.maxPositionPct).toBe(0.07);
     expect(reverted[0]!.status).toBe('reverted');
   });

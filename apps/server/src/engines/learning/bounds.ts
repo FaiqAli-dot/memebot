@@ -1,61 +1,59 @@
-import type { LearnableParam, PortfolioSettings } from '@memebot/shared';
+import {
+  resolveStrategyParams,
+  type PortfolioSettings,
+  type StrategyParamDef,
+  type StrategyParamKey,
+} from '@memebot/shared';
 
 /** Largest relative change the learner may make to one setting in one day. */
 export const MAX_STEP_PCT = 0.1;
 
-interface Bound {
-  min: number;
-  max: number;
-  /** Floor for the step so tiny values can still move. */
-  minStep: number;
-  decimals: number;
-}
+/** Portfolio-wide exit settings: shared by every strategy, so the learner never applies them. */
+export type ExitParam = 'stopLossPct' | 'takeProfitPct' | 'trailingStopPct';
+export const EXIT_PARAMS: ReadonlySet<string> = new Set<ExitParam>(['stopLossPct', 'takeProfitPct', 'trailingStopPct']);
 
-export const LEARNING_BOUNDS: Record<LearnableParam, Bound> = {
-  minPriceChange5mPct: { min: 0.5, max: 10, minStep: 0.1, decimals: 2 },
-  minBuySellRatio: { min: 1, max: 3, minStep: 0.02, decimals: 2 },
-  minVolumeAcceleration: { min: 1, max: 3, minStep: 0.02, decimals: 2 },
-  minLiquidityUsd: { min: 2_000, max: 100_000, minStep: 200, decimals: 0 },
-  minActivityTx5m: { min: 5, max: 200, minStep: 1, decimals: 0 },
-  minVolume5mUsd: { min: 500, max: 50_000, minStep: 100, decimals: 0 },
-  minOverallScore: { min: 40, max: 85, minStep: 1, decimals: 1 },
-  maxTopHolderPct: { min: 10, max: 60, minStep: 1, decimals: 1 },
-  minTokenAgeMinutes: { min: 1, max: 120, minStep: 0.5, decimals: 1 },
+export const EXIT_BOUNDS: Record<ExitParam, { min: number; max: number; minStep: number; decimals: number }> = {
   stopLossPct: { min: 0.03, max: 0.25, minStep: 0.005, decimals: 4 },
   takeProfitPct: { min: 0.05, max: 1, minStep: 0.01, decimals: 4 },
   trailingStopPct: { min: 0.03, max: 0.3, minStep: 0.005, decimals: 4 },
 };
 
-const TOP_LEVEL: ReadonlySet<LearnableParam> = new Set([
-  'stopLossPct',
-  'takeProfitPct',
-  'trailingStopPct',
-]);
-
-export function stepFor(param: LearnableParam, current: number): number {
-  return Math.max(Math.abs(current) * MAX_STEP_PCT, LEARNING_BOUNDS[param].minStep);
+export function exitStep(param: ExitParam, current: number): number {
+  return Math.max(Math.abs(current) * MAX_STEP_PCT, EXIT_BOUNDS[param].minStep);
 }
 
-export function clampToBounds(param: LearnableParam, value: number): number {
-  const b = LEARNING_BOUNDS[param];
-  const clamped = Math.min(b.max, Math.max(b.min, value));
+export function clampExit(param: ExitParam, value: number): number {
+  const b = EXIT_BOUNDS[param];
   const f = 10 ** b.decimals;
-  return Math.round(clamped * f) / f;
+  return Math.round(Math.min(b.max, Math.max(b.min, value)) * f) / f;
 }
 
-export function getParam(settings: PortfolioSettings, param: LearnableParam): number | null {
-  if (TOP_LEVEL.has(param)) {
-    const v = settings[param as 'stopLossPct' | 'takeProfitPct' | 'trailingStopPct'];
-    return v ?? null;
-  }
-  return settings.strategyParams[param as keyof PortfolioSettings['strategyParams']];
+export function strategyStep(def: StrategyParamDef, current: number): number {
+  return Math.max(Math.abs(current) * MAX_STEP_PCT, def.minStep);
 }
 
-export function setParam(
+export function getExitParam(settings: PortfolioSettings, param: ExitParam): number | null {
+  return settings[param] ?? null;
+}
+
+export function setExitParam(settings: PortfolioSettings, param: ExitParam, value: number): PortfolioSettings {
+  return { ...settings, [param]: value };
+}
+
+export function getStrategyParam(settings: PortfolioSettings, strategyId: string, key: string): number | null {
+  return resolveStrategyParams(settings.strategyParams)[strategyId]?.[key as StrategyParamKey] ?? null;
+}
+
+/** Changes exactly one parameter of exactly one strategy; every other strategy is untouched. */
+export function setStrategyParam(
   settings: PortfolioSettings,
-  param: LearnableParam,
+  strategyId: string,
+  key: string,
   value: number,
 ): PortfolioSettings {
-  if (TOP_LEVEL.has(param)) return { ...settings, [param]: value };
-  return { ...settings, strategyParams: { ...settings.strategyParams, [param]: value } };
+  const resolved = resolveStrategyParams(settings.strategyParams);
+  return {
+    ...settings,
+    strategyParams: { ...resolved, [strategyId]: { ...resolved[strategyId], [key]: value } },
+  };
 }

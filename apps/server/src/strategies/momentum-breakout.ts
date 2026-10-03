@@ -1,5 +1,15 @@
+import type { StrategyParamValues } from '@memebot/shared';
 import { clamp, safeDiv } from '../utils/helpers.js';
-import { buySignal, noTrade, type Strategy, type StrategyContext, type Signal } from './types.js';
+import {
+  buySignal,
+  liquidityIsKnown,
+  noTrade,
+  paramsFor,
+  strategyVolumeAccel,
+  type Strategy,
+  type StrategyContext,
+  type Signal,
+} from './types.js';
 
 export class MomentumBreakoutStrategy implements Strategy {
   readonly id = 'momentum-breakout';
@@ -7,33 +17,36 @@ export class MomentumBreakoutStrategy implements Strategy {
   readonly version = 'momentum-v4';
   readonly activeByDefault = true;
 
-  evaluate(ctx: StrategyContext): Signal {
+  evaluate(ctx: StrategyContext, params?: StrategyParamValues): Signal {
+    const p = paramsFor(this.id, params);
     if (ctx.safety?.blocked) {
       return noTrade(this, ['safety_blocked', ...(ctx.safety.reasons ?? [])], 'SAFETY_REJECTION');
     }
-    if (ctx.liquidityUsd < 5000) {
+    if (!liquidityIsKnown(ctx)) {
+      return noTrade(this, [`liquidity_status_${ctx.liquidityStatus ?? 'UNKNOWN'}`], 'LIQUIDITY_REJECTION');
+    }
+    if (ctx.liquidityUsd < p.minLiquidityUsd) {
       return noTrade(this, ['liquidity_below_min'], 'LIQUIDITY_REJECTION');
     }
-    if (ctx.volume5mUsd < 1500) {
+    if (ctx.volume5mUsd < p.minVolume5mUsd) {
       return noTrade(this, ['volume_below_min'], 'VOLUME_REJECTION');
     }
 
-    const accel =
-      ctx.priorVolume5mUsd && ctx.priorVolume5mUsd > 0
-        ? ctx.volume5mUsd / ctx.priorVolume5mUsd
-        : ctx.volume1hUsd > 0
-          ? (ctx.volume5mUsd * 12) / ctx.volume1hUsd
-          : 0;
+    const accelInfo = strategyVolumeAccel(ctx);
     const buySell = safeDiv(ctx.buyVolume5mUsd, Math.max(ctx.sellVolume5mUsd, 1), 0);
 
-    if (accel < 1.3) return noTrade(this, ['volume_acceleration_weak'], 'VOLUME_REJECTION', 20);
-    if (ctx.priceChange5mPct < 1.5) return noTrade(this, ['momentum_weak'], 'MOMENTUM_REJECTION', 25);
-    if (buySell < 1.1) return noTrade(this, ['buy_pressure_weak'], 'MOMENTUM_REJECTION', 30);
-    if (ctx.txCount5m < 15) return noTrade(this, ['activity_low'], 'VOLUME_REJECTION', 20);
-    if (ctx.ageMinutes != null && (ctx.ageMinutes < 5 || ctx.ageMinutes > 24 * 60)) {
+    if (accelInfo.value == null) {
+      return noTrade(this, ['volume_acceleration_insufficient_data'], 'VOLUME_REJECTION', 15);
+    }
+    const accel = accelInfo.value;
+    if (accel < p.minVolumeAcceleration) return noTrade(this, ['volume_acceleration_weak'], 'VOLUME_REJECTION', 20);
+    if (ctx.priceChange5mPct < p.minPriceChange5mPct) return noTrade(this, ['momentum_weak'], 'MOMENTUM_REJECTION', 25);
+    if (buySell < p.minBuySellRatio) return noTrade(this, ['buy_pressure_weak'], 'MOMENTUM_REJECTION', 30);
+    if (ctx.txCount5m < p.minActivityTx5m) return noTrade(this, ['activity_low'], 'VOLUME_REJECTION', 20);
+    if (ctx.ageMinutes != null && (ctx.ageMinutes < p.minTokenAgeMinutes || ctx.ageMinutes > p.maxTokenAgeMinutes)) {
       return noTrade(this, ['age_out_of_range'], 'UNKNOWN', 10);
     }
-    if (ctx.topHolderPct != null && ctx.topHolderPct > 40) {
+    if (ctx.topHolderPct != null && ctx.topHolderPct > p.maxTopHolderPct) {
       return noTrade(this, ['holder_concentration'], 'SAFETY_REJECTION', 15);
     }
     if (ctx.phase === 'DISTRIBUTION' || ctx.phase === 'DECLINE' || ctx.phase === 'DEAD') {
@@ -57,7 +70,7 @@ export class MomentumBreakoutStrategy implements Strategy {
       0,
       100,
     );
-    if (overall < 55) return noTrade(this, ['overall_score_low'], 'MOMENTUM_REJECTION', overall);
+    if (overall < p.minOverallScore) return noTrade(this, ['overall_score_low'], 'MOMENTUM_REJECTION', overall);
 
     const confMult = ctx.buySellConfidence === 'LOW' ? 0.7 : ctx.buySellConfidence === 'HIGH' ? 1 : 0.85;
     const confidence = clamp(overall * confMult, 0, 100);
@@ -69,7 +82,7 @@ export class MomentumBreakoutStrategy implements Strategy {
       expectedHoldTimeSec: 900,
       reasons: [
         `5m_momentum_+${ctx.priceChange5mPct.toFixed(1)}%`,
-        `volume_accel_x${accel.toFixed(2)}`,
+        `volume_accel_x${accelInfo.label}`,
         `buy_sell_${buySell.toFixed(2)}`,
         `phase_${ctx.phase ?? 'unknown'}`,
       ],

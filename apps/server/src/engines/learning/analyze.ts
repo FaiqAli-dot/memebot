@@ -1,14 +1,17 @@
-import type {
-  ExitStats,
-  FeatureStat,
-  LearnableParam,
-  PortfolioSettings,
+import {
+  STRATEGY_PARAM_REGISTRY,
+  type ExitStats,
+  type FeatureStat,
+  type LearnableParam,
+  type PortfolioSettings,
+  type StrategyInputs,
+  type StrategyParamDef,
+  type StrategyParamValues,
 } from '@memebot/shared';
 import { safeDiv } from '../../utils/helpers.js';
-import { getParam, stepFor } from './bounds.js';
+import { strategyStep } from './bounds.js';
 import {
   type ClosedTrade,
-  type TradeFeatures,
   bucketStats,
   holdSec,
   isWin,
@@ -19,45 +22,29 @@ import {
 /** Minimum trades on each side of a threshold before it is analysed or acted on. */
 export const MIN_BUCKET_TRADES = 8;
 
-interface FeatureDef {
-  feature: keyof TradeFeatures;
-  param: LearnableParam;
-  direction: 'min' | 'max';
-}
-
-export const FEATURE_DEFS: FeatureDef[] = [
-  { feature: 'priceChange5mPct', param: 'minPriceChange5mPct', direction: 'min' },
-  { feature: 'buySellRatio', param: 'minBuySellRatio', direction: 'min' },
-  { feature: 'volumeAcceleration', param: 'minVolumeAcceleration', direction: 'min' },
-  { feature: 'liquidityUsd', param: 'minLiquidityUsd', direction: 'min' },
-  { feature: 'txCount5m', param: 'minActivityTx5m', direction: 'min' },
-  { feature: 'volume5mUsd', param: 'minVolume5mUsd', direction: 'min' },
-  { feature: 'overallScore', param: 'minOverallScore', direction: 'min' },
-  { feature: 'topHolderPct', param: 'maxTopHolderPct', direction: 'max' },
-  { feature: 'ageMinutes', param: 'minTokenAgeMinutes', direction: 'min' },
-];
-
-/** Rebuilds entry features from the strategy context stored on the signal. */
-export function featuresFromMarketState(
+/**
+ * Rebuilds the strategy inputs from the context stored on the signal. Volume acceleration is
+ * the capped non-overlapping value strategies compare against (`volumeAccel.capped`).
+ */
+export function strategyInputsFromMarketState(
   ms: Record<string, unknown> | null | undefined,
-  overallScore: number,
-): TradeFeatures | null {
-  if (!ms || typeof ms !== 'object' || ms.priceUsd == null) return null;
-  const n = (k: string) => Number(ms[k] ?? 0);
-  const nullable = (k: string) => (ms[k] == null ? null : Number(ms[k]));
-  const vol5m = n('volume5mUsd');
-  const prior = n('priorVolume5mUsd');
-  const vol1h = n('volume1hUsd');
+  overallScore: number | null,
+): StrategyInputs | null {
+  if (!ms || typeof ms !== 'object') return null;
+  const num = (v: unknown) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  const accel = ms.volumeAccel && typeof ms.volumeAccel === 'object' ? (ms.volumeAccel as Record<string, unknown>) : null;
+  const buy = num(ms.buyVolume5mUsd);
+  const sell = num(ms.sellVolume5mUsd);
   return {
-    priceChange5mPct: n('priceChange5mPct'),
-    buySellRatio: safeDiv(n('buyVolume5mUsd'), Math.max(n('sellVolume5mUsd'), 1), 0),
-    volumeAcceleration: prior > 0 ? vol5m / prior : vol1h > 0 ? (vol5m * 12) / vol1h : 0,
-    liquidityUsd: n('liquidityUsd'),
-    txCount5m: n('txCount5m'),
-    volume5mUsd: vol5m,
-    overallScore,
-    topHolderPct: nullable('topHolderPct'),
-    ageMinutes: nullable('ageMinutes'),
+    priceChange5mPct: num(ms.priceChange5mPct),
+    buySellRatio: buy == null || sell == null ? null : safeDiv(buy, Math.max(sell, 1), 0),
+    volumeAcceleration: accel ? num(accel.capped) : null,
+    liquidityUsd: num(ms.liquidityUsd),
+    txCount5m: num(ms.txCount5m),
+    volume5mUsd: num(ms.volume5mUsd),
+    overallScore: overallScore != null && Number.isFinite(overallScore) ? overallScore : null,
+    topHolderPct: num(ms.topHolderPct),
+    ageMinutes: num(ms.ageMinutes),
   };
 }
 
@@ -84,30 +71,45 @@ function quartiles(points: Array<{ v: number; t: ClosedTrade }>): FeatureStat['q
   return out;
 }
 
-export function analyzeFeatures(
+/** One guarded tightening step for a threshold. */
+export function tightenedThreshold(def: StrategyParamDef, threshold: number): number {
+  const step = strategyStep(def, threshold);
+  return def.direction === 'min' ? threshold + step : threshold - step;
+}
+
+/** Trades the tightened threshold would filter out ("near the limit"). */
+export function inBand(def: StrategyParamDef, candidate: number, v: number): boolean {
+  return def.direction === 'min' ? v < candidate : v > candidate;
+}
+
+export function featurePoints(trades: ClosedTrade[], def: StrategyParamDef): Array<{ v: number; t: ClosedTrade }> {
+  if (!def.feature) return [];
+  const feature = def.feature;
+  return trades
+    .map((t) => ({ v: t.features?.[feature] ?? null, t }))
+    .filter((p): p is { v: number; t: ClosedTrade } => p.v != null && Number.isFinite(p.v));
+}
+
+/** Winners vs losers around each learnable threshold the strategy actually consumes. */
+export function analyzeStrategyFeatures(
+  strategyId: string,
   trades: ClosedTrade[],
-  settings: PortfolioSettings,
-): FeatureStat[] {
-  const stats: FeatureStat[] = [];
-  for (const def of FEATURE_DEFS) {
-    const threshold = getParam(settings, def.param);
-    if (threshold == null) continue;
-    const step = stepFor(def.param, threshold);
-    const candidate = def.direction === 'min' ? threshold + step : threshold - step;
-
-    const points = trades
-      .map((t) => ({ v: t.features?.[def.feature] ?? null, t }))
-      .filter((p): p is { v: number; t: ClosedTrade } => p.v != null && Number.isFinite(p.v));
-
-    const inBand = (v: number) => (def.direction === 'min' ? v < candidate : v > candidate);
-    const band = points.filter((p) => inBand(p.v)).map((p) => p.t);
-    const rest = points.filter((p) => !inBand(p.v)).map((p) => p.t);
+  params: StrategyParamValues,
+): Array<FeatureStat & { strategyId: string }> {
+  const stats: Array<FeatureStat & { strategyId: string }> = [];
+  for (const def of STRATEGY_PARAM_REGISTRY[strategyId]?.params ?? []) {
+    if (!def.feature) continue;
+    const threshold = params[def.key] ?? def.default;
+    const candidate = tightenedThreshold(def, threshold);
+    const points = featurePoints(trades, def);
+    const band = points.filter((p) => inBand(def, candidate, p.v)).map((p) => p.t);
+    const rest = points.filter((p) => !inBand(def, candidate, p.v)).map((p) => p.t);
     const winVals = points.filter((p) => isWin(p.t)).map((p) => p.v);
     const loseVals = points.filter((p) => !isWin(p.t)).map((p) => p.v);
-
     stats.push({
+      strategyId,
       feature: def.feature,
-      param: def.param,
+      param: def.key as LearnableParam,
       direction: def.direction,
       threshold,
       candidate,

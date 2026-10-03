@@ -149,13 +149,25 @@ npm run typecheck
 npm run lint
 ```
 
-Run built server:
+Run the built app (migrates, then starts API + worker; the API also serves the dashboard on the same port):
 
 ```bash
-npm run start -w @memebot/server
-npm run start:worker -w @memebot/server
-npm run preview -w @memebot/web
+npm start
 ```
+
+## Hosting on Railway (free trial)
+
+`railway.json` configures the build (`npm run build`), start (`npm start`) and health check (`/api/health`). One service runs the API, worker and dashboard; Railway provides Postgres.
+
+1. [railway.com](https://railway.com) → sign in with GitHub → **New Project → Deploy from GitHub repo** → pick this repo.
+2. In the project: **+ Create → Database → PostgreSQL**.
+3. Open the app service → **Variables → Raw Editor**, paste your `.env`, then set:
+   - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
+   - `NODE_ENV=production`
+   - delete `TEST_DATABASE_URL`, `API_PORT` and `CORS_ORIGIN` (Railway's `PORT` is used; the UI is same-origin)
+4. **Settings → Networking → Generate Domain**. Open it — that's the dashboard.
+
+Raw market tables are pruned to `RAW_DATA_RETENTION_HOURS` (default 3) and logs to `EVENT_RETENTION_DAYS` (default 3) so the database stays small. The trial is a one-time $5 credit for up to 30 days; when it runs out, services stop until a plan is added.
 
 ## Project layout
 

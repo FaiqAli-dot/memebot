@@ -35,6 +35,10 @@ import {
   getSystemHealth,
   meta,
 } from '../../services/query-service.js';
+import { getBotReadiness } from '../../services/readiness-service.js';
+import { getLearningStatus } from '../../learning/status-service.js';
+import { getWeek1Overview } from '../../services/week1-service.js';
+import { rollbackCalibration } from '../../learning/calibration-service.js';
 import { logBotEvent } from '../../services/token-service.js';
 import { publish } from '../../ws/hub.js';
 import {
@@ -111,6 +115,15 @@ apiRouter.get('/bot/status', async (_req, res, next) => {
   }
 });
 
+apiRouter.get('/bot/readiness', async (_req, res, next) => {
+  try {
+    await ensureDefaultPortfolio();
+    res.json(await getBotReadiness(portfolioId()));
+  } catch (err) {
+    next(err);
+  }
+});
+
 apiRouter.post('/bot/control', async (req, res, next) => {
   try {
     const body = botControlSchema.parse(req.body);
@@ -173,19 +186,7 @@ apiRouter.put('/settings', async (req, res, next) => {
   try {
     const body = portfolioSettingsSchema.parse(req.body);
     await ensureDefaultPortfolio();
-    const { strategyParams, ...rest } = body;
-    const updated = await updatePortfolioSettings(portfolioId(), {
-      ...rest,
-      ...(strategyParams
-        ? {
-            strategyParams: {
-              ...(await getPortfolioSettings(portfolioId())).strategyParams,
-              ...strategyParams,
-            },
-          }
-        : {}),
-    });
-    res.json(updated);
+    res.json(await updatePortfolioSettings(portfolioId(), body));
   } catch (err) {
     next(err);
   }
@@ -350,6 +351,41 @@ apiRouter.post('/reports/:id/rollback', async (req, res, next) => {
     res.json(await rollbackReport(reportIdSchema.parse(req.params.id)));
   } catch (err) {
     sendReportError(err, res, next);
+  }
+});
+
+apiRouter.get('/learning/status', async (_req, res, next) => {
+  try {
+    res.json(await getLearningStatus());
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/week1/overview', async (req, res, next) => {
+  try {
+    const hours = z.coerce.number().positive().max(24 * 30).default(24).parse(req.query.hours);
+    res.json(await getWeek1Overview(hours));
+  } catch (err) {
+    next(err);
+  }
+});
+
+const rollbackSchema = z.object({ reason: z.string().min(3).max(500) });
+
+/** Operator action only — calibrations are never rolled back automatically after losses. */
+apiRouter.post('/learning/calibrations/:strategyId/rollback', async (req, res, next) => {
+  try {
+    const strategyId = z.string().min(1).max(100).parse(req.params.strategyId);
+    const { reason } = rollbackSchema.parse(req.body ?? {});
+    res.json(await rollbackCalibration(strategyId, 'operator', reason));
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status) {
+      res.status(status).json({ error: (err as Error).message });
+      return;
+    }
+    next(err);
   }
 });
 

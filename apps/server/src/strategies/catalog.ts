@@ -1,10 +1,23 @@
+import type { StrategyParamValues, StrategyParamsById } from '@memebot/shared';
 import { clamp, safeDiv } from '../utils/helpers.js';
-import { buySignal, noTrade, type Strategy, type StrategyContext, type Signal } from './types.js';
+import {
+  buySignal,
+  liquidityIsKnown,
+  noTrade,
+  paramsFor,
+  strategyVolumeAccel,
+  type Strategy,
+  type StrategyContext,
+  type Signal,
+} from './types.js';
 import { MomentumBreakoutStrategy } from './momentum-breakout.js';
 
 function baseGates(s: Strategy, ctx: StrategyContext): Signal | null {
   if (ctx.safety?.blocked) {
     return noTrade(s, ['safety_blocked', ...(ctx.safety.reasons ?? [])], 'SAFETY_REJECTION');
+  }
+  if (!liquidityIsKnown(ctx)) {
+    return noTrade(s, [`liquidity_status_${ctx.liquidityStatus ?? 'UNKNOWN'}`], 'LIQUIDITY_REJECTION');
   }
   if (ctx.liquidityUsd < 3000) {
     return noTrade(s, ['liquidity_below_min'], 'LIQUIDITY_REJECTION');
@@ -18,19 +31,21 @@ export class EarlyVolumeExpansionStrategy implements Strategy {
   readonly version = 'eve-v1';
   readonly activeByDefault = true;
 
-  evaluate(ctx: StrategyContext): Signal {
+  evaluate(ctx: StrategyContext, params?: StrategyParamValues): Signal {
+    const p = paramsFor(this.id, params);
     const blocked = baseGates(this, ctx);
     if (blocked) return blocked;
-    const accel =
-      ctx.priorVolume5mUsd && ctx.priorVolume5mUsd > 0
-        ? ctx.volume5mUsd / ctx.priorVolume5mUsd
-        : 0;
+    const accelInfo = strategyVolumeAccel(ctx);
     const uniqueBuyers = ctx.flow?.['5m']?.uniqueBuyers.value ?? null;
     if (ctx.ageMinutes != null && ctx.ageMinutes > 60) {
       return noTrade(this, ['not_early'], 'MOMENTUM_REJECTION');
     }
-    if (accel < 1.8) return noTrade(this, ['accel_insufficient'], 'VOLUME_REJECTION', 20);
-    if (ctx.volume5mUsd < 2000) return noTrade(this, ['volume_low'], 'VOLUME_REJECTION', 20);
+    if (accelInfo.value == null) {
+      return noTrade(this, ['accel_insufficient_data'], 'VOLUME_REJECTION', 15);
+    }
+    const accel = accelInfo.value;
+    if (accel < p.minVolumeAcceleration) return noTrade(this, ['accel_insufficient'], 'VOLUME_REJECTION', 20);
+    if (ctx.volume5mUsd < p.minVolume5mUsd) return noTrade(this, ['volume_low'], 'VOLUME_REJECTION', 20);
     if (uniqueBuyers != null && uniqueBuyers < 5) {
       return noTrade(this, ['unique_buyers_low'], 'VOLUME_REJECTION', 25);
     }
@@ -43,7 +58,7 @@ export class EarlyVolumeExpansionStrategy implements Strategy {
       expectedReturn: 0.18,
       expectedLoss: 0.1,
       expectedHoldTimeSec: 600,
-      reasons: [`volume_accel_x${accel.toFixed(2)}`, `unique_buyers_${uniqueBuyers ?? 'unknown'}`],
+      reasons: [`volume_accel_x${accelInfo.label}`, `unique_buyers_${uniqueBuyers ?? 'unknown'}`],
       scores: {
         momentum: clamp(accel * 30, 0, 100),
         liquidity: clamp(ctx.liquidityUsd / 100, 0, 100),
@@ -62,14 +77,15 @@ export class LiquidityExpansionStrategy implements Strategy {
   readonly version = 'liq-v1';
   readonly activeByDefault = true;
 
-  evaluate(ctx: StrategyContext): Signal {
+  evaluate(ctx: StrategyContext, params?: StrategyParamValues): Signal {
+    const p = paramsFor(this.id, params);
     const blocked = baseGates(this, ctx);
     if (blocked) return blocked;
-    if (ctx.liquidityUsd < 10_000) return noTrade(this, ['need_deeper_liquidity'], 'LIQUIDITY_REJECTION');
+    if (ctx.liquidityUsd < p.minLiquidityUsd) return noTrade(this, ['need_deeper_liquidity'], 'LIQUIDITY_REJECTION');
     if (ctx.volume5mUsd < ctx.liquidityUsd * 0.05) {
       return noTrade(this, ['volume_not_confirming'], 'VOLUME_REJECTION');
     }
-    if (ctx.priceChange5mPct < 0.5) return noTrade(this, ['no_price_confirmation'], 'MOMENTUM_REJECTION');
+    if (ctx.priceChange5mPct < p.minPriceChange5mPct) return noTrade(this, ['no_price_confirmation'], 'MOMENTUM_REJECTION');
     const confidence = clamp(40 + Math.log10(ctx.liquidityUsd) * 8, 0, 90);
     return buySignal(this, {
       confidence,
@@ -249,12 +265,16 @@ export function activeStrategies(
   return catalog.filter((s) => s.activeByDefault);
 }
 
-/** Pick best BUY signal by confidence; collect NO_TRADE rejections for shadow tracking. */
+/**
+ * Pick best BUY signal by confidence; collect NO_TRADE rejections for shadow tracking.
+ * Each strategy receives only its own resolved parameters.
+ */
 export function evaluateAllStrategies(
   strategies: Strategy[],
   ctx: StrategyContext,
+  paramsById: StrategyParamsById = {},
 ): { best: Signal | null; all: Signal[] } {
-  const all = strategies.map((s) => s.evaluate(ctx));
+  const all = strategies.map((s) => s.evaluate(ctx, paramsById[s.id]));
   const buys = all.filter((s) => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
   return { best: buys[0] ?? null, all };
 }

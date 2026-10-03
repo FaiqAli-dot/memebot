@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { strategyParamDef } from './strategy-params.js';
 
 export const botControlSchema = z.object({
   action: z.enum(['start', 'pause']),
@@ -26,18 +27,23 @@ export const portfolioSettingsSchema = z.object({
   scanIntervalMs: z.number().int().positive().min(1000).max(300000).optional(),
   failedTxStillChargesNetwork: z.boolean().optional(),
   priorityFeeLamports: z.number().int().nonnegative().optional(),
+  /** { [strategyId]: { [param]: value } } — only registered parameters, within their range */
   strategyParams: z
-    .object({
-      minVolume5mUsd: z.number().nonnegative().optional(),
-      minVolumeAcceleration: z.number().optional(),
-      minPriceChange5mPct: z.number().optional(),
-      minBuySellRatio: z.number().nonnegative().optional(),
-      minLiquidityUsd: z.number().nonnegative().optional(),
-      minActivityTx5m: z.number().nonnegative().optional(),
-      minTokenAgeMinutes: z.number().nonnegative().optional(),
-      maxTokenAgeMinutes: z.number().positive().optional(),
-      minOverallScore: z.number().min(0).max(100).optional(),
-      maxTopHolderPct: z.number().min(0).max(100).optional(),
+    .record(z.string(), z.record(z.string(), z.number().finite()))
+    .superRefine((byStrategy, ctx) => {
+      for (const [strategyId, params] of Object.entries(byStrategy)) {
+        for (const [key, value] of Object.entries(params)) {
+          const def = strategyParamDef(strategyId, key);
+          if (!def) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${strategyId} does not consume ${key}` });
+          } else if (value < def.min || value > def.max) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `${strategyId}.${key} must be within ${def.min}–${def.max}`,
+            });
+          }
+        }
+      }
     })
     .optional(),
 });

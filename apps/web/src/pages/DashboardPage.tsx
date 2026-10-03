@@ -18,8 +18,19 @@ import type {
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct, pnlClass } from '../lib/api';
 import { useRealtime, useThrottled } from '../hooks/useRealtime';
+import { ReadinessPanel } from '../components/ReadinessPanel';
+import { LearningPanel } from '../components/LearningPanel';
+import { Week1Panel } from '../components/Week1Panel';
+
+const BOARD_TABS = [
+  { id: 'observation', label: 'Observation mode' },
+  { id: 'trading', label: 'Trading' },
+  { id: 'learning', label: 'Learning' },
+] as const;
+type BoardTab = (typeof BOARD_TABS)[number]['id'];
 
 export function DashboardPage() {
+  const [board, setBoard] = useState<BoardTab>('trading');
   const [portfolio, setPortfolio] = useState<PortfolioSummary | null>(null);
   const [bot, setBot] = useState<BotStatusInfo | null>(null);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
@@ -125,6 +136,23 @@ export function DashboardPage() {
           RESET ALL SIMULATION DATA
         </button>
       </div>
+
+      <div className="tabs" role="tablist">
+        {BOARD_TABS.map((t) => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={board === t.id}
+            className={`tab ${board === t.id ? 'active' : ''}`}
+            onClick={() => setBoard(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {board === 'observation' && <Week1Panel />}
+      {board === 'trading' && <ReadinessPanel />}
+      {board === 'learning' && <LearningPanel />}
 
       <div className="grid grid-4" style={{ marginBottom: '0.75rem' }}>
         <Metric label="Starting balance" value={money(portfolio?.startingBalanceUsd)} />

@@ -1,3 +1,4 @@
+import type { StrategyParamsById } from './strategy-params.js';
 import type {
   BotStatus,
   ConfidenceLevel,
@@ -77,17 +78,49 @@ export interface StrategySignal {
   strategyVersion: string;
 }
 
+/** Round-trip execution cost estimate; *Rate fields are fractions of position size, *Usd are dollars. */
+export interface ExecutionCostEstimate {
+  positionSizeUsd: number;
+  dexFeeRate: number;
+  dexFeeUsd: number;
+  priceImpactRate: number;
+  priceImpactUsd: number;
+  slippageRate: number;
+  slippageUsd: number;
+  networkFeeUsd: number;
+  totalCostUsd: number;
+  totalCostRate: number;
+  /** false when network fees could not be priced (SOL/USD unavailable) */
+  networkFeePriced: boolean;
+}
+
+/**
+ * Provisional research estimate — NOT a calibrated probability model.
+ * pWin / expectedReturn / expectedLoss are uncalibrated placeholders.
+ */
 export interface ExpectedValueEstimate {
   grossUpside: number | null;
   downside: number | null;
+  positionSizeUsd: number | null;
+  executionCostRate: number | null;
   executionCostUsd: number | null;
+  costBreakdown: ExecutionCostEstimate | null;
   failureProbability: number | null;
   timeToTargetSec: number | null;
   expectedNetValue: number | null;
   threshold: number;
+  thresholdMultiplier: number;
+  dataConfidence: ConfidenceLevel;
   passes: boolean;
   uncertainty: ConfidenceLevel;
   reasons: string[];
+  /** true only when a promoted, forward-validated calibration adjusted expectedNetValue */
+  calibrated: boolean;
+  /** Model win probability used in the EV formula (uncalibrated) */
+  winProbability?: number | null;
+  /** Pre-calibration value when `calibrated` */
+  rawExpectedNetValue?: number | null;
+  calibrationVersion?: string | null;
 }
 
 export interface TradeJournalEntry {
@@ -327,15 +360,48 @@ export type LearnableParam =
   | 'takeProfitPct'
   | 'trailingStopPct';
 
-export type LessonStatus = 'applied' | 'skipped' | 'reverted';
+/**
+ * applied               — validated and written to that strategy's runtime configuration
+ * skipped               — not evaluated/applied (insufficient data, limits, flip-flop, disabled)
+ * reverted              — an earlier applied lesson was undone
+ * rejected              — failed forward validation or a conservative-safety rule
+ * unused_parameter      — no running strategy consumes this parameter; never applied
+ * portfolio_scope       — derived from mixed-strategy trades or a shared setting; never applied
+ * validated_not_applied — passed validation, held back by LEARNING_OBSERVATION_MODE
+ */
+export type LessonStatus =
+  | 'applied'
+  | 'skipped'
+  | 'reverted'
+  | 'rejected'
+  | 'unused_parameter'
+  | 'portfolio_scope'
+  | 'validated_not_applied';
+
+export interface LessonSplitMetrics {
+  trades: number;
+  bandTrades: number;
+  bandWinRatePct: number;
+  restTrades: number;
+  restWinRatePct: number;
+  gapPp: number;
+}
 
 export interface Lesson {
+  /** Owning strategy; null/absent = portfolio-wide (legacy or shared exit setting) */
+  strategyId?: string | null;
   param: LearnableParam | 'all';
   from: number | null;
   to: number | null;
   status: LessonStatus;
   reason: string;
   evidence: Record<string, number>;
+  trainingSampleCount?: number;
+  validationSampleCount?: number;
+  trainingMetrics?: LessonSplitMetrics | null;
+  validationMetrics?: LessonSplitMetrics | null;
+  confidence?: 'LOW' | 'MEDIUM' | 'HIGH' | null;
+  lessonVersion?: string;
 }
 
 export interface ImportantTrade {
@@ -360,6 +426,8 @@ export interface BucketStat {
 }
 
 export interface FeatureStat {
+  /** Strategy that owns `param`; absent in pre-v2 reports (portfolio-wide analysis). */
+  strategyId?: string;
   feature: string;
   param: LearnableParam;
   direction: 'min' | 'max';
@@ -409,11 +477,52 @@ export interface ReportSummary {
   windowWinRatePct: number;
 }
 
+export interface LearningModeInfo {
+  tradingMode: 'PAPER';
+  liveExecution: 'DISABLED';
+  observationMode: boolean;
+  automaticStrategyPromotion: 'ENABLED' | 'DISABLED';
+  automaticRiskExpansion: 'DISABLED';
+  banner: string;
+}
+
+export interface LearningDataQuality {
+  production: number;
+  trueEntrySnapshots: number;
+  partialEntrySnapshots: number;
+  signalBackfills: number;
+  calibrationEligible: number;
+  research: number;
+  note: string | null;
+}
+
+export interface StrategyReportSection {
+  strategyId: string;
+  name: string;
+  day: { trades: number; wins: number; losses: number; winRatePct: number | null; netPnlUsd: number };
+  window: {
+    trades: number;
+    calibrationEligible: number;
+    winRatePct: number | null;
+    winRateCI: { low: number; high: number } | null;
+    avgPredictedEv: number | null;
+    avgRealizedReturn: number | null;
+    avgPositionSizeUsd: number | null;
+    netPnlUsd: number;
+  };
+  calibration: { activeVersion: string | null; latestCandidate: string | null; latestStatus: string | null };
+  params: Record<string, number>;
+  lessons: Lesson[];
+}
+
 export interface ReportAnalysis {
   features: FeatureStat[];
   exits: ExitStats;
   review: ReportReview;
   learningEnabled: boolean;
+  mode?: LearningModeInfo;
+  dataQuality?: LearningDataQuality;
+  strategies?: StrategyReportSection[];
 }
 
 export interface DailyReportListItem {
@@ -484,6 +593,317 @@ export interface BotStatusInfo {
   tradingMode: 'PAPER';
   realismProfile: RealismProfile;
   marketRegime: MarketRegime | null;
+}
+
+export type ReadinessState = 'PAUSED' | 'BLOCKED' | 'WARMING_UP' | 'HUNTING' | 'TRADING';
+
+export interface ReadinessGate {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface ReadinessFunnelStage {
+  key: string;
+  label: string;
+  count: number;
+  /** 'now' = point-in-time universe count; 'window' = summed evaluations in the window */
+  scope: 'now' | 'window';
+}
+
+export interface ReadinessCount {
+  key: string;
+  label: string;
+  count: number;
+}
+
+export interface ReadinessNearMiss {
+  tokenId: string;
+  symbol: string;
+  strategyId: string | null;
+  expectedNetValue: number;
+  threshold: number;
+  observedAt: string;
+  dataConfidence?: string | null;
+  executionCostRate?: number | null;
+  positionSizeUsd?: number | null;
+}
+
+export interface ReadinessEvSummary {
+  /** Distinct token/strategy opportunities with an EV in the window */
+  candidates: number;
+  best: ReadinessNearMiss | null;
+  closestMiss: ReadinessNearMiss | null;
+  within0_5pct: number;
+  within1pct: number;
+  within2pct: number;
+  minExpectedNetValue: number;
+  lowConfidenceMultiplier: number;
+}
+
+export interface ReadinessResearch {
+  enabled: boolean;
+  tradesToday: number;
+  maxTradesPerDay: number;
+  maxEvShortfall: number;
+  openPositions: number;
+  signalsInWindow: number;
+}
+
+export interface ReadinessRiskExample {
+  symbol: string;
+  strategyId: string | null;
+  decision: 'SIZED' | 'RESIZED' | 'REJECTED';
+  reason: string | null;
+  expectedNetValue: number | null;
+  requestedSizeUsd: number;
+  finalSizeUsd: number;
+  maxViableSizeUsd: number;
+  maximumPlannedLossUsd: number;
+  maxRiskPerTradeUsd: number;
+  executionStatus: string | null;
+  evaluatedAt: string;
+}
+
+/** Unique risk decisions (one per signal) for the production portfolio. */
+export interface ReadinessRisk {
+  windowMinutes: number;
+  candidates: number;
+  sized: number;
+  resized: number;
+  rejected: number;
+  passRate: number | null;
+  resizeRate: number | null;
+  rejectRate: number | null;
+  /** Would fail at the requested size but fit at a smaller one (= resized) */
+  passIfSmaller: number;
+  executed: number;
+  evFailedAtFinalSize: number;
+  limitBlocked: number;
+  avgRequestedSizeUsd: number | null;
+  avgFinalSizeUsd: number | null;
+  avgPositionMultiplier: number | null;
+  avgMaxPlannedLossUsd: number | null;
+  avgExecutionCostRate: number | null;
+  baseSizeUsd: number;
+  minSizeUsd: number;
+  maxRiskPerTradeUsd: number;
+  maxPortfolioExposureUsd: number;
+  openExposureUsd: number;
+  rejections: ReadinessCount[];
+  resizedBy: ReadinessCount[];
+  examples: ReadinessRiskExample[];
+}
+
+export interface LearningInterval {
+  low: number;
+  high: number;
+}
+
+export interface LearningStrategyStat {
+  scope: 'PRODUCTION' | 'RESEARCH';
+  strategyId: string;
+  n: number;
+  lowSample: boolean;
+  winRate: number | null;
+  winRateCI: LearningInterval | null;
+  avgReturn: number | null;
+  avgReturnCI: LearningInterval | null;
+  profitFactor: number | null;
+  avgPredictedEv: number | null;
+  avgPredictedWinProbability: number | null;
+}
+
+export interface LearningAnomalyItem {
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  type: string;
+  scope: string;
+  strategyId: string | null;
+  message: string;
+  sampleSize: number;
+  lowSample: boolean;
+  safety: boolean;
+  createdAt: string;
+}
+
+export interface LearningCandidateItem {
+  strategyId: string;
+  version: string;
+  status: 'CANDIDATE' | 'VALIDATED' | 'PROMOTED' | 'REJECTED';
+  promotionDecision: string;
+  trainingCount: number;
+  validationCount: number;
+  createdAt: string;
+}
+
+export interface LearningStatus {
+  config: {
+    learningIntervalHours: number;
+    minNewObservations: number;
+    anomalyCheckEvery: number;
+    recentWindow: number;
+    baselineWindow: number;
+    alertCooldownMinutes: number;
+    reportTime: string;
+    reportTimezone: string;
+  };
+  observation: {
+    completed: number;
+    production: number;
+    research: number;
+    openTrades: number;
+    newSinceCalibration: number;
+    lastObservationAt: string | null;
+    entrySnapshots: number;
+    signalBackfills: number;
+    quality: LearningDataQuality;
+  };
+  mode: LearningModeInfo;
+  health: {
+    checksLast24h: number;
+    lastCheckAt: string | null;
+    observationsSinceLastCheck: number;
+    warnings: number;
+    critical: number;
+    byType: Record<'execution' | 'prediction' | 'data' | 'risk' | 'degradation', number>;
+    protectionAction: string | null;
+    recentAnomalies: LearningAnomalyItem[];
+    strategies: LearningStrategyStat[];
+  };
+  calibration: {
+    stage: string;
+    stageNote: string;
+    productionObservations: number;
+    active: Array<{ strategyId: string; version: string; offset: number; scale: number; activatedAt: string }>;
+    lastPerformedAt: string | null;
+    lastRun: {
+      decision: string;
+      reason: string;
+      createdAt: string;
+      newObservations: number;
+      requiredObservations: number;
+    } | null;
+    gate: {
+      decision: string;
+      reason: string;
+      newObservations: number;
+      requiredObservations: number;
+      hoursSinceLast: number | null;
+      requiredHours: number;
+    };
+    nextEvaluation: string;
+    nextEligibleAt: string | null;
+    observationsNeeded: number;
+    candidates: LearningCandidateItem[];
+    versionCounts: Record<LearningCandidateItem['status'], number>;
+  };
+}
+
+export interface Week1PerformanceStats {
+  closedTrades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number | null;
+  winRateCI: { low: number; high: number } | null;
+  realizedPnlUsd: number;
+  avgWinUsd: number | null;
+  avgLossUsd: number | null;
+  profitFactor: number | null;
+  avgHoldSec: number | null;
+}
+
+export interface Week1StrategyRow {
+  strategyId: string;
+  signals: number;
+  trades: number;
+  closed: number;
+  wins: number;
+  losses: number;
+  winRatePct: number | null;
+  avgPredictedEv: number | null;
+  realizedPnlUsd: number;
+  avgPositionSizeUsd: number | null;
+}
+
+export interface Week1Overview {
+  generatedAt: string;
+  windowHours: number;
+  mode: LearningModeInfo;
+  trading: {
+    tokensDiscovered: number;
+    tokensTracked: number;
+    tokensEligible: number;
+    signals: number;
+    productionSignals: number;
+    researchSignals: number;
+    tradesOpened: number;
+    tradesClosed: number;
+    openPositions: number;
+  };
+  performance: {
+    window: Week1PerformanceStats;
+    allTime: Week1PerformanceStats;
+    unrealizedPnlUsd: number;
+    sampleNote: string;
+  };
+  execution: {
+    avgSlippageRate: number | null;
+    avgPriceImpactRate: number | null;
+    feesUsd: number;
+    networkCostsUsd: number;
+    slippageCostsUsd: number;
+    priceImpactCostsUsd: number;
+    totalTradingCostsUsd: number;
+  };
+  risk: {
+    maxPortfolioExposureUsd: number;
+    currentExposureUsd: number;
+    largestPlannedLossUsd: number | null;
+    largestRealizedLossUsd: number | null;
+    riskRejections: number;
+    rejectionsByReason: Array<{ key: string; count: number }>;
+    positionSizeDistribution: Array<{ bucket: string; count: number }>;
+  };
+  strategies: Week1StrategyRow[];
+  learning: {
+    observations: number;
+    trueEntrySnapshots: number;
+    partialEntrySnapshots: number;
+    signalBackfills: number;
+    research: number;
+    calibrationEligible: number;
+    healthChecksWindow: number;
+    warningsWindow: number;
+    criticalWindow: number;
+    calibrationStatus: string;
+    calibrationReason: string;
+    lastCalibrationAt: string | null;
+    nextEligibleAt: string | null;
+    versionCounts: Record<LearningCandidateItem['status'], number>;
+  };
+}
+
+export interface BotReadiness {
+  state: ReadinessState;
+  headline: string;
+  detail: string;
+  windowMinutes: number;
+  gates: ReadinessGate[];
+  warmup: { tokensEligible: number; tokensReady: number; minHistoryMinutes: number };
+  funnel: {
+    ticks: number;
+    stages: ReadinessFunnelStage[];
+    rejections: ReadinessCount[];
+    byStrategy: Array<{ strategyId: string; rejections: ReadinessCount[] }>;
+    signals: number;
+    tradesOpened: number;
+  };
+  ev: ReadinessEvSummary;
+  risk: ReadinessRisk;
+  research: ReadinessResearch;
+  lastSignalAt: string | null;
+  lastTradeAt: string | null;
 }
 
 export interface BotEventData {
@@ -605,7 +1025,8 @@ export type WsEventType =
   | 'shadow_trade_updated'
   | 'regime_updated'
   | 'kill_switch'
-  | 'safety_blocked';
+  | 'safety_blocked'
+  | 'learning_updated';
 
 export interface WsMessage<T = unknown> {
   type: WsEventType;
@@ -628,7 +1049,8 @@ export interface PortfolioSettings {
   minTokenAgeMinutes: number;
   maxTokenAgeMinutes: number;
   scanIntervalMs: number;
-  strategyParams: MomentumStrategyParams;
+  /** Per-strategy thresholds; resolve with `resolveStrategyParams` before use */
+  strategyParams: StrategyParamsById;
   failedTxStillChargesNetwork: boolean;
   priorityFeeLamports: number;
   /** Allow multiple open positions in same token (default false). */

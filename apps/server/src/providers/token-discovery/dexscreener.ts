@@ -2,6 +2,7 @@ import type { DataMode } from '@memebot/shared';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { isSolanaAddress, sanitizeString, withRetry } from '../../utils/helpers.js';
+import { classifyLiquidity } from '../../universe/lifecycle.js';
 import type {
   DiscoveredToken,
   MarketDataProvider,
@@ -23,6 +24,7 @@ interface DexPair {
   txns?: {
     m5?: { buys?: number; sells?: number };
     h1?: { buys?: number; sells?: number };
+    h24?: { buys?: number; sells?: number };
   };
   fdv?: number;
   marketCap?: number;
@@ -60,8 +62,17 @@ function toQuote(pair: DexPair): MarketQuote | null {
   const buys = pair.txns?.m5?.buys ?? 0;
   const sells = pair.txns?.m5?.sells ?? 0;
   const volume5m = Number(pair.volume?.m5 ?? 0);
+  // Equal-size assumption: provider gives counts, not buy/sell volume
   const buyShare = buys + sells > 0 ? buys / (buys + sells) : 0.5;
-  const liquidityUsd = Number(pair.liquidity?.usd ?? 0);
+  const reportedLiquidity = pair.liquidity?.usd;
+  const liquidityUsd =
+    reportedLiquidity != null && Number.isFinite(Number(reportedLiquidity)) ? Number(reportedLiquidity) : 0;
+  const venue = pair.dexId ?? 'unknown';
+  const liquidityStatus = classifyLiquidity({
+    venue,
+    liquidityUsd: reportedLiquidity == null ? null : liquidityUsd,
+  });
+  const count = (n: number | undefined) => (n == null || !Number.isFinite(n) ? null : n);
   return {
     chain: 'solana',
     address,
@@ -76,13 +87,33 @@ function toQuote(pair: DexPair): MarketQuote | null {
     priceChange5mPct: Number(pair.priceChange?.m5 ?? 0),
     priceChange1hPct: Number(pair.priceChange?.h1 ?? 0),
     liquidityUsd,
+    liquidityStatus,
+    buys5m: count(pair.txns?.m5?.buys),
+    sells5m: count(pair.txns?.m5?.sells),
+    buys1h: count(pair.txns?.h1?.buys),
+    sells1h: count(pair.txns?.h1?.sells),
+    buys24h: count(pair.txns?.h24?.buys),
+    sells24h: count(pair.txns?.h24?.sells),
+    pairCreatedAt:
+      pair.pairCreatedAt && Number.isFinite(pair.pairCreatedAt) ? new Date(pair.pairCreatedAt) : null,
     observedAt: new Date(),
     poolAddress: pair.pairAddress ?? null,
-    venue: pair.dexId ?? 'unknown',
+    venue,
     feeBps: null, // filled by fee provider / pool metadata when known
-    baseReserve: null,
-    quoteReserve: liquidityUsd > 0 && priceUsd > 0 ? liquidityUsd / 2 / priceUsd : null,
+    // quoteReserve is the USD value of the quote side (what the simulator expects);
+    // baseReserve is the token quantity on the base side
+    baseReserve: liquidityStatus === 'KNOWN' && priceUsd > 0 ? liquidityUsd / 2 / priceUsd : null,
+    quoteReserve: liquidityStatus === 'KNOWN' ? liquidityUsd / 2 : null,
   };
+}
+
+/** Prefer a pool with known AMM liquidity, then deeper liquidity, then more volume. */
+function betterQuote(a: MarketQuote, b: MarketQuote): boolean {
+  const ka = a.liquidityStatus === 'KNOWN' ? 1 : 0;
+  const kb = b.liquidityStatus === 'KNOWN' ? 1 : 0;
+  if (ka !== kb) return ka > kb;
+  if (a.liquidityUsd !== b.liquidityUsd) return a.liquidityUsd > b.liquidityUsd;
+  return a.volume24hUsd > b.volume24hUsd;
 }
 
 export class DexScreenerTokenDiscoveryProvider implements TokenDiscoveryProvider {
@@ -154,7 +185,7 @@ export class DexScreenerMarketDataProvider implements MarketDataProvider, PriceP
           const q = toQuote(pair);
           if (!q) continue;
           const prev = best.get(q.address);
-          if (!prev || q.liquidityUsd > prev.liquidityUsd) best.set(q.address, q);
+          if (!prev || betterQuote(q, prev)) best.set(q.address, q);
         }
         quotes.push(...best.values());
       } catch (err) {

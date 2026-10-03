@@ -21,6 +21,7 @@ const PARAM_LABELS: Record<string, string> = {
   minOverallScore: 'Min overall score',
   maxTopHolderPct: 'Max top holder',
   minTokenAgeMinutes: 'Min token age (min)',
+  maxTokenAgeMinutes: 'Max token age (min)',
   stopLossPct: 'Stop-loss',
   takeProfitPct: 'Take-profit',
   trailingStopPct: 'Trailing stop',
@@ -154,6 +155,9 @@ export function ReportsPage() {
                   {r.lessonCounts.reverted > 0 && (
                     <span className="badge pause">{r.lessonCounts.reverted} reverted</span>
                   )}
+                  {(r.lessonCounts.validated_not_applied ?? 0) > 0 && (
+                    <span className="badge">{r.lessonCounts.validated_not_applied} observed</span>
+                  )}
                 </span>
               </button>
             ))}
@@ -186,11 +190,18 @@ function ReportDetail({
   onRollback: () => void;
 }) {
   const s = report.summary;
-  const { exits, review } = report.analysis;
+  const { exits, review, mode, dataQuality: dq, strategies } = report.analysis;
   const canRollback = report.applied && !report.rolledBackAt;
 
   return (
     <div style={{ display: 'grid', gap: '0.75rem' }}>
+      {mode && (
+        <div className="week1-banner">
+          <strong>{mode.banner}</strong>
+          <span>Live trading: {mode.liveExecution}</span>
+          <span>Automatic strategy promotion: {mode.automaticStrategyPromotion}</span>
+        </div>
+      )}
       <div className="panel">
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem' }}>
           <h2 style={{ margin: 0 }}>Report {report.reportDate}</h2>
@@ -230,6 +241,74 @@ function ReportDetail({
           <Metric label="Last changes review" value={reviewLabel(review.verdict, review.reverted)} />
         </div>
       </div>
+
+      {dq && (
+        <div className="panel">
+          <h3>Learning data quality (production)</h3>
+          <div className="grid grid-4">
+            <Metric label="True entry snapshots" value={String(dq.trueEntrySnapshots)} />
+            <Metric label="Signal backfills" value={String(dq.signalBackfills)} />
+            <Metric label="Partial snapshots" value={String(dq.partialEntrySnapshots)} />
+            <Metric label="Calibration-eligible" value={String(dq.calibrationEligible)} />
+          </div>
+          <p className="disclaimer">
+            {dq.note ?? 'Only true entry snapshots feed calibration and parameter lessons.'} Research observations (
+            {dq.research}) are never used for production learning.
+          </p>
+        </div>
+      )}
+
+      {strategies && strategies.length > 0 && (
+        <div className="panel">
+          <h3>Per strategy</h3>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Strategy</th>
+                  <th>Today</th>
+                  <th>{s.windowDays}-day trades (eligible)</th>
+                  <th>Win rate [95% CI]</th>
+                  <th>Avg predicted EV / realized</th>
+                  <th>Avg size</th>
+                  <th>Net P/L ({s.windowDays}d)</th>
+                  <th>Calibration</th>
+                </tr>
+              </thead>
+              <tbody>
+                {strategies.map((st) => (
+                  <tr key={st.strategyId}>
+                    <td title={st.strategyId}>{st.name}</td>
+                    <td>
+                      {st.day.trades} · {st.day.wins}W/{st.day.losses}L ·{' '}
+                      <span className={pnlClass(st.day.netPnlUsd)}>{money(st.day.netPnlUsd)}</span>
+                    </td>
+                    <td>
+                      {st.window.trades} ({st.window.calibrationEligible})
+                    </td>
+                    <td>
+                      {pct(st.window.winRatePct, 0)}
+                      {st.window.winRateCI &&
+                        ` [${st.window.winRateCI.low.toFixed(0)}–${st.window.winRateCI.high.toFixed(0)}%]`}
+                    </td>
+                    <td>
+                      {st.window.avgPredictedEv == null ? '—' : pct(st.window.avgPredictedEv * 100, 2)} /{' '}
+                      {st.window.avgRealizedReturn == null ? '—' : pct(st.window.avgRealizedReturn * 100, 2)}
+                    </td>
+                    <td>{st.window.avgPositionSizeUsd == null ? '—' : money(st.window.avgPositionSizeUsd)}</td>
+                    <td className={pnlClass(st.window.netPnlUsd)}>{money(st.window.netPnlUsd)}</td>
+                    <td className="muted">
+                      {st.calibration.activeVersion ?? 'uncalibrated'}
+                      {st.calibration.latestCandidate &&
+                        ` · ${st.calibration.latestStatus ?? ''} ${st.calibration.latestCandidate}`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="panel">
         <h3>Lessons</h3>
@@ -289,6 +368,7 @@ function ReportDetail({
           <table>
             <thead>
               <tr>
+                <th>Strategy</th>
                 <th>Setting</th>
                 <th>Limit</th>
                 <th>Winners avg</th>
@@ -299,14 +379,15 @@ function ReportDetail({
             </thead>
             <tbody>
               {report.analysis.features.map((f) => (
-                <FeatureRow key={f.param} f={f} />
+                <FeatureRow key={`${f.strategyId ?? 'all'}:${f.param}`} f={f} />
               ))}
             </tbody>
           </table>
         </div>
         <p className="disclaimer">
-          "Near the limit" means trades that one guarded step (10%) of tightening would have filtered out.
-          A setting only changes with 8+ trades on each side and a 15-point win-rate gap.
+          Each row uses only that strategy's true-entry-snapshot trades. "Near the limit" means trades that one
+          guarded step (10%) of tightening would have filtered out. A setting only changes with 8+ trades on each
+          side, a 15-point win-rate gap on the older 70%, and confirmation on the newer, unseen 30%.
         </p>
       </div>
 
@@ -342,12 +423,15 @@ function reviewLabel(verdict: string, reverted: boolean): string {
 
 function LessonRow({ lesson: l, rolledBack }: { lesson: Lesson; rolledBack: boolean }) {
   const status = l.status === 'applied' && rolledBack ? 'rolled back' : l.status;
-  const cls = status === 'applied' ? 'run' : status === 'skipped' ? '' : 'pause';
+  const cls =
+    status === 'applied' ? 'run' : status === 'skipped' || status === 'validated_not_applied' ? '' : 'pause';
+  const owner = l.strategyId ?? (l.param === 'all' ? null : 'portfolio-wide');
   return (
     <div className="lesson">
-      <span className={`badge ${cls}`}>{status.toUpperCase()}</span>
+      <span className={`badge ${cls}`}>{status.replace(/_/g, ' ').toUpperCase()}</span>
       <div>
         <div className="lesson-title">
+          {owner && <span className="muted">{owner} · </span>}
           {PARAM_LABELS[l.param] ?? l.param}
           {l.from != null && l.to != null && (
             <>
@@ -357,6 +441,15 @@ function LessonRow({ lesson: l, rolledBack }: { lesson: Lesson; rolledBack: bool
           )}
         </div>
         <div className="lesson-reason">{l.reason}</div>
+        {(l.trainingSampleCount != null || l.confidence) && (
+          <div className="lesson-reason muted">
+            {l.trainingSampleCount != null &&
+              `train ${l.trainingSampleCount} / unseen ${l.validationSampleCount ?? 0} trades`}
+            {l.trainingMetrics?.gapPp != null && ` · train gap ${l.trainingMetrics.gapPp.toFixed(0)}pp`}
+            {l.validationMetrics?.gapPp != null && ` · unseen gap ${l.validationMetrics.gapPp.toFixed(0)}pp`}
+            {l.confidence && ` · ${l.confidence} confidence`}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -367,6 +460,7 @@ function FeatureRow({ f }: { f: FeatureStat }) {
     b.n === 0 ? '—' : `${b.n} trades · ${pct(b.winRatePct, 0)} win`;
   return (
     <tr>
+      <td>{f.strategyId ?? 'all (legacy)'}</td>
       <td>{PARAM_LABELS[f.param] ?? f.param}</td>
       <td>{fmtParam(f.param, f.threshold)}</td>
       <td>{fmtFeature(f.feature, f.winners.mean)}</td>

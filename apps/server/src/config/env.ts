@@ -83,6 +83,54 @@ const envSchema = z.object({
   CAUTION_DRAWDOWN_PCT: z.coerce.number().default(0.1),
   RECOVERY_DRAWDOWN_PCT: z.coerce.number().default(0.08),
   MIN_EXPECTED_NET_VALUE: z.coerce.number().default(0.02),
+  /** Threshold multiplier applied only when measured data confidence is LOW/UNKNOWN */
+  LOW_CONFIDENCE_EV_MULTIPLIER: z.coerce.number().min(1).default(1.2),
+  // Token universe: tracking set vs per-tick budgets
+  TOKEN_TRACKING_MAX_AGE_HOURS: z.coerce.number().positive().default(24),
+  TOKEN_TRACKING_CAP: z.coerce.number().int().positive().default(5000),
+  TOKEN_EVALUATION_CAP_PER_TICK: z.coerce.number().int().positive().default(200),
+  TOKEN_EVALUATION_ROTATION_SHARE: z.coerce.number().min(0).max(1).default(0.25),
+  MARKET_DATA_CAP_PER_TICK: z.coerce.number().int().positive().default(300),
+  TOKEN_STALE_AFTER_SEC: z.coerce.number().int().positive().default(300),
+  TOKEN_ARCHIVE_STALE_AFTER_MIN: z.coerce.number().positive().default(30),
+  // Volume acceleration (non-overlapping windows)
+  VOLUME_ACCEL_MIN_BASELINE_USD: z.coerce.number().nonnegative().default(500),
+  VOLUME_ACCEL_MAX: z.coerce.number().positive().default(10),
+  // Research paper portfolio (never mixed with production stats)
+  RESEARCH_EXPLORATION_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  RESEARCH_MAX_TRADES_PER_DAY: z.coerce.number().int().nonnegative().default(5),
+  RESEARCH_MAX_EV_SHORTFALL: z.coerce.number().nonnegative().default(0.015),
+  // Risk sizing (provisional paper/research values). Base size, per-trade max loss and
+  // max open positions come from the existing portfolio settings (maxPositionPct,
+  // maxRiskPerTradePct, maxSimultaneousPositions) — not duplicated here.
+  PAPER_MIN_POSITION_USD: z.coerce.number().positive().default(1),
+  MAX_PORTFOLIO_EXPOSURE_PCT: z.coerce.number().positive().max(1).default(0.5),
+  MAX_STRATEGY_EXPOSURE_PCT: z.coerce.number().positive().max(1).default(0.25),
+  MAX_TOKEN_EXPOSURE_PCT: z.coerce.number().positive().max(1).default(0.1),
+  RISK_SIZE_HIGH_MULTIPLIER: z.coerce.number().positive().max(1).default(1),
+  RISK_SIZE_MEDIUM_MULTIPLIER: z.coerce.number().positive().max(1).default(0.6),
+  RISK_SIZE_LOW_MULTIPLIER: z.coerce.number().positive().max(1).default(0.3),
+  /** EV at least this far above threshold → strong tier */
+  RISK_STRONG_EV_MARGIN: z.coerce.number().nonnegative().default(0.03),
+  RISK_SIZE_STRONG_EV_MULTIPLIER: z.coerce.number().min(1).max(1.5).default(1.25),
+  /** Research-lane (near-threshold EV) positions are smaller, not exempt */
+  RISK_SIZE_RESEARCH_MULTIPLIER: z.coerce.number().positive().max(1).default(0.5),
+  /** |5m price change| bands: high → reduce, very high → reduce more, extreme → reject */
+  RISK_VOL_HIGH_PCT: z.coerce.number().positive().default(15),
+  RISK_VOL_VERY_HIGH_PCT: z.coerce.number().positive().default(25),
+  RISK_VOL_EXTREME_PCT: z.coerce.number().positive().default(80),
+  RISK_SIZE_HIGH_VOL_MULTIPLIER: z.coerce.number().positive().max(1).default(0.75),
+  RISK_SIZE_VERY_HIGH_VOL_MULTIPLIER: z.coerce.number().positive().max(1).default(0.5),
+  /** Hard execution limits — size is reduced to satisfy them, rejected if the minimum can't */
+  MAX_ENTRY_PRICE_IMPACT_PCT: z.coerce.number().positive().default(3),
+  MAX_ROUND_TRIP_COST_RATE: z.coerce.number().positive().default(0.2),
+  SHADOW_REENTRY_COOLDOWN_SECONDS: z.coerce.number().int().nonnegative().default(300),
+  OPPORTUNITY_COOLDOWN_SECONDS: z.coerce.number().int().nonnegative().default(300),
+  JOB_LIFECYCLE_INTERVAL_MS: z.coerce.number().default(15_000),
+  JOB_OPPORTUNITY_INTERVAL_MS: z.coerce.number().default(5_000),
   REPORT_TIME: z
     .string()
     .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'REPORT_TIME must be HH:MM (24h)')
@@ -103,6 +151,29 @@ const envSchema = z.object({
     .transform((v) => v !== 'false')
     .default('true'),
   LEARNING_MIN_TRADES: z.coerce.number().int().positive().default(20),
+  /**
+   * Three-level learning. Level 1 records every closed trade; Level 2 health-checks every
+   * N observations (alerts only); Level 3 calibrates in the daily report run, and only when
+   * BOTH enough new production observations exist AND the interval has passed.
+   */
+  LEARNING_INTERVAL_HOURS: z.coerce.number().positive().default(24),
+  MIN_NEW_OBSERVATIONS_FOR_LEARNING: z.coerce.number().int().positive().default(25),
+  ANOMALY_CHECK_INTERVAL_TRADES: z.coerce.number().int().positive().default(5),
+  ANOMALY_RECENT_WINDOW_TRADES: z.coerce.number().int().positive().default(25),
+  ANOMALY_BASELINE_WINDOW_TRADES: z.coerce.number().int().positive().default(100),
+  ANOMALY_ALERT_COOLDOWN_MINUTES: z.coerce.number().nonnegative().default(60),
+  /**
+   * Week-1 observation mode (default ON): observations, health checks, reports and calibration
+   * candidates continue, but no strategy parameter or EV calibration is changed automatically.
+   */
+  LEARNING_OBSERVATION_MODE: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  /** High-frequency raw tables (snapshots, trade events) are pruned past this age; each token's latest row is kept */
+  RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(3),
+  /** Bot log and missed-opportunity rows are pruned past this age */
+  EVENT_RETENTION_DAYS: z.coerce.number().positive().default(3),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),
@@ -110,6 +181,9 @@ const envSchema = z.object({
   ALERT_EMAIL_TO: z.string().optional().default(''),
   ALERT_COOLDOWN_MS: z.coerce.number().default(300_000),
 });
+
+// Hosting platforms (Railway, Render, …) assign the listen port via PORT; it must win over API_PORT
+if (process.env.PORT) process.env.API_PORT = process.env.PORT;
 
 const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {

@@ -12,6 +12,7 @@
     "dev:worker": "npm run dev:worker -w @memebot/server",
     "dev:web": "npm run dev -w @memebot/web",
     "build": "npm run build -w @memebot/shared && npm run build -w @memebot/server && npm run build -w @memebot/web",
+    "start": "npm run start:all -w @memebot/server",
     "typecheck": "npm run typecheck -w @memebot/shared && npm run typecheck -w @memebot/server && npm run typecheck -w @memebot/web",
     "lint": "npm run lint -w @memebot/server && npm run lint -w @memebot/web",
     "test": "npm run test -w @memebot/server",

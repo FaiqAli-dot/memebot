@@ -4,31 +4,37 @@ import { api } from './lib/api';
 import { useRealtime } from './hooks/useRealtime';
 import { DashboardPage } from './pages/DashboardPage';
 import { ScannerPage } from './pages/ScannerPage';
+import { LivePage } from './pages/LivePage';
 import { PositionsPage } from './pages/PositionsPage';
 import { TradesPage } from './pages/TradesPage';
 import { StrategiesPage } from './pages/StrategiesPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
+import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TokenDetailPage } from './pages/TokenDetailPage';
 
 const links = [
   ['/', 'Dashboard'],
   ['/scanner', 'Scanner'],
+  ['/live', 'Live'],
   ['/positions', 'Positions'],
   ['/trades', 'Trades'],
   ['/strategies', 'Strategies'],
   ['/analytics', 'Analytics'],
+  ['/reports', 'Reports'],
   ['/settings', 'Settings'],
 ] as const;
 
 export function App() {
   const [dataMode, setDataMode] = useState<string>('demo');
   const [botStatus, setBotStatus] = useState<string>('PAUSED');
-  const { connected, tick } = useRealtime((msg) => {
+  const [statusTick, setStatusTick] = useState(0);
+  const { connected } = useRealtime((msg) => {
     if (msg.type === 'bot_status' && msg.payload && typeof msg.payload === 'object') {
       const p = msg.payload as { status?: string; dataMode?: string };
       if (p.status) setBotStatus(p.status);
       if (p.dataMode) setDataMode(p.dataMode);
+      setStatusTick((t) => t + 1);
     }
   });
 
@@ -38,7 +44,7 @@ export function App() {
       setBotStatus(b.status);
       setDataMode(b.dataMode);
     });
-  }, [tick]);
+  }, [statusTick]);
 
   return (
     <div className="app-shell">
@@ -75,10 +81,12 @@ export function App() {
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/scanner" element={<ScannerPage />} />
+          <Route path="/live" element={<LivePage />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/trades" element={<TradesPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/reports" element={<ReportsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/tokens/:id" element={<TokenDetailPage />} />
         </Routes>

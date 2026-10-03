@@ -269,6 +269,70 @@ tr.flash td { animation: flashRow 0.8s ease; }
   padding: 1rem;
 }
 
+.live-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  font-family: var(--font-display);
+}
+.live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+  gap: 0.75rem;
+}
+.live-card { display: flex; flex-direction: column; gap: 0.6rem; transition: opacity 0.4s; }
+.live-card.closed { opacity: 0.55; }
+.live-card-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.live-symbol { font-family: var(--font-display); font-weight: 800; font-size: 1.1rem; }
+.live-symbol:hover { color: var(--accent); }
+.live-tick { display: flex; align-items: center; gap: 0.35rem; color: var(--muted); font-size: 0.7rem; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); }
+.live-dot.on { background: var(--gain); animation: pulseDemo 1.6s ease-in-out infinite; }
+.live-prices { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.5rem; }
+.live-prices .value { font-size: 0.95rem; border-radius: 4px; }
+.live-foot { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; color: var(--muted); font-size: 0.7rem; }
+.flash-up { animation: flashUp 1.2s ease-out; }
+.flash-down { animation: flashDown 1.2s ease-out; }
+
+@keyframes flashUp {
+  from { background: color-mix(in srgb, var(--gain) 35%, transparent); }
+  to { background: transparent; }
+}
+@keyframes flashDown {
+  from { background: color-mix(in srgb, var(--loss) 35%, transparent); }
+  to { background: transparent; }
+}
+
+.reports-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: start;
+}
+.report-list { display: flex; flex-direction: column; gap: 0.35rem; }
+.report-item {
+  display: grid;
+  gap: 0.1rem;
+  text-align: left;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.report-item:hover { border-color: var(--muted); }
+.report-item.active { border-color: var(--accent-dim); background: var(--bg-3); }
+.report-date { font-family: var(--font-display); font-weight: 700; font-size: 0.9rem; }
+.report-badges { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+.report-badges:empty { display: none; }
+.lesson-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.lesson { display: grid; grid-template-columns: 110px 1fr; gap: 0.6rem; align-items: start; }
+.lesson .badge { justify-self: start; }
+.lesson-title { font-weight: 600; }
+.lesson-reason { color: var(--muted); font-size: 0.75rem; }
+
 .mobile-nav {
   display: none;
 }
@@ -276,6 +340,10 @@ tr.flash td { animation: flashRow 0.8s ease; }
 @media (max-width: 960px) {
   .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid-3, .grid-2 { grid-template-columns: 1fr; }
+  .live-grid { grid-template-columns: 1fr; }
+  .reports-layout { grid-template-columns: 1fr; }
+  .lesson { grid-template-columns: 1fr; }
+  .live-prices { grid-template-columns: 1fr 1fr; }
   .brand-sub { display: none; }
   .nav { display: none; }
   .mobile-nav {

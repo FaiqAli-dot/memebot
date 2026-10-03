@@ -52,3 +52,28 @@ export function useRealtime(onMessage?: (msg: WsMessage) => void): {
 
   return { connected, lastMessage, tick };
 }
+
+/** Runs `fn` at most once per `ms`, with a trailing call so the last event is never dropped. */
+export function useThrottled(fn: () => void, ms = 3000): () => void {
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+  const lastRun = useRef(0);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  return useRef(() => {
+    if (timer.current) return;
+    const wait = Math.max(0, lastRun.current + ms - Date.now());
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      lastRun.current = Date.now();
+      fnRef.current();
+    }, wait);
+  }).current;
+}

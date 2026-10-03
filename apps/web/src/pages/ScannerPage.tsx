@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import type { ScannerRow } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct } from '../lib/api';
-import { useRealtime } from '../hooks/useRealtime';
+import { useRealtime, useThrottled } from '../hooks/useRealtime';
 
 export function ScannerPage() {
   const [rows, setRows] = useState<ScannerRow[]>([]);
@@ -28,10 +28,13 @@ export function ScannerPage() {
     void load();
   }, [filter, sort, minLiquidity]);
 
+  const throttledLoad = useThrottled(() => {
+    setFlash((f) => f + 1);
+    void load();
+  });
   useRealtime((msg) => {
     if (msg.type === 'scanner_updated' || msg.type === 'token_discovered' || msg.type === 'signal_generated') {
-      setFlash((f) => f + 1);
-      void load();
+      throttledLoad();
     }
   });
 

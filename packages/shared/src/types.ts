@@ -157,6 +157,151 @@ export interface PositionData {
   token?: TokenInfo;
 }
 
+export interface PricePoint {
+  t: string;
+  price: number;
+}
+
+export interface LivePositionData extends PositionData {
+  history: PricePoint[];
+  stopLossPriceUsd: number;
+  takeProfitPriceUsd: number;
+  trailingStopPriceUsd: number | null;
+}
+
+/** Settings the nightly learning job is allowed to adjust. */
+export type LearnableParam =
+  | 'minPriceChange5mPct'
+  | 'minBuySellRatio'
+  | 'minVolumeAcceleration'
+  | 'minLiquidityUsd'
+  | 'minActivityTx5m'
+  | 'minVolume5mUsd'
+  | 'minOverallScore'
+  | 'maxTopHolderPct'
+  | 'minTokenAgeMinutes'
+  | 'stopLossPct'
+  | 'takeProfitPct'
+  | 'trailingStopPct';
+
+export type LessonStatus = 'applied' | 'skipped' | 'reverted';
+
+export interface Lesson {
+  param: LearnableParam | 'all';
+  from: number | null;
+  to: number | null;
+  status: LessonStatus;
+  reason: string;
+  evidence: Record<string, number>;
+}
+
+export interface ImportantTrade {
+  positionId: string;
+  tokenId: string;
+  symbol: string;
+  netPnlUsd: number;
+  netPnlPct: number;
+  closeReason: string | null;
+  holdSec: number;
+  peakGainPct: number;
+  costsUsd: number;
+  openedAt: string;
+  closedAt: string;
+  tags: string[];
+}
+
+export interface BucketStat {
+  n: number;
+  winRatePct: number;
+  avgPnlUsd: number;
+}
+
+export interface FeatureStat {
+  feature: string;
+  param: LearnableParam;
+  direction: 'min' | 'max';
+  threshold: number;
+  /** Threshold the band test compares against (one guarded step away). */
+  candidate: number;
+  winners: { n: number; mean: number | null };
+  losers: { n: number; mean: number | null };
+  /** Trades that would be filtered if the threshold moved to `candidate`. */
+  band: BucketStat;
+  rest: BucketStat;
+  quartiles: Array<BucketStat & { from: number; to: number }>;
+}
+
+export interface ExitStats {
+  total: number;
+  byReason: Record<string, number>;
+  stopLossSharePct: number;
+  medianStopHoldSec: number | null;
+  medianWinnerHoldSec: number | null;
+  losers: number;
+  losersThatWereUp: number;
+  losersThatWereUpSharePct: number;
+  avgLoserPeakGainPct: number | null;
+}
+
+export interface ReportReview {
+  targetReportId: string | null;
+  verdict: 'better' | 'worse' | 'inconclusive' | 'none';
+  since: BucketStat;
+  before: BucketStat;
+  reverted: boolean;
+}
+
+export interface ReportSummary {
+  tradeCount: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  netPnlUsd: number;
+  grossPnlUsd: number;
+  costsUsd: number;
+  avgHoldSec: number;
+  byCloseReason: Record<string, number>;
+  windowDays: number;
+  windowTradeCount: number;
+  windowWinRatePct: number;
+}
+
+export interface ReportAnalysis {
+  features: FeatureStat[];
+  exits: ExitStats;
+  review: ReportReview;
+  learningEnabled: boolean;
+}
+
+export interface DailyReportListItem {
+  id: string;
+  reportDate: string;
+  dataMode: DataMode;
+  createdAt: string;
+  summary: ReportSummary;
+  lessonCounts: Record<LessonStatus, number>;
+  applied: boolean;
+  rolledBackAt: string | null;
+}
+
+export interface DailyReport extends DailyReportListItem {
+  importantTrades: ImportantTrade[];
+  analysis: ReportAnalysis;
+  lessons: Lesson[];
+  settingsBefore: PortfolioSettings;
+  settingsAfter: PortfolioSettings;
+}
+
+export interface PositionUpdatePayload {
+  positionId: string;
+  tokenId: string;
+  priceUsd: number;
+  observedAt: string;
+  highestPriceUsd: number;
+  unrealizedPnlUsd: number;
+  unrealizedPnlPct: number;
+}
+
 export interface PortfolioSummary {
   id: string;
   name: string;
@@ -298,7 +443,8 @@ export type WsEventType =
   | 'portfolio_updated'
   | 'bot_event'
   | 'scanner_updated'
-  | 'position_updated';
+  | 'position_updated'
+  | 'report_generated';
 
 export interface WsMessage<T = unknown> {
   type: WsEventType;

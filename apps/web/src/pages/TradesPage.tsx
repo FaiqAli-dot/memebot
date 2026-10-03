@@ -16,8 +16,10 @@ export function TradesPage() {
   useEffect(() => {
     void load();
   }, []);
-  useRealtime(() => {
-    void load();
+  useRealtime((msg) => {
+    if (msg.type === 'trade_opened' || msg.type === 'trade_closed' || msg.payload == null) {
+      void load();
+    }
   });
 
   useEffect(() => {

@@ -59,6 +59,26 @@ const envSchema = z.object({
   MAX_RISK_PER_TRADE_PCT: z.coerce.number().default(0.01),
   MAX_DAILY_LOSS_PCT: z.coerce.number().default(0.05),
   MAX_DRAWDOWN_PCT: z.coerce.number().default(0.15),
+  REPORT_TIME: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'REPORT_TIME must be HH:MM (24h)')
+    .default('23:55'),
+  REPORT_TIMEZONE: z
+    .string()
+    .refine((tz) => {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tz });
+        return true;
+      } catch {
+        return false;
+      }
+    }, 'REPORT_TIMEZONE must be an IANA zone like Asia/Dubai')
+    .default('Asia/Dubai'),
+  LEARNING_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+  LEARNING_MIN_TRADES: z.coerce.number().int().positive().default(20),
 });
 
 const parsed = envSchema.safeParse(process.env);

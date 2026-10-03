@@ -1,4 +1,5 @@
-import { Router } from 'express';
+import { Router, type NextFunction, type Response } from 'express';
+import { z } from 'zod';
 import {
   botControlSchema,
   resetSchema,
@@ -20,6 +21,7 @@ import {
   getBotStatus,
   getScannerRows,
   getPositions,
+  getLivePositions,
   getTrades,
   getTradeDetail,
   getEquityHistory,
@@ -31,8 +33,17 @@ import {
 } from '../../services/query-service.js';
 import { logBotEvent } from '../../services/token-service.js';
 import { publish } from '../../ws/hub.js';
+import {
+  ReportError,
+  generateDailyReport,
+  getReport,
+  listReports,
+  rollbackReport,
+} from '../../services/report-service.js';
 
 export const apiRouter = Router();
+
+const reportIdSchema = z.string().uuid();
 
 function portfolioId(): string {
   return env.DEFAULT_PORTFOLIO_ID;
@@ -206,6 +217,14 @@ apiRouter.get('/positions', async (req, res, next) => {
   }
 });
 
+apiRouter.get('/positions/live', async (_req, res, next) => {
+  try {
+    res.json(await getLivePositions(portfolioId()));
+  } catch (err) {
+    next(err);
+  }
+});
+
 apiRouter.get('/trades', async (_req, res, next) => {
   try {
     res.json(await getTrades(portfolioId()));
@@ -264,5 +283,60 @@ apiRouter.get('/strategies', async (_req, res, next) => {
     });
   } catch (err) {
     next(err);
+  }
+});
+
+function sendReportError(err: unknown, res: Response, next: NextFunction): void {
+  if (err instanceof ReportError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  next(err);
+}
+
+apiRouter.get('/reports', async (_req, res, next) => {
+  try {
+    res.json({
+      reports: await listReports(portfolioId()),
+      reportTime: env.REPORT_TIME,
+      reportTimezone: env.REPORT_TIMEZONE,
+      learningEnabled: env.LEARNING_ENABLED,
+      minTrades: env.LEARNING_MIN_TRADES,
+      dataMode: meta().dataMode,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.post('/reports/run', async (_req, res, next) => {
+  try {
+    await ensureDefaultPortfolio();
+    const { report } = await generateDailyReport(portfolioId(), { force: true });
+    res.json(report);
+  } catch (err) {
+    sendReportError(err, res, next);
+  }
+});
+
+apiRouter.get('/reports/:id', async (req, res, next) => {
+  try {
+    const id = reportIdSchema.parse(req.params.id);
+    const report = await getReport(id);
+    if (!report) {
+      res.status(404).json({ error: 'Report not found' });
+      return;
+    }
+    res.json(report);
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.post('/reports/:id/rollback', async (req, res, next) => {
+  try {
+    res.json(await rollbackReport(reportIdSchema.parse(req.params.id)));
+  } catch (err) {
+    sendReportError(err, res, next);
   }
 });

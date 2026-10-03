@@ -17,7 +17,7 @@ import type {
 } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct, pnlClass } from '../lib/api';
-import { useRealtime } from '../hooks/useRealtime';
+import { useRealtime, useThrottled } from '../hooks/useRealtime';
 
 export function DashboardPage() {
   const [portfolio, setPortfolio] = useState<PortfolioSummary | null>(null);
@@ -59,9 +59,8 @@ export function DashboardPage() {
     void refresh();
   }, [refresh]);
 
-  useRealtime(() => {
-    void refresh();
-  });
+  const throttledRefresh = useThrottled(() => void refresh());
+  useRealtime(throttledRefresh);
 
   async function control(action: 'start' | 'pause') {
     setBusy(true);

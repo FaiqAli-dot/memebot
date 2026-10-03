@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { PositionData } from '@memebot/shared';
 import { api, money, pct, pnlClass } from '../lib/api';
-import { useRealtime } from '../hooks/useRealtime';
+import { useRealtime, useThrottled } from '../hooks/useRealtime';
 
 export function PositionsPage() {
   const [open, setOpen] = useState<PositionData[]>([]);
@@ -17,9 +17,8 @@ export function PositionsPage() {
   useEffect(() => {
     void load();
   }, []);
-  useRealtime(() => {
-    void load();
-  });
+  const throttledLoad = useThrottled(() => void load());
+  useRealtime(throttledLoad);
 
   return (
     <div className="page">

@@ -31,6 +31,7 @@ import {
 import { evaluateExitRules } from '../engines/paper/exits.js';
 import { query } from '../db/client.js';
 import { publish } from '../ws/hub.js';
+import { runDailyReportIfDue } from '../services/report-service.js';
 import { registerJob, defaultIntervals, startJobs, stopJobs } from './scheduler.js';
 import type { MarketQuote } from '../providers/types.js';
 
@@ -440,6 +441,7 @@ async function manageOpenPositions(
     trailing_stop_pct: string | null;
     opened_at: Date;
     quantity: string;
+    cost_basis_usd: string;
   }>(
     `SELECT * FROM positions WHERE portfolio_id = $1 AND status = 'OPEN'`,
     [portfolioId],
@@ -452,7 +454,18 @@ async function manageOpenPositions(
     if (!market) continue;
 
     await markPositionMarkToMarket(pos.id, market.price_usd);
-    publish('position_updated', { positionId: pos.id, price: market.price_usd });
+    const costBasis = Number(pos.cost_basis_usd);
+    const unrealizedPnlUsd = Number(pos.quantity) * market.price_usd - costBasis;
+    publish('position_updated', {
+      positionId: pos.id,
+      tokenId: pos.token_id,
+      price: market.price_usd,
+      priceUsd: market.price_usd,
+      observedAt: market.observed_at.toISOString(),
+      highestPriceUsd: Math.max(Number(pos.highest_price_usd), market.price_usd),
+      unrealizedPnlUsd,
+      unrealizedPnlPct: costBasis > 0 ? (unrealizedPnlUsd / costBasis) * 100 : 0,
+    });
 
     const marketStale =
       market.stale ||
@@ -547,7 +560,7 @@ async function manageOpenPositions(
         message: `Paper SELL executed (${closeReason})`,
         details: result,
       });
-      publish('trade_closed', { ...result, closeReason });
+      publish('trade_closed', { ...result, positionId: pos.id, closeReason });
       publish('portfolio_updated', await getPortfolio(portfolioId));
     } else {
       await logBotEvent({
@@ -614,6 +627,11 @@ export function registerAllJobs(): void {
   registerJob('paper_execution', intervals.paper_execution, jobPaperExecution);
   registerJob('portfolio_valuation', intervals.portfolio_valuation, jobPortfolioValuation);
   registerJob('analytics', intervals.analytics, jobAnalytics);
+  registerJob('daily_report', intervals.daily_report, jobDailyReport);
+}
+
+async function jobDailyReport(): Promise<void> {
+  await runDailyReportIfDue(await ensureDefaultPortfolio());
 }
 
 export { startJobs, stopJobs, providers };

@@ -3,6 +3,7 @@ import type {
   BotEventData,
   BotStatusInfo,
   EquityPoint,
+  LivePositionData,
   PositionData,
   ScannerRow,
   StrategyLabStats,
@@ -14,6 +15,10 @@ import { getPortfolio } from './portfolio-service.js';
 import { getRuntimeBotStats } from '../jobs/runners.js';
 import { MomentumStrategyV1, riskLabelFromScore } from '../engines/strategy/momentum-v1.js';
 import { safeDiv } from '../utils/helpers.js';
+import {
+  theoreticalStopPrice,
+  theoreticalTakeProfitPrice,
+} from '../engines/paper/exits.js';
 
 const strategy = new MomentumStrategyV1();
 
@@ -263,6 +268,33 @@ export async function getPositions(portfolioId: string, status?: 'OPEN' | 'CLOSE
 
   const { rows } = await query(sql, params);
   return rows.map((r) => mapPosition(r));
+}
+
+export async function getLivePositions(portfolioId: string): Promise<LivePositionData[]> {
+  const positions = await getPositions(portfolioId, 'OPEN');
+  return Promise.all(
+    positions.map(async (p) => {
+      const { rows } = await query<{ observed_at: Date; price_usd: string }>(
+        `SELECT observed_at, price_usd FROM (
+           SELECT observed_at, price_usd FROM market_snapshots
+           WHERE token_id = $1 AND observed_at >= $2::timestamptz - INTERVAL '5 minutes'
+           ORDER BY observed_at DESC LIMIT 500
+         ) recent ORDER BY observed_at ASC`,
+        [p.tokenId, p.openedAt],
+      );
+      return {
+        ...p,
+        history: rows.map((r) => ({
+          t: new Date(r.observed_at).toISOString(),
+          price: Number(r.price_usd),
+        })),
+        stopLossPriceUsd: theoreticalStopPrice(p.entryPriceUsd, p.stopLossPct),
+        takeProfitPriceUsd: theoreticalTakeProfitPrice(p.entryPriceUsd, p.takeProfitPct),
+        trailingStopPriceUsd:
+          p.trailingStopPct != null ? p.highestPriceUsd * (1 - p.trailingStopPct) : null,
+      };
+    }),
+  );
 }
 
 function mapPosition(r: Record<string, unknown>): PositionData {

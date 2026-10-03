@@ -9,7 +9,7 @@ import { migrate } from './db/migrate.js';
 import { ensureDefaultPortfolio } from './services/portfolio-service.js';
 import { apiRouter } from './api/routes/index.js';
 import { errorHandler, notFound } from './api/middleware/error.js';
-import { attachWebSocket } from './ws/hub.js';
+import { attachWebSocket, closeWebSocket } from './ws/hub.js';
 import { closePool } from './db/client.js';
 
 async function main(): Promise<void> {
@@ -60,6 +60,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     logger.info('Shutting down API');
     server.close();
+    await closeWebSocket();
     await closePool();
     process.exit(0);
   };

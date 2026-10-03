@@ -34,6 +34,8 @@ export const api = {
     request<import('@memebot/shared').PositionData[]>(
       `/api/positions${status ? `?status=${status}` : ''}`,
     ),
+  livePositions: () =>
+    request<import('@memebot/shared').LivePositionData[]>('/api/positions/live'),
   trades: () => request<unknown[]>('/api/trades'),
   trade: (id: string) => request<Record<string, unknown>>(`/api/trades/${id}`),
   equity: () => request<import('@memebot/shared').EquityPoint[]>('/api/equity'),
@@ -45,6 +47,22 @@ export const api = {
       '/api/strategies',
     ),
   token: (id: string) => request<Record<string, unknown>>(`/api/tokens/${id}`),
+  reports: () =>
+    request<{
+      reports: import('@memebot/shared').DailyReportListItem[];
+      reportTime: string;
+      reportTimezone: string;
+      learningEnabled: boolean;
+      minTrades: number;
+      dataMode: string;
+    }>('/api/reports'),
+  report: (id: string) => request<import('@memebot/shared').DailyReport>(`/api/reports/${id}`),
+  runReport: () =>
+    request<import('@memebot/shared').DailyReport>('/api/reports/run', { method: 'POST' }),
+  rollbackReport: (id: string) =>
+    request<import('@memebot/shared').DailyReport>(`/api/reports/${id}/rollback`, {
+      method: 'POST',
+    }),
   solPrice: () =>
     request<{
       solPriceUsd: number | null;

@@ -8,7 +8,8 @@ export type JobName =
   | 'signal'
   | 'paper_execution'
   | 'portfolio_valuation'
-  | 'analytics';
+  | 'analytics'
+  | 'daily_report';
 
 interface Job {
   name: JobName;
@@ -67,5 +68,6 @@ export function defaultIntervals(): Record<JobName, number> {
     paper_execution: env.JOB_PAPER_EXECUTION_INTERVAL_MS,
     portfolio_valuation: env.JOB_PORTFOLIO_VALUATION_INTERVAL_MS,
     analytics: env.JOB_ANALYTICS_INTERVAL_MS,
+    daily_report: 60_000,
   };
 }

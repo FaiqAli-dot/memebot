@@ -287,6 +287,13 @@ const envSchema = z.object({
   /** Log a headroom warning once estimated volume usage (incl. overhead) passes this % of the limit. */
   STORAGE_HEADROOM_WARN_PCT: z.coerce.number().positive().max(100).default(85),
   JOB_STORAGE_GUARD_INTERVAL_MS: z.coerce.number().positive().default(60_000),
+  /** Local research archive (archive:research CLI). Must be a localhost database. */
+  ARCHIVE_DATABASE_URL: z.string().optional(),
+  /** Database the archive CLI reads from and prunes (production: Railway public URL, TLS). */
+  ARCHIVE_SOURCE_DATABASE_URL: z.string().optional(),
+  ARCHIVE_BATCH_SIZE: z.coerce.number().int().min(10).max(10_000).default(1_000),
+  /** Dashboard shows the archive as stale/failed when no successful run in this many hours. */
+  ARCHIVE_STALE_AFTER_HOURS: z.coerce.number().positive().default(24),
   /**
    * A sell that fails because the token has no liquidity to sell into is retried for this long
    * (from its first failed attempt), then the position is closed at $0 as a liquidity collapse.

@@ -68,8 +68,10 @@ export function estimatedVolumePct(m: Pick<StorageMeasurement, 'estimatedVolumeB
   return (m.estimatedVolumeBytes / (env.STORAGE_LIMIT_MB * MB)) * 100;
 }
 
-export async function measureStorage(): Promise<StorageMeasurement> {
-  const { rows } = await query<{ db: string; all: string }>(
+type Querier = <T extends import('pg').QueryResultRow>(text: string, params?: unknown[]) => Promise<import('pg').QueryResult<T>>;
+
+export async function measureStorage(q: Querier = query): Promise<StorageMeasurement> {
+  const { rows } = await q<{ db: string; all: string }>(
     `SELECT pg_database_size(current_database())::text AS db,
             (SELECT SUM(pg_database_size(datname)) FROM pg_database)::text AS all`,
   );
@@ -77,7 +79,7 @@ export async function measureStorage(): Promise<StorageMeasurement> {
   const allDatabasesBytes = Number(rows[0]?.all ?? databaseBytes);
   let walBytes: number | null = null;
   try {
-    const wal = await query<{ b: string | null }>(`SELECT SUM(size)::text AS b FROM pg_ls_waldir()`);
+    const wal = await q<{ b: string | null }>(`SELECT SUM(size)::text AS b FROM pg_ls_waldir()`);
     walBytes = wal.rows[0]?.b != null ? Number(wal.rows[0].b) : 0;
   } catch {
     walBytes = null; // needs superuser / pg_monitor

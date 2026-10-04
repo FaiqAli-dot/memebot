@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { StorageReport, StorageState } from '@memebot/shared';
+import type { ArchiveHealth, ArchiveStatus, StorageReport, StorageState } from '@memebot/shared';
 import { api } from '../lib/api';
 
 const POLL_MS = 60_000;
@@ -57,6 +57,57 @@ export function StorageBanner() {
     <div className={`storage-banner ${storageStateClass(data.state)}`}>
       Database storage {STATE_LABEL[data.state]}: {mb(data.usedBytes)} of {data.thresholdsMb.limit} MB (
       {data.usedPct.toFixed(0)}%). Trading continues; older research data is being trimmed.
+    </div>
+  );
+}
+
+const ARCHIVE_LABEL: Record<ArchiveHealth, { text: string; className: string }> = {
+  ARCHIVE_HEALTHY: { text: 'ARCHIVE HEALTHY', className: 'pos' },
+  ARCHIVE_RUNNING: { text: 'ARCHIVE RUNNING', className: 'storage-warn' },
+  ARCHIVE_FAILED: { text: 'ARCHIVE FAILED', className: 'neg' },
+  ARCHIVE_NEVER_CONFIGURED: { text: 'ARCHIVE NEVER CONFIGURED', className: 'storage-warn' },
+};
+
+const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString() : '—');
+
+function ArchiveSection({ archive }: { archive: ArchiveStatus | undefined }) {
+  if (!archive) return null;
+  const label = ARCHIVE_LABEL[archive.health];
+  return (
+    <div style={{ marginTop: '0.75rem' }}>
+      <h3>
+        Local research archive <span className={label.className}>{label.text}</span>
+        {archive.stale && archive.health !== 'ARCHIVE_NEVER_CONFIGURED' ? (
+          <span className="storage-warn"> · STALE</span>
+        ) : null}
+      </h3>
+      <div className="grid grid-3">
+        <div>
+          <Row label="Last successful run" value={when(archive.lastSuccessAt)} />
+          <Row label="Last archived timestamp" value={when(archive.lastArchivedAt)} />
+          <Row label="Rows archived (all runs)" value={num(archive.rowsArchived)} />
+          <Row label="Rows pruned from Railway" value={num(archive.rowsDeleted)} />
+        </div>
+        <div>
+          <Row label="Archive size (local)" value={mb(archive.archiveBytes)} />
+          <Row label="Tables archived" value={archive.tablesArchived.length ? String(archive.tablesArchived.length) : '—'} />
+          <Row
+            label="Last verification"
+            value={archive.lastVerification ? `${archive.lastVerification.result} · ${when(archive.lastVerification.at)}` : '—'}
+            className={archive.lastVerification?.result === 'FAILED' ? 'neg' : undefined}
+          />
+          <Row
+            label="Last run"
+            value={archive.lastRun ? `${archive.lastRun.mode} ${archive.lastRun.status}` : '—'}
+            className={archive.health === 'ARCHIVE_FAILED' ? 'neg' : undefined}
+          />
+        </div>
+        <div>
+          <Row label="Last error" value={archive.lastError ?? '—'} className={archive.lastError ? 'neg' : undefined} />
+          <Row label="Archival recommended" value={archive.archivalRecommended ? 'yes' : 'no'} />
+          <Row label="Next eligible run" value={archive.nextEligibleRun} />
+        </div>
+      </div>
     </div>
   );
 }
@@ -136,6 +187,8 @@ export function StoragePanel() {
           )}
         </div>
       </div>
+
+      <ArchiveSection archive={data.archive} />
 
       <div className="grid grid-2" style={{ marginTop: '0.75rem' }}>
         <div>

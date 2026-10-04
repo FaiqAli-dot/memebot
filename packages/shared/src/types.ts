@@ -1148,4 +1148,33 @@ export interface StorageReport {
   rawRetentionHours: number;
   researchRetentionHours: number;
   eventRetentionDays: number;
+  archive: ArchiveStatus;
+}
+
+export type ArchiveHealth = 'ARCHIVE_HEALTHY' | 'ARCHIVE_RUNNING' | 'ARCHIVE_FAILED' | 'ARCHIVE_NEVER_CONFIGURED';
+
+/** Local research archive status, from archive_runs written by the archive:research CLI. */
+export interface ArchiveStatus {
+  health: ArchiveHealth;
+  /** Latest run of any mode (a failed latest run is never reported healthy). */
+  lastRun: {
+    mode: string;
+    status: string;
+    startedAt: string;
+    finishedAt: string | null;
+    error: string | null;
+  } | null;
+  lastSuccessAt: string | null;
+  /** Newest source timestamp copied by the last successful archive run. */
+  lastArchivedAt: string | null;
+  rowsArchived: number;
+  rowsDeleted: number;
+  tablesArchived: string[];
+  archiveBytes: number | null;
+  lastVerification: { result: string; at: string } | null;
+  lastError: string | null;
+  /** No successful run within ARCHIVE_STALE_AFTER_HOURS. */
+  stale: boolean;
+  archivalRecommended: boolean;
+  nextEligibleRun: string;
 }

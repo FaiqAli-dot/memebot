@@ -76,6 +76,7 @@ export const OPERATIONAL_TABLES = [
   'strategies',
   'pools',
   'discovery_source_health',
+  'archive_runs',
 ] as const;
 
 export type DataClass = 'CRITICAL' | 'COMPACT_RESEARCH' | 'RESEARCH' | 'OPERATIONAL';

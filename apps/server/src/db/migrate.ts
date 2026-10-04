@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type pg from 'pg';
 import { getPool, closePool } from './client.js';
 import { logger } from '../utils/logger.js';
 
@@ -12,6 +13,15 @@ const MIGRATION_LOCK_KEY = 727_001;
 export async function migrate(connectionString?: string): Promise<void> {
   const pool = getPool(connectionString);
   const client = await pool.connect();
+  try {
+    await migrateClient(client);
+  } finally {
+    client.release();
+  }
+}
+
+/** Applies pending migrations through an explicit connection (no shared pool). */
+export async function migrateClient(client: pg.ClientBase): Promise<void> {
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
     await client.query(`
@@ -46,7 +56,6 @@ export async function migrate(connectionString?: string): Promise<void> {
     }
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => undefined);
-    client.release();
   }
 }
 

@@ -153,7 +153,7 @@ const EVENT_TABLES: Array<{ table: string; time: string }> = [
   { table: 'alert_log', time: 'created_at' },
 ];
 
-const COMPACT_RESEARCH_PRUNE: Array<{ table: string; time: string }> = [
+export const COMPACT_RESEARCH_PRUNE: Array<{ table: string; time: string }> = [
   { table: 'token_decision_audits', time: 'decided_at' },
   { table: 'token_decision_feature_snapshots', time: 'observed_at' },
   { table: 'token_discovery_events', time: 'observed_at' },
@@ -201,14 +201,110 @@ function keepLatest(table: string, time: string): string {
 }
 
 /** Tokens whose recent price path is still being consumed (positions, shadow sims, trackers). */
-async function tokensInUse(): Promise<string[]> {
-  const { rows } = await query<{ token_id: string }>(
-    `SELECT token_id FROM positions WHERE status = 'OPEN'
+export const TOKENS_IN_USE_SQL = `SELECT token_id FROM positions WHERE status = 'OPEN'
      UNION SELECT token_id FROM shadow_trades WHERE status = 'OPEN'
-     UNION SELECT token_id FROM opportunity_trackers WHERE status = 'PENDING'`,
-  );
+     UNION SELECT token_id FROM opportunity_trackers WHERE status = 'PENDING'`;
+
+async function tokensInUse(): Promise<string[]> {
+  const { rows } = await query<{ token_id: string }>(TOKENS_IN_USE_SQL);
   return rows.map((r) => r.token_id);
 }
+
+/** One retention predicate: rows of `table` (aliased `t`) matching `where` are expired. */
+export interface RetentionRule {
+  table: string;
+  where: string;
+  params: unknown[];
+}
+
+/**
+ * The time-window retention predicates, in prune order. Pure, so the research archive can
+ * select exactly the rows retention would expire (the compact-research budget is separate).
+ */
+export function retentionRules(now: Date, w: RetentionWindows, inUse: string[]): RetentionRule[] {
+  const rules: RetentionRule[] = [
+    {
+      table: 'market_snapshots',
+      where: `t.observed_at < $1
+     AND (t.observed_at < $2 OR NOT (t.token_id = ANY($3::uuid[])))
+     AND ${keepLatest('market_snapshots', 'observed_at')}`,
+      params: [ago(now, w.marketFullResMinutes * MIN), ago(now, w.inUseCapHours * HOUR), inUse],
+    },
+    { table: 'liquidity_snapshots', where: `${keepLatest('liquidity_snapshots', 'observed_at')}`, params: [] },
+    {
+      table: 'holder_snapshots',
+      where: `t.observed_at < $1 AND ${keepLatest('holder_snapshots', 'observed_at')}`,
+      params: [ago(now, w.holderHours * HOUR)],
+    },
+    {
+      table: 'safety_assessments',
+      where: `t.assessed_at < $1 AND ${keepLatest('safety_assessments', 'assessed_at')}`,
+      params: [ago(now, w.safetyMinutes * MIN)],
+    },
+    { table: 'trade_events', where: `t.observed_at < $1`, params: [ago(now, w.tradeEventsMinutes * MIN)] },
+    { table: 'feature_snapshots', where: `t.observed_at < $1`, params: [ago(now, w.featureSnapshotHours * HOUR)] },
+    {
+      table: 'token_raw_feature_observations',
+      where: `t.observed_at < $1`,
+      params: [ago(now, w.rawFeatureHours * HOUR)],
+    },
+    {
+      table: 'token_phases',
+      where: `t.observed_at < $1 AND ${keepLatest('token_phases', 'observed_at')}`,
+      params: [ago(now, w.phaseHours * HOUR)],
+    },
+    {
+      table: 'shadow_trades',
+      where: `t.status <> 'OPEN' AND COALESCE(t.closed_at, t.opened_at) < $1`,
+      params: [ago(now, w.shadowClosedHours * HOUR)],
+    },
+    { table: 'funnel_snapshots', where: `t.observed_at < $1`, params: [ago(now, w.funnelHours * HOUR)] },
+    // Checkpoints only after 24h compaction (or MISSED). PENDING/CAPTURED rows waiting for the
+    // 24h summary are never deleted.
+    {
+      table: 'token_outcome_checkpoints',
+      where: `t.status IN ('COMPACTED','MISSED')
+     AND COALESCE(t.observed_at, t.due_at) < $1
+     AND (
+       t.status = 'MISSED'
+       OR EXISTS (
+         SELECT 1 FROM token_outcome_summaries s
+         WHERE s.token_id = t.token_id
+           AND (s.decision_id = t.decision_id OR (s.decision_id IS NULL AND t.decision_id IS NULL))
+       )
+     )`,
+      params: [ago(now, w.checkpointHours * HOUR)],
+    },
+    // Pending trackers are still being resolved; their opportunity rows must stay.
+    {
+      table: 'opportunities',
+      where: `t.observed_at < $1
+     AND NOT EXISTS (
+       SELECT 1 FROM opportunity_trackers k WHERE k.opportunity_id = t.id AND k.status = 'PENDING'
+     )`,
+      params: [ago(now, w.opportunityHours * HOUR)],
+    },
+  ];
+  for (const { table, time } of EVENT_TABLES) {
+    rules.push({
+      table,
+      where: table === 'retention_runs' ? `t.${time} < $1 AND t.status = 'DONE'` : `t.${time} < $1`,
+      params: [ago(now, w.eventHours * HOUR)],
+    });
+  }
+  for (const { table, time } of COMPACT_RESEARCH_PRUNE) {
+    rules.push({ table, where: `t.${time} < $1`, params: [ago(now, w.compactResearchDays * 24 * HOUR)] });
+  }
+  rules.push({
+    table: 'token_decision_audits',
+    where: `t.stage IN ('DISCOVERED','NORMALIZED','TRACKED') AND t.decided_at < $1`,
+    params: [ago(now, w.lifecycleAuditHours * HOUR)],
+  });
+  return rules;
+}
+
+/** Compact research is never trimmed below this, even over budget. */
+export const COMPACT_RESEARCH_FLOOR_HOURS = 24;
 
 /**
  * Live (not on-disk) size of compact research: deletes don't shrink files, so file size can't
@@ -242,7 +338,7 @@ async function enforceCompactResearchBudget(now: Date): Promise<Record<string, n
   const total = Object.values(live).reduce((a, b) => a + b, 0);
   if (total <= budget) return {};
   const fraction = Math.min(1, (total - budget * 0.9) / total);
-  const floor = ago(now, 24 * HOUR);
+  const floor = ago(now, COMPACT_RESEARCH_FLOOR_HOURS * HOUR);
   const deleted: Record<string, number> = {};
   for (const { table, time } of COMPACT_RESEARCH_PRUNE) {
     // Cutoff stays text: JS Dates drop the microseconds Postgres timestamps carry.
@@ -288,99 +384,9 @@ async function runPrune(now: Date, state: StorageState): Promise<Record<string, 
   const runId = runRows[0]?.id;
   const deleted: Record<string, number> = {};
 
-  const inUse = await tokensInUse();
-  deleted.market_snapshots = await deleteBatched(
-    'market_snapshots',
-    `t.observed_at < $1
-     AND (t.observed_at < $2 OR NOT (t.token_id = ANY($3::uuid[])))
-     AND ${keepLatest('market_snapshots', 'observed_at')}`,
-    [ago(now, w.marketFullResMinutes * MIN), ago(now, w.inUseCapHours * HOUR), inUse],
-  );
-  deleted.liquidity_snapshots = await deleteBatched(
-    'liquidity_snapshots',
-    `${keepLatest('liquidity_snapshots', 'observed_at')}`,
-    [],
-  );
-  deleted.holder_snapshots = await deleteBatched(
-    'holder_snapshots',
-    `t.observed_at < $1 AND ${keepLatest('holder_snapshots', 'observed_at')}`,
-    [ago(now, w.holderHours * HOUR)],
-  );
-  deleted.safety_assessments = await deleteBatched(
-    'safety_assessments',
-    `t.assessed_at < $1 AND ${keepLatest('safety_assessments', 'assessed_at')}`,
-    [ago(now, w.safetyMinutes * MIN)],
-  );
-  deleted.trade_events = await deleteBatched('trade_events', `t.observed_at < $1`, [
-    ago(now, w.tradeEventsMinutes * MIN),
-  ]);
-  deleted.feature_snapshots = await deleteBatched('feature_snapshots', `t.observed_at < $1`, [
-    ago(now, w.featureSnapshotHours * HOUR),
-  ]);
-  deleted.token_raw_feature_observations = await deleteBatched(
-    'token_raw_feature_observations',
-    `t.observed_at < $1`,
-    [ago(now, w.rawFeatureHours * HOUR)],
-  );
-  deleted.token_phases = await deleteBatched(
-    'token_phases',
-    `t.observed_at < $1 AND ${keepLatest('token_phases', 'observed_at')}`,
-    [ago(now, w.phaseHours * HOUR)],
-  );
-  deleted.shadow_trades = await deleteBatched(
-    'shadow_trades',
-    `t.status <> 'OPEN' AND COALESCE(t.closed_at, t.opened_at) < $1`,
-    [ago(now, w.shadowClosedHours * HOUR)],
-  );
-  deleted.funnel_snapshots = await deleteBatched('funnel_snapshots', `t.observed_at < $1`, [
-    ago(now, w.funnelHours * HOUR),
-  ]);
-
-  // Checkpoints only after 24h compaction (or MISSED). PENDING/CAPTURED rows waiting for the
-  // 24h summary are never deleted.
-  deleted.token_outcome_checkpoints = await deleteBatched(
-    'token_outcome_checkpoints',
-    `t.status IN ('COMPACTED','MISSED')
-     AND COALESCE(t.observed_at, t.due_at) < $1
-     AND (
-       t.status = 'MISSED'
-       OR EXISTS (
-         SELECT 1 FROM token_outcome_summaries s
-         WHERE s.token_id = t.token_id
-           AND (s.decision_id = t.decision_id OR (s.decision_id IS NULL AND t.decision_id IS NULL))
-       )
-     )`,
-    [ago(now, w.checkpointHours * HOUR)],
-  );
-
-  // Pending trackers are still being resolved; their opportunity rows must stay.
-  deleted.opportunities = await deleteBatched(
-    'opportunities',
-    `t.observed_at < $1
-     AND NOT EXISTS (
-       SELECT 1 FROM opportunity_trackers k WHERE k.opportunity_id = t.id AND k.status = 'PENDING'
-     )`,
-    [ago(now, w.opportunityHours * HOUR)],
-  );
-
-  for (const { table, time } of EVENT_TABLES) {
-    deleted[table] = await deleteBatched(
-      table,
-      table === 'retention_runs' ? `t.${time} < $1 AND t.status = 'DONE'` : `t.${time} < $1`,
-      [ago(now, w.eventHours * HOUR)],
-    );
+  for (const rule of retentionRules(now, w, await tokensInUse())) {
+    deleted[rule.table] = (deleted[rule.table] ?? 0) + (await deleteBatched(rule.table, rule.where, rule.params));
   }
-
-  for (const { table, time } of COMPACT_RESEARCH_PRUNE) {
-    deleted[table] = await deleteBatched(table, `t.${time} < $1`, [
-      ago(now, w.compactResearchDays * 24 * HOUR),
-    ]);
-  }
-  deleted.token_decision_audits! += await deleteBatched(
-    'token_decision_audits',
-    `t.stage IN ('DISCOVERED','NORMALIZED','TRACKED') AND t.decided_at < $1`,
-    [ago(now, w.lifecycleAuditHours * HOUR)],
-  );
   for (const [table, n] of Object.entries(await enforceCompactResearchBudget(now))) {
     deleted[table] = (deleted[table] ?? 0) + n;
   }

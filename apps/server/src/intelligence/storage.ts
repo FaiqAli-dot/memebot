@@ -7,6 +7,7 @@ import { env } from '../config/env.js';
 import type { StorageReport, TableStorageRow } from '@memebot/shared';
 import { estimatedVolumePct, measureStorage, storageThresholds } from '../db/storage-guard.js';
 import { dataClassOf } from '../db/data-classes.js';
+import { getArchiveStatus } from '../archive/status.js';
 import { AUTO_COMPACT_TABLES, TRADING_PATH_TABLES, estimateBloat } from '../db/compact.js';
 import {
   PERMANENT_RETENTION_TABLES,
@@ -151,6 +152,7 @@ export async function getStorageMonitor(): Promise<StorageReport> {
     rawRetentionHours: env.RAW_DATA_RETENTION_HOURS,
     researchRetentionHours: env.RESEARCH_DATA_RETENTION_HOURS,
     eventRetentionDays: env.EVENT_RETENTION_DAYS,
+    archive: await getArchiveStatus(m.state),
   };
 }
 

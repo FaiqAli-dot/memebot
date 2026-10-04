@@ -1113,6 +1113,13 @@ export interface StorageReport {
   databaseBytes: number;
   allDatabasesBytes: number;
   walBytes: number | null;
+  /** Estimate: usedBytes + configured volume overhead that SQL cannot measure. */
+  estimatedVolumeBytes: number;
+  estimatedVolumePct: number;
+  unobservedOverheadMb: number;
+  /** From storage_monitor_snapshots ≥ ~1h old; null until such a snapshot exists. */
+  growthMbPerHour: number | null;
+  researchWritesSuppressed: boolean;
   largestTables: TableStorageRow[];
   largestIndexes: Array<{ index: string; table: string; bytes: number }>;
   /** Space freed by deletes but still held in table files (reusable; VACUUM FULL returns it). */

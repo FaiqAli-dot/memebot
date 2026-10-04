@@ -249,7 +249,12 @@ const envSchema = z.object({
    * Hard cap on compact research tables (MB, incl. indexes). When exceeded, the oldest rows go
    * first (never the last 24h), so research can never fill the volume on its own.
    */
-  COMPACT_RESEARCH_BUDGET_MB: z.coerce.number().positive().default(150),
+  COMPACT_RESEARCH_BUDGET_MB: z.coerce.number().positive().default(50),
+  /**
+   * Opportunities (+ their trackers/outcomes) older than this are pruned once their tracker is no
+   * longer PENDING. Only pending trackers (≤ 30 min horizons) and a 10 min readiness window read them.
+   */
+  OPPORTUNITY_RETENTION_HOURS: z.coerce.number().positive().default(24),
   /**
    * Per-tick decision stages (lifecycle, eligibility, signal, repeated risk/capacity rejections)
    * are re-recorded only when the outcome changes or after this many minutes. 0 records every call.
@@ -266,12 +271,21 @@ const envSchema = z.object({
     .string()
     .transform((v) => v === 'true')
     .default('false'),
-  /** Storage guard thresholds (whole Postgres volume: all databases + WAL when measurable). */
-  STORAGE_LIMIT_MB: z.coerce.number().positive().default(500),
-  STORAGE_WARNING_MB: z.coerce.number().positive().default(300),
-  STORAGE_AGGRESSIVE_MB: z.coerce.number().positive().default(350),
-  STORAGE_EMERGENCY_MB: z.coerce.number().positive().default(400),
-  STORAGE_STOP_WRITES_MB: z.coerce.number().positive().default(450),
+  /**
+   * Storage guard thresholds in MiB, compared with all databases + WAL (what SQL can see). The
+   * hosted volume also holds filesystem overhead SQL cannot measure, so thresholds sit well below
+   * the limit to leave room for cleanup, VACUUM FULL rewrites, WAL and temp files.
+   * The 500 MB (decimal) Railway volume is ≈ 476 MiB.
+   */
+  STORAGE_LIMIT_MB: z.coerce.number().positive().default(476),
+  STORAGE_WARNING_MB: z.coerce.number().positive().default(260),
+  STORAGE_AGGRESSIVE_MB: z.coerce.number().positive().default(300),
+  STORAGE_EMERGENCY_MB: z.coerce.number().positive().default(340),
+  STORAGE_STOP_WRITES_MB: z.coerce.number().positive().default(370),
+  /** Volume usage invisible to SQL (filesystem metadata, journal, reserved blocks); measured ~55–75 MB. */
+  STORAGE_UNOBSERVED_OVERHEAD_MB: z.coerce.number().min(0).default(70),
+  /** Log a headroom warning once estimated volume usage (incl. overhead) passes this % of the limit. */
+  STORAGE_HEADROOM_WARN_PCT: z.coerce.number().positive().max(100).default(85),
   JOB_STORAGE_GUARD_INTERVAL_MS: z.coerce.number().positive().default(60_000),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),

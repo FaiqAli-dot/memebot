@@ -36,6 +36,8 @@ export interface RetentionWindows {
   /** DISCOVERED/NORMALIZED/TRACKED audits duplicate tokens + discovery events; kept briefly. */
   lifecycleAuditHours: number;
   checkpointHours: number;
+  /** Opportunities whose tracker is no longer PENDING (trackers/outcomes cascade). */
+  opportunityHours: number;
 }
 
 /** Retention tightens as the volume fills; compact research is never cut below the research period. */
@@ -55,6 +57,7 @@ export function retentionWindows(state: StorageState = currentStorageState()): R
     compactResearchDays: env.COMPACT_RESEARCH_RETENTION_DAYS,
     lifecycleAuditHours: env.RESEARCH_DATA_RETENTION_HOURS,
     checkpointHours: env.RESEARCH_DATA_RETENTION_HOURS,
+    opportunityHours: env.OPPORTUNITY_RETENTION_HOURS,
   };
   const rank = stateRank(state);
   if (rank >= stateRank('EMERGENCY_CLEANUP')) {
@@ -72,6 +75,7 @@ export function retentionWindows(state: StorageState = currentStorageState()): R
       eventHours: Math.min(base.eventHours, 6),
       lifecycleAuditHours: Math.min(base.lifecycleAuditHours, 1),
       checkpointHours: Math.min(base.checkpointHours, 6),
+      opportunityHours: Math.min(base.opportunityHours, 6),
     };
   }
   if (rank >= stateRank('AGGRESSIVE_CLEANUP')) {
@@ -89,6 +93,7 @@ export function retentionWindows(state: StorageState = currentStorageState()): R
       eventHours: Math.min(base.eventHours, 24),
       lifecycleAuditHours: Math.min(base.lifecycleAuditHours, 6),
       checkpointHours: Math.min(base.checkpointHours, 12),
+      opportunityHours: Math.min(base.opportunityHours, 12),
     };
   }
   return base;
@@ -114,6 +119,11 @@ export function retentionPolicyTable(state: StorageState = currentStorageState()
     { table: 'token_phases', retention: `${w.phaseHours}h (latest/token kept)`, permanent: false },
     { table: 'shadow_trades', retention: `${w.shadowClosedHours}h after close (open kept)`, permanent: false },
     { table: 'funnel_snapshots', retention: `${w.funnelHours}h`, permanent: false },
+    {
+      table: 'opportunities',
+      retention: `${w.opportunityHours}h once tracking completes (trackers + outcomes cascade)`,
+      permanent: false,
+    },
     ...EVENT_TABLES.map((t) => ({ table: t.table, retention: `${w.eventHours}h`, permanent: false })),
     {
       table: 'token_outcome_checkpoints',
@@ -163,6 +173,9 @@ export const PRUNABLE_TABLES = [
   'shadow_trades',
   'funnel_snapshots',
   'token_outcome_checkpoints',
+  'opportunities',
+  'opportunity_trackers',
+  'opportunity_outcomes',
   ...EVENT_TABLES.map((t) => t.table),
   ...COMPACT_RESEARCH_PRUNE.map((t) => t.table),
 ];
@@ -340,6 +353,16 @@ async function runPrune(now: Date, state: StorageState): Promise<Record<string, 
     [ago(now, w.checkpointHours * HOUR)],
   );
 
+  // Pending trackers are still being resolved; their opportunity rows must stay.
+  deleted.opportunities = await deleteBatched(
+    'opportunities',
+    `t.observed_at < $1
+     AND NOT EXISTS (
+       SELECT 1 FROM opportunity_trackers k WHERE k.opportunity_id = t.id AND k.status = 'PENDING'
+     )`,
+    [ago(now, w.opportunityHours * HOUR)],
+  );
+
   for (const { table, time } of EVENT_TABLES) {
     deleted[table] = await deleteBatched(
       table,
@@ -363,12 +386,14 @@ async function runPrune(now: Date, state: StorageState): Promise<Record<string, 
   }
 
   // Plain VACUUM (not FULL): no exclusive lock, makes freed space reusable so tables stop growing.
-  for (const [table, n] of Object.entries(deleted)) {
-    if (n >= 1_000) {
-      await query(`VACUUM (ANALYZE) ${table}`).catch((err) =>
-        logger.warn({ err: (err as Error).message, table }, 'VACUUM after prune failed'),
-      );
-    }
+  const vacuumTables = Object.entries(deleted)
+    .filter(([, n]) => n >= 1_000)
+    .map(([table]) => table);
+  if ((deleted.opportunities ?? 0) >= 1_000) vacuumTables.push('opportunity_trackers', 'opportunity_outcomes');
+  for (const table of vacuumTables) {
+    await query(`VACUUM (ANALYZE) ${table}`).catch((err) =>
+      logger.warn({ err: (err as Error).message, table }, 'VACUUM after prune failed'),
+    );
   }
 
   if (runId) {

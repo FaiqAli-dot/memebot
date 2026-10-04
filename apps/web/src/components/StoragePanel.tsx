@@ -94,6 +94,20 @@ export function StoragePanel() {
           <Row label="This database" value={mb(data.databaseBytes)} />
           <Row label="All databases on volume" value={mb(data.allDatabasesBytes)} />
           <Row label="Write-ahead log" value={data.walBytes == null ? 'not measurable' : mb(data.walBytes)} />
+          <Row
+            label={`Est. volume (+${data.unobservedOverheadMb} MB unseen overhead)`}
+            value={`${mb(data.estimatedVolumeBytes)} (${data.estimatedVolumePct.toFixed(0)}%)`}
+            className={data.estimatedVolumePct >= 85 ? 'neg' : undefined}
+          />
+          <Row
+            label="Growth"
+            value={data.growthMbPerHour == null ? '—' : `${data.growthMbPerHour.toFixed(1)} MB/h`}
+          />
+          <Row
+            label="Research writes"
+            value={data.researchWritesSuppressed ? 'PAUSED' : 'active'}
+            className={data.researchWritesSuppressed ? 'neg' : 'pos'}
+          />
           <Row label="Raw snapshot rows" value={num(data.rawSnapshotRows)} />
           <Row label="Compact research rows" value={num(data.compactResearchRows)} />
           <Row

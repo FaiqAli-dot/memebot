@@ -57,8 +57,15 @@ export interface StorageMeasurement {
   allDatabasesBytes: number;
   walBytes: number | null;
   usedBytes: number;
+  /** usedBytes plus the configured volume overhead SQL cannot see (an estimate, not a measurement). */
+  estimatedVolumeBytes: number;
   state: StorageState;
   measuredAt: Date;
+}
+
+/** Estimated share of the hosted volume in use, including unobservable overhead. */
+export function estimatedVolumePct(m: Pick<StorageMeasurement, 'estimatedVolumeBytes'>): number {
+  return (m.estimatedVolumeBytes / (env.STORAGE_LIMIT_MB * MB)) * 100;
 }
 
 export async function measureStorage(): Promise<StorageMeasurement> {
@@ -81,6 +88,7 @@ export async function measureStorage(): Promise<StorageMeasurement> {
     allDatabasesBytes,
     walBytes,
     usedBytes,
+    estimatedVolumeBytes: usedBytes + env.STORAGE_UNOBSERVED_OVERHEAD_MB * MB,
     state: classifyStorage(usedBytes),
     measuredAt: new Date(),
   };
@@ -88,6 +96,8 @@ export async function measureStorage(): Promise<StorageMeasurement> {
 
 let current: StorageMeasurement | null = null;
 let forcedState: StorageState | null = null;
+const HEADROOM_WARN_EVERY_MS = 15 * 60_000;
+let lastHeadroomWarnAt = 0;
 
 /** Latest known state in this process (NORMAL until first measurement). */
 export function currentStorageState(): StorageState {
@@ -112,6 +122,22 @@ export async function refreshStorageState(): Promise<StorageMeasurement> {
     log(
       { from: prev, to: m.state, usedMb: Math.round(m.usedBytes / MB), walMb: m.walBytes != null ? Math.round(m.walBytes / MB) : null },
       'Database storage state changed',
+    );
+  }
+  const pct = estimatedVolumePct(m);
+  if (pct >= env.STORAGE_HEADROOM_WARN_PCT && Date.now() - lastHeadroomWarnAt >= HEADROOM_WARN_EVERY_MS) {
+    lastHeadroomWarnAt = Date.now();
+    logger.warn(
+      {
+        state: m.state,
+        usedMb: Math.round(m.usedBytes / MB),
+        estimatedVolumeMb: Math.round(m.estimatedVolumeBytes / MB),
+        unobservedOverheadMb: env.STORAGE_UNOBSERVED_OVERHEAD_MB,
+        limitMb: env.STORAGE_LIMIT_MB,
+        estimatedPct: Math.round(pct),
+        researchWritesSuppressed: !researchWritesAllowed(),
+      },
+      'Volume headroom low (estimate includes overhead invisible to SQL)',
     );
   }
   return m;

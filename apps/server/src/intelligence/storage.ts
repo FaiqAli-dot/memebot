@@ -5,7 +5,7 @@
 import { query } from '../db/client.js';
 import { env } from '../config/env.js';
 import type { StorageReport, TableStorageRow } from '@memebot/shared';
-import { measureStorage, storageThresholds } from '../db/storage-guard.js';
+import { estimatedVolumePct, measureStorage, storageThresholds } from '../db/storage-guard.js';
 import { dataClassOf } from '../db/data-classes.js';
 import { AUTO_COMPACT_TABLES, TRADING_PATH_TABLES, estimateBloat } from '../db/compact.js';
 import {
@@ -35,7 +35,7 @@ const COMPACT_TABLES = [
   'missed_opportunities',
 ];
 
-const COUNT_TABLES = ['tokens', 'positions', 'signals', ...RAW_TABLES, ...COMPACT_TABLES];
+const COUNT_TABLES = ['tokens', 'positions', 'signals', 'opportunities', ...RAW_TABLES, ...COMPACT_TABLES];
 
 export async function getStorageMonitor(): Promise<StorageReport> {
   const m = await measureStorage();
@@ -105,6 +105,16 @@ export async function getStorageMonitor(): Promise<StorageReport> {
   }
   const lastMs = run?.finished_at?.getTime() ?? Date.now();
 
+  const { rows: prior } = await query<{ bytes: string; observed_at: Date }>(
+    `SELECT estimated_db_bytes::text AS bytes, observed_at FROM storage_monitor_snapshots
+     WHERE observed_at <= NOW() - INTERVAL '55 minutes' AND observed_at >= NOW() - INTERVAL '6 hours'
+     ORDER BY observed_at DESC LIMIT 1`,
+  );
+  const p = prior[0];
+  const growthMbPerHour = p
+    ? (m.usedBytes - Number(p.bytes)) / (1024 * 1024) / ((Date.now() - p.observed_at.getTime()) / 3_600_000)
+    : null;
+
   return {
     state: m.state,
     thresholdsMb: t,
@@ -113,6 +123,11 @@ export async function getStorageMonitor(): Promise<StorageReport> {
     databaseBytes: m.databaseBytes,
     allDatabasesBytes: m.allDatabasesBytes,
     walBytes: m.walBytes,
+    estimatedVolumeBytes: m.estimatedVolumeBytes,
+    estimatedVolumePct: estimatedVolumePct(m),
+    unobservedOverheadMb: env.STORAGE_UNOBSERVED_OVERHEAD_MB,
+    growthMbPerHour,
+    researchWritesSuppressed: m.state === 'STOP_NON_ESSENTIAL_WRITES',
     largestTables,
     largestIndexes: indexRows.map((r) => ({ index: r.indexrelname, table: r.relname, bytes: Number(r.bytes) })),
     bloat,
@@ -150,7 +165,15 @@ export async function snapshotStorageMonitor(): Promise<void> {
       mon.usedBytes,
       mon.oldestRawSnapshotAt,
       mon.nextCleanupAt,
-      JSON.stringify({ state: mon.state, walBytes: mon.walBytes, usedPct: mon.usedPct }),
+      JSON.stringify({
+        state: mon.state,
+        walBytes: mon.walBytes,
+        usedPct: mon.usedPct,
+        estimatedVolumeBytes: mon.estimatedVolumeBytes,
+        growthMbPerHour: mon.growthMbPerHour,
+        researchWritesSuppressed: mon.researchWritesSuppressed,
+        compactResearchLiveBytes: mon.compactResearchLiveBytes,
+      }),
     ],
   );
 }

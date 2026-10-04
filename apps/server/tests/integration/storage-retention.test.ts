@@ -8,6 +8,9 @@ loadEnv({ path: resolve(__dirname, '../../../../.env') });
 
 process.env.DATA_MODE = 'demo';
 for (const k of [
+  'COMPACT_RESEARCH_BUDGET_MB',
+  'OPPORTUNITY_RETENTION_HOURS',
+  'STORAGE_UNOBSERVED_OVERHEAD_MB',
   'RAW_DATA_RETENTION_HOURS',
   'RESEARCH_DATA_RETENTION_HOURS',
   'EVENT_RETENTION_DAYS',
@@ -256,7 +259,7 @@ describe('integration: storage retention under simulated high-frequency writes',
     );
   }, 180_000);
 
-  it('emergency cleanup activates well before the volume limit', () => {
+  it('emergency cleanup activates well before the volume limit', async () => {
     const t = guard.storageThresholds();
     expect(t.warning).toBeLessThan(t.aggressive);
     expect(t.aggressive).toBeLessThan(t.emergency);
@@ -264,11 +267,16 @@ describe('integration: storage retention under simulated high-frequency writes',
     expect(t.stopWrites).toBeLessThan(t.limit);
 
     const MB = 1024 * 1024;
+    expect(t).toEqual({ warning: 260, aggressive: 300, emergency: 340, stopWrites: 370, limit: 476 });
     expect(guard.classifyStorage(250 * MB, t)).toBe('NORMAL');
-    expect(guard.classifyStorage(320 * MB, t)).toBe('WARNING');
-    expect(guard.classifyStorage(370 * MB, t)).toBe('AGGRESSIVE_CLEANUP');
-    expect(guard.classifyStorage(420 * MB, t)).toBe('EMERGENCY_CLEANUP');
-    expect(guard.classifyStorage(460 * MB, t)).toBe('STOP_NON_ESSENTIAL_WRITES');
+    expect(guard.classifyStorage(280 * MB, t)).toBe('WARNING');
+    expect(guard.classifyStorage(320 * MB, t)).toBe('AGGRESSIVE_CLEANUP');
+    expect(guard.classifyStorage(350 * MB, t)).toBe('EMERGENCY_CLEANUP');
+    expect(guard.classifyStorage(380 * MB, t)).toBe('STOP_NON_ESSENTIAL_WRITES');
+    // Research writes pause with free volume left for cleanup + WAL after the overhead SQL cannot see.
+    const { env } = await import('../../src/config/env.js');
+    expect(t.limit - t.stopWrites - env.STORAGE_UNOBSERVED_OVERHEAD_MB).toBeGreaterThanOrEqual(30);
+    expect(env.COMPACT_RESEARCH_BUDGET_MB).toBe(50);
 
     const normal = retention.retentionWindows('NORMAL');
     const emergency = retention.retentionWindows('EMERGENCY_CLEANUP');
@@ -414,5 +422,64 @@ describe('integration: storage retention under simulated high-frequency writes',
     } finally {
       (env as { COMPACT_RESEARCH_BUDGET_MB: number }).COMPACT_RESEARCH_BUDGET_MB = original;
     }
+  });
+
+  it('prunes completed opportunities after 24h with their trackers/outcomes; pending ones stay', async () => {
+    const token = tokenIds[6]!;
+    const opportunity = async (hoursAgo: number, trackerStatus: 'PENDING' | 'COMPLETE') => {
+      const { rows } = await db.query<{ id: string }>(
+        `INSERT INTO opportunities (token_id, strategy_id, decision, observed_at, price_usd, liquidity_status,
+           volume_5m_usd, volume_1h_usd, tx_count_5m, age_source, data_confidence, buy_sell_confidence,
+           volume_accel_confidence, features, sim_params, data_mode)
+         VALUES ($1, 'x', 'BUY', NOW() - ($2::text || ' hours')::interval, 1, 'KNOWN', 0, 0, 0,
+           'FIRST_OBSERVED_AT', 'LOW', 'LOW', 'UNKNOWN', '{}', '{}', 'demo') RETURNING id`,
+        [token, String(hoursAgo)],
+      );
+      const id = rows[0]!.id;
+      await db.query(
+        `INSERT INTO opportunity_trackers (opportunity_id, token_id, status, sim_state) VALUES ($1, $2, $3, '{}'::jsonb)`,
+        [id, token, trackerStatus],
+      );
+      await db.query(
+        `INSERT INTO opportunity_outcomes (opportunity_id, horizon_sec, observed_at, lag_sec, price_usd, return_pct,
+           mfe_pct, mae_pct) VALUES ($1, 60, NOW(), 0, 1, 0, 0, 0)`,
+        [id],
+      );
+      return id;
+    };
+    const oldDone = await opportunity(30, 'COMPLETE');
+    const oldPending = await opportunity(30, 'PENDING');
+    const recentDone = await opportunity(2, 'COMPLETE');
+    const positionsBefore = await count(`SELECT COUNT(*) AS c FROM positions`);
+
+    await retention.pruneOldData(new Date(), 'NORMAL');
+
+    const exists = (sql: string, id: string) => count(sql, [id]);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunities WHERE id = $1`, oldDone)).toBe(0);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunity_trackers WHERE opportunity_id = $1`, oldDone)).toBe(0);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunity_outcomes WHERE opportunity_id = $1`, oldDone)).toBe(0);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunities WHERE id = $1`, oldPending)).toBe(1);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunity_trackers WHERE opportunity_id = $1`, oldPending)).toBe(1);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunities WHERE id = $1`, recentDone)).toBe(1);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunity_outcomes WHERE opportunity_id = $1`, recentDone)).toBe(1);
+    expect(await count(`SELECT COUNT(*) AS c FROM positions`)).toBe(positionsBefore);
+    expect(await count(`SELECT COUNT(*) AS c FROM positions WHERE id = $1`, [closedPositionId])).toBe(1);
+
+    // Under storage pressure the window shrinks (12h aggressive, 6h emergency), pending still kept.
+    expect(retention.retentionWindows('AGGRESSIVE_CLEANUP').opportunityHours).toBe(12);
+    await retention.pruneOldData(new Date(), 'EMERGENCY_CLEANUP');
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunities WHERE id = $1`, recentDone)).toBe(1);
+    expect(await exists(`SELECT COUNT(*) AS c FROM opportunities WHERE id = $1`, oldPending)).toBe(1);
+  });
+
+  it('drops only the unused tokens poll index; indexes with readers remain', async () => {
+    const { rows } = await db.query<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'tokens'`,
+    );
+    const names = rows.map((r) => r.indexname);
+    expect(names).not.toContain('idx_tokens_last_polled');
+    expect(names).toEqual(
+      expect.arrayContaining(['idx_tokens_last_discovered', 'idx_tokens_discovered', 'idx_tokens_activity']),
+    );
   });
 });

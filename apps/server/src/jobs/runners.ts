@@ -1944,6 +1944,7 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
     });
 
     if (result.success) {
+      const finalReason = result.closeReason ?? closeReason;
       try {
         await recordTradeObservation(pos.id);
       } catch (err) {
@@ -1953,11 +1954,11 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
         portfolioId,
         level: 'info',
         category: 'execution',
-        message: `Paper SELL executed (${closeReason})`,
+        message: `Paper SELL executed (${finalReason})`,
         details: result,
       });
       if (isProduction) {
-        publish('trade_closed', { ...result, positionId: pos.id, closeReason });
+        publish('trade_closed', { ...result, positionId: pos.id, closeReason: finalReason });
         publish('portfolio_updated', await getPortfolio(portfolioId));
       }
     }

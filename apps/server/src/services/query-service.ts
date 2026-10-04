@@ -354,8 +354,34 @@ export async function getTrades(portfolioId: string) {
     `SELECT o.*, t.symbol, t.address, t.chain
      FROM paper_orders o
      JOIN tokens t ON t.id = o.token_id
-     WHERE o.portfolio_id = $1
+     WHERE o.portfolio_id = $1 AND o.status <> 'FAILED'
      ORDER BY o.created_at DESC
+     LIMIT 100`,
+    [portfolioId],
+  );
+  return rows;
+}
+
+/**
+ * Failed orders, one row per position + failure reason (retries are counted, not repeated),
+ * with how the position eventually ended: filled exit, closed at $0, or still open.
+ */
+export async function getFailedOrders(portfolioId: string) {
+  const { rows } = await query(
+    `SELECT o.id, o.side, o.failure_reason, o.attempt_count, o.created_at AS first_attempt_at,
+            COALESCE(o.last_attempt_at, o.created_at) AS last_attempt_at,
+            o.requested_price_usd, o.requested_amount_usd, o.network_fee_usd, o.priority_fee_usd,
+            o.total_cost_usd, t.symbol,
+            p.id AS position_id, p.status AS position_status, p.close_reason, p.closed_at,
+            p.net_pnl_usd, p.gross_pnl_usd,
+            e.id AS exit_order_id, e.status AS exit_status, e.executed_price_usd AS exit_price_usd,
+            e.filled_amount_usd AS exit_filled_usd, e.total_cost_usd AS exit_cost_usd
+     FROM paper_orders o
+     JOIN tokens t ON t.id = o.token_id
+     LEFT JOIN positions p ON p.id = o.position_id
+     LEFT JOIN paper_orders e ON e.id = p.exit_order_id
+     WHERE o.portfolio_id = $1 AND o.status = 'FAILED'
+     ORDER BY COALESCE(o.last_attempt_at, o.created_at) DESC
      LIMIT 100`,
     [portfolioId],
   );

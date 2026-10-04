@@ -6,11 +6,15 @@ import { useRealtime } from '../hooks/useRealtime';
 
 export function TradesPage() {
   const [trades, setTrades] = useState<Record<string, unknown>[]>([]);
+  const [failed, setFailed] = useState<Record<string, unknown>[]>([]);
+  const [tab, setTab] = useState<'trades' | 'failed'>('trades');
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
   const [params] = useSearchParams();
 
   async function load() {
-    setTrades((await api.trades()) as Record<string, unknown>[]);
+    const [t, f] = await Promise.all([api.trades(), api.failedTrades()]);
+    setTrades(t as Record<string, unknown>[]);
+    setFailed(f);
   }
 
   useEffect(() => {
@@ -33,6 +37,26 @@ export function TradesPage() {
 
   return (
     <div className="page">
+      <div className="tabs" role="tablist">
+        <button
+          role="tab"
+          aria-selected={tab === 'trades'}
+          className={`tab ${tab === 'trades' ? 'active' : ''}`}
+          onClick={() => setTab('trades')}
+        >
+          Trades
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === 'failed'}
+          className={`tab ${tab === 'failed' ? 'active' : ''}`}
+          onClick={() => setTab('failed')}
+        >
+          Failed attempts ({failed.length})
+        </button>
+      </div>
+      {tab === 'failed' && <FailedAttempts rows={failed} onDetail={(id) => void openDetail(id)} />}
+      {tab === 'trades' && (
       <div className="panel">
         <h2>Trades</h2>
         <div className="table-wrap">
@@ -94,6 +118,7 @@ export function TradesPage() {
           cash costs. {SCORE_DISCLAIMER}
         </p>
       </div>
+      )}
 
       {detail && (
         <div className="modal-backdrop" onClick={() => setDetail(null)}>
@@ -106,6 +131,76 @@ export function TradesPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function attemptOutcome(r: Record<string, unknown>): { text: string; className?: string } {
+  if (r.position_status === 'OPEN') return { text: 'Position still open — retrying' };
+  if (r.exit_status === 'FILLED' || r.exit_status === 'PARTIAL') {
+    return {
+      text: `Succeeded: sold at ${money(Number(r.exit_price_usd), 8)} for ${money(Number(r.exit_filled_usd))} · net P/L ${money(Number(r.net_pnl_usd))}`,
+      className: pnlClass(Number(r.net_pnl_usd)),
+    };
+  }
+  if (r.position_status === 'CLOSED') {
+    return {
+      text: `Closed at $0 (${String(r.close_reason ?? '—')}) · net P/L ${money(Number(r.net_pnl_usd))}`,
+      className: 'neg',
+    };
+  }
+  return { text: '—' };
+}
+
+function FailedAttempts({ rows, onDetail }: { rows: Record<string, unknown>[]; onDetail: (id: string) => void }) {
+  return (
+    <div className="panel">
+      <h2>Failed attempts</h2>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>Side</th>
+              <th>Failed</th>
+              <th>Reason</th>
+              <th>First attempt</th>
+              <th>Last attempt</th>
+              <th>Fees charged</th>
+              <th>Outcome</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const outcome = attemptOutcome(r);
+              return (
+                <tr key={String(r.id)}>
+                  <td>{String(r.symbol)}</td>
+                  <td className={r.side === 'BUY' ? 'pos' : 'neg'}>{String(r.side)}</td>
+                  <td>{Number(r.attempt_count ?? 1).toLocaleString()}×</td>
+                  <td>{String(r.failure_reason ?? '—')}</td>
+                  <td>{new Date(String(r.first_attempt_at)).toLocaleString()}</td>
+                  <td>{new Date(String(r.last_attempt_at)).toLocaleString()}</td>
+                  <td>{money(Number(r.total_cost_usd))}</td>
+                  <td className={outcome.className}>{outcome.text}</td>
+                  <td>
+                    {r.exit_order_id != null && r.exit_order_id !== r.id && (
+                      <button className="btn" onClick={() => onDetail(String(r.exit_order_id))}>
+                        Exit detail
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="disclaimer">
+        Repeated failures for the same position and reason are stored once with an attempt count. A sell that cannot
+        fill because the token has no liquidity is retried for 15 minutes, then the position is closed at $0.
+      </p>
     </div>
   );
 }

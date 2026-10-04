@@ -392,6 +392,144 @@ describe('integration: paper trading loop + edge cases', () => {
     expect(pos.rows[0]!.close_reason).toBe('emergency_liquidity_collapse');
   });
 
+  it('untradeable max-hold exit retries as one counted order, then closes at $0 after the grace period', async () => {
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoDeadPool1111111111111111111111111',
+      symbol: 'DEAD',
+      name: 'Dead Pool',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 30 * 60_000),
+    });
+    const quote = liquidQuote('DemoDeadPool1111111111111111111111111');
+    const buy = await executePaperBuy({
+      portfolioId,
+      tokenId: tokenId!,
+      signalId: null,
+      amountUsd: 3,
+      midPriceUsd: quote.priceUsd,
+      quote,
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      stopLossPct: 0.08,
+      takeProfitPct: 0.2,
+      trailingStopPct: null,
+    });
+    expect(buy.success).toBe(true);
+    const deadQuote = { ...quote, liquidityUsd: 0, quoteReserve: 0 };
+    const sell = () =>
+      executePaperSell({
+        portfolioId,
+        positionId: buy.positionId!,
+        midPriceUsd: quote.priceUsd,
+        quote: deadQuote,
+        gas,
+        priorityFeeLamports: 5000,
+        failedTxStillChargesNetwork: true,
+        closeReason: 'max_holding_time',
+      });
+
+    // Inside the grace period: position stays open, retries collapse into one counted row.
+    for (let i = 0; i < 5; i++) expect((await sell()).success).toBe(false);
+    const failed = await query<{ id: string; attempt_count: number; total_cost_usd: string; network_fee_usd: string }>(
+      `SELECT id, attempt_count, total_cost_usd, network_fee_usd FROM paper_orders
+       WHERE position_id = $1 AND status = 'FAILED'`,
+      [buy.positionId],
+    );
+    expect(failed.rows).toHaveLength(1);
+    expect(failed.rows[0]!.attempt_count).toBe(5);
+    expect(Number(failed.rows[0]!.total_cost_usd)).toBeGreaterThan(0);
+    const open = await query<{ status: string }>(`SELECT status FROM positions WHERE id = $1`, [buy.positionId]);
+    expect(open.rows[0]!.status).toBe('OPEN');
+
+    // First attempt now older than 15 minutes: next failure closes the position at $0.
+    await query(`UPDATE paper_orders SET created_at = NOW() - INTERVAL '16 minutes' WHERE id = $1`, [failed.rows[0]!.id]);
+    const closing = await sell();
+    expect(closing.success).toBe(true);
+    expect(closing.closeReason).toBe('emergency_liquidity_collapse');
+    const pos = await query<{ status: string; close_reason: string; exit_order_id: string; current_value_usd: string }>(
+      `SELECT status, close_reason, exit_order_id, current_value_usd FROM positions WHERE id = $1`,
+      [buy.positionId],
+    );
+    expect(pos.rows[0]!.status).toBe('CLOSED');
+    expect(pos.rows[0]!.close_reason).toBe('emergency_liquidity_collapse');
+    expect(pos.rows[0]!.exit_order_id).toBe(failed.rows[0]!.id);
+    expect(Number(pos.rows[0]!.current_value_usd)).toBe(0);
+    const after = await query<{ c: string; attempts: number }>(
+      `SELECT COUNT(*)::text AS c, MAX(attempt_count) AS attempts FROM paper_orders
+       WHERE position_id = $1 AND status = 'FAILED'`,
+      [buy.positionId],
+    );
+    expect(after.rows[0]!.c).toBe('1');
+    expect(after.rows[0]!.attempts).toBe(6);
+  });
+
+  it('migration 013 collapses existing repeated failed sells, summing fees, keeping other orders', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { getPool } = await import('../../src/db/client.js');
+    const tokenId = await upsertDiscoveredToken({
+      chain: 'solana',
+      address: 'DemoRetrySpam111111111111111111111111',
+      symbol: 'SPAM',
+      name: 'Retry Spam',
+      decimals: 9,
+      createdAt: new Date(Date.now() - 30 * 60_000),
+    });
+    const quote = liquidQuote('DemoRetrySpam111111111111111111111111');
+    const buy = await executePaperBuy({
+      portfolioId,
+      tokenId: tokenId!,
+      signalId: null,
+      amountUsd: 3,
+      midPriceUsd: quote.priceUsd,
+      quote,
+      gas,
+      priorityFeeLamports: 5000,
+      failedTxStillChargesNetwork: true,
+      stopLossPct: 0.08,
+      takeProfitPct: 0.2,
+      trailingStopPct: null,
+    });
+    // Legacy layout: one row per retry.
+    await query(
+      `INSERT INTO paper_orders (portfolio_id, token_id, position_id, side, status, requested_price_usd,
+         executed_price_usd, requested_amount_usd, filled_amount_usd, token_quantity, dex_fee_usd,
+         network_fee_usd, priority_fee_usd, slippage_pct, slippage_cost_usd, price_impact_pct,
+         price_impact_cost_usd, total_cost_usd, failure_reason, data_mode, created_at, execution_record)
+       SELECT $1, $2, $3, 'SELL', 'FAILED', 1, 0, 3, 0, 0, 0, 0.001, 0.001, 0, 0, 0, 0, 0.002,
+              'Legacy repeat', 'demo', NOW() - (g * INTERVAL '8 seconds'), '{}'::jsonb
+       FROM generate_series(1, 4) g`,
+      [portfolioId, tokenId, buy.positionId],
+    );
+    const sql = readFileSync(
+      resolve(__dirname, '../../src/db/migrations/013_failed_order_attempts.sql'),
+      'utf8',
+    );
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(sql);
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+    const rows = await query<{ attempt_count: number; total_cost_usd: string; network_fee_usd: string }>(
+      `SELECT attempt_count, total_cost_usd, network_fee_usd FROM paper_orders
+       WHERE position_id = $1 AND status = 'FAILED'`,
+      [buy.positionId],
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]!.attempt_count).toBe(4);
+    expect(Number(rows.rows[0]!.total_cost_usd)).toBeCloseTo(0.008, 9);
+    expect(Number(rows.rows[0]!.network_fee_usd)).toBeCloseTo(0.004, 9);
+    const buys = await query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM paper_orders WHERE token_id = $1 AND side = 'BUY'`,
+      [tokenId],
+    );
+    expect(buys.rows[0]!.c).toBe('1');
+  });
+
   it('stale market snapshot is readable as stale; missing market returns null (no invent)', async () => {
     const tokenId = await upsertDiscoveredToken({
       chain: 'solana',

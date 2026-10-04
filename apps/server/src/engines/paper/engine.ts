@@ -1,7 +1,7 @@
 import { v4 as uuid } from 'uuid';
 import type { CostBreakdown, ExecutionRecord } from '@memebot/shared';
 import { query, withTransaction, isDbAvailable } from '../../db/client.js';
-import { dataMode } from '../../config/env.js';
+import { dataMode, env } from '../../config/env.js';
 import { simulateTrade, emptyCosts, sellProceedsUsd } from '../cost/simulator.js';
 import type { GasFeeEstimate, MarketQuote } from '../../providers/types.js';
 import { logger } from '../../utils/logger.js';
@@ -319,7 +319,7 @@ export async function executePaperSell(opts: {
   failedTxStillChargesNetwork: boolean;
   closeReason: string;
   exitSignalId?: string | null;
-}): Promise<{ success: boolean; orderId?: string; reason?: string; netPnl?: number }> {
+}): Promise<{ success: boolean; orderId?: string; reason?: string; netPnl?: number; closeReason?: string }> {
   if (!isDbAvailable()) {
     return { success: false, reason: 'Database unavailable — new executions stopped' };
   }
@@ -357,35 +357,70 @@ export async function executePaperSell(opts: {
         forceFailReason: opts.quote.liquidityUsd <= 0 ? 'Emergency: token untradeable / liquidity collapsed' : undefined,
       });
 
-      const orderId = uuid();
+      let orderId = uuid();
 
       if (sim.execution.failed) {
-        // Still charge network if configured; keep position open unless emergency untradeable with forced close
-        await client.query(
-          `INSERT INTO paper_orders (
-            id, portfolio_id, token_id, position_id, side, status,
-            requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
-            token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
-            slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
-            execution_record, failure_reason, data_mode, filled_at, sol_price_usd, sol_price_source
-          ) VALUES ($1,$2,$3,$4,'SELL','FAILED',$5,0,$6,0,0,0,$7,$8,0,0,0,0,$9,$10,$11,$12,NOW(),$13,$14)`,
+        // Still charge network if configured. A retry with the same failure reason updates the
+        // position's existing failed order (attempt count, summed fees) instead of adding a row.
+        const repeat = await client.query<{ id: string; created_at: Date }>(
+          `UPDATE paper_orders SET
+             attempt_count = attempt_count + 1, last_attempt_at = NOW(),
+             requested_price_usd = $3, requested_amount_usd = $4,
+             network_fee_usd = network_fee_usd + $5, priority_fee_usd = priority_fee_usd + $6,
+             total_cost_usd = total_cost_usd + $7, execution_record = $8,
+             sol_price_usd = $9, sol_price_source = $10
+           WHERE id = (
+             SELECT id FROM paper_orders
+             WHERE position_id = $1 AND side = 'SELL' AND status = 'FAILED'
+               AND failure_reason IS NOT DISTINCT FROM $2
+             ORDER BY created_at DESC LIMIT 1
+           )
+           RETURNING id, created_at`,
           [
-            orderId,
-            opts.portfolioId,
-            pos.token_id,
             opts.positionId,
+            sim.execution.failureReason,
             opts.midPriceUsd,
             notional,
             sim.costs.networkFeeUsd,
             sim.costs.priorityFeeUsd,
             sim.costs.totalCostUsd,
             JSON.stringify(sim.execution),
-            sim.execution.failureReason,
-            dataMode,
             sim.costs.solPriceUsd,
             sim.costs.solPriceSource,
           ],
         );
+        let firstAttemptAt = new Date();
+        if (repeat.rows[0]) {
+          orderId = repeat.rows[0].id;
+          firstAttemptAt = repeat.rows[0].created_at;
+        } else {
+          await client.query(
+            `INSERT INTO paper_orders (
+              id, portfolio_id, token_id, position_id, side, status,
+              requested_price_usd, executed_price_usd, requested_amount_usd, filled_amount_usd,
+              token_quantity, dex_fee_usd, network_fee_usd, priority_fee_usd, slippage_pct,
+              slippage_cost_usd, price_impact_pct, price_impact_cost_usd, total_cost_usd,
+              execution_record, failure_reason, data_mode, filled_at, sol_price_usd, sol_price_source,
+              last_attempt_at
+            ) VALUES ($1,$2,$3,$4,'SELL','FAILED',$5,0,$6,0,0,0,$7,$8,0,0,0,0,$9,$10,$11,$12,NOW(),$13,$14,NOW())`,
+            [
+              orderId,
+              opts.portfolioId,
+              pos.token_id,
+              opts.positionId,
+              opts.midPriceUsd,
+              notional,
+              sim.costs.networkFeeUsd,
+              sim.costs.priorityFeeUsd,
+              sim.costs.totalCostUsd,
+              JSON.stringify(sim.execution),
+              sim.execution.failureReason,
+              dataMode,
+              sim.costs.solPriceUsd,
+              sim.costs.solPriceSource,
+            ],
+          );
+        }
         if (sim.costs.totalCostUsd > 0) {
           await client.query(
             `UPDATE user_portfolios SET cash_usd = GREATEST(0, cash_usd - $2),
@@ -394,8 +429,15 @@ export async function executePaperSell(opts: {
             [opts.portfolioId, sim.costs.totalCostUsd],
           );
         }
-        // Mark closed at zero if untradeable emergency
-        if (opts.closeReason.startsWith('emergency')) {
+        // Untradeable (no liquidity to sell into): retry for the grace period, then close at zero
+        // whatever triggered the exit, so a max-hold/stop exit cannot retry forever against a dead pool.
+        const untradeableTooLong =
+          opts.quote.liquidityUsd <= 0 &&
+          Date.now() - firstAttemptAt.getTime() >= env.UNTRADEABLE_EXIT_GRACE_MINUTES * 60_000;
+        if (opts.closeReason.startsWith('emergency') || untradeableTooLong) {
+          const closeReason = opts.closeReason.startsWith('emergency')
+            ? opts.closeReason
+            : 'emergency_liquidity_collapse';
           const costBasis = Number(pos.cost_basis_usd);
           const netPnl = -costBasis - sim.costs.totalCostUsd;
           await client.query(
@@ -410,7 +452,7 @@ export async function executePaperSell(opts: {
               -costBasis,
               JSON.stringify(sim.costs),
               orderId,
-              opts.closeReason,
+              closeReason,
               opts.exitSignalId ?? null,
             ],
           );
@@ -418,7 +460,7 @@ export async function executePaperSell(opts: {
             `UPDATE user_portfolios SET realized_pnl_usd = realized_pnl_usd + $2, updated_at = NOW() WHERE id = $1`,
             [opts.portfolioId, netPnl],
           );
-          return { success: true, orderId, netPnl, reason: sim.execution.failureReason ?? undefined };
+          return { success: true, orderId, netPnl, closeReason, reason: sim.execution.failureReason ?? undefined };
         }
         return { success: false, orderId, reason: sim.execution.failureReason ?? 'Sell failed' };
       }

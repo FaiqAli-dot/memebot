@@ -23,6 +23,7 @@ import {
   getPositions,
   getLivePositions,
   getTrades,
+  getFailedOrders,
   getTradeDetail,
   getEquityHistory,
   getBotEvents,
@@ -241,6 +242,14 @@ apiRouter.get('/positions/live', async (_req, res, next) => {
 apiRouter.get('/trades', async (_req, res, next) => {
   try {
     res.json(await getTrades(portfolioId()));
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/trades/failed', async (_req, res, next) => {
+  try {
+    res.json(await getFailedOrders(portfolioId()));
   } catch (err) {
     next(err);
   }

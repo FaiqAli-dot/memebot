@@ -42,6 +42,7 @@ export const api = {
   livePositions: () =>
     request<import('@memebot/shared').LivePositionData[]>('/api/positions/live'),
   trades: () => request<unknown[]>('/api/trades'),
+  failedTrades: () => request<Record<string, unknown>[]>('/api/trades/failed'),
   trade: (id: string) => request<Record<string, unknown>>(`/api/trades/${id}`),
   equity: () => request<import('@memebot/shared').EquityPoint[]>('/api/equity'),
   events: (qs = '') =>

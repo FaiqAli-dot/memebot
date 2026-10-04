@@ -287,6 +287,11 @@ const envSchema = z.object({
   /** Log a headroom warning once estimated volume usage (incl. overhead) passes this % of the limit. */
   STORAGE_HEADROOM_WARN_PCT: z.coerce.number().positive().max(100).default(85),
   JOB_STORAGE_GUARD_INTERVAL_MS: z.coerce.number().positive().default(60_000),
+  /**
+   * A sell that fails because the token has no liquidity to sell into is retried for this long
+   * (from its first failed attempt), then the position is closed at $0 as a liquidity collapse.
+   */
+  UNTRADEABLE_EXIT_GRACE_MINUTES: z.coerce.number().min(0).default(15),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),

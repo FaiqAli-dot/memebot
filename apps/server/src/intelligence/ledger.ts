@@ -4,9 +4,26 @@
  */
 import type { DecisionReasonCode, DecisionStage, DiscoverySource } from '@memebot/shared';
 import { query } from '../db/client.js';
-import { dataMode } from '../config/env.js';
+import { dataMode, env } from '../config/env.js';
 import type { EnrichedDiscoveredToken } from '../providers/discovery/multi-source.js';
 import { isSolanaAddress } from '../utils/helpers.js';
+import { WriteDedupe } from '../db/write-dedupe.js';
+import { researchWritesAllowed } from '../db/storage-guard.js';
+
+/**
+ * Stages evaluated on every market/signal tick. Re-recorded only when the outcome changes or the
+ * dedupe window elapses; skipped entirely (returns '') when storage is critical.
+ */
+const HIGH_FREQUENCY_STAGES = new Set(['DISCOVERED', 'NORMALIZED', 'TRACKED', 'ELIGIBILITY', 'SIGNAL']);
+/** Rejections re-evaluated every tick while a slot is full; deduped but always recorded once. */
+const REPEATING_REJECTION_STAGES = new Set(['RISK_GATE', 'POSITION_CAPACITY']);
+const auditDedupe = new WriteDedupe<string>();
+const discoveryDedupe = new WriteDedupe();
+
+export function resetIntelligenceDedupeForTests(): void {
+  auditDedupe.clear();
+  discoveryDedupe.clear();
+}
 
 export interface RecordDiscoveryResult {
   tokenId: string | null;
@@ -90,35 +107,39 @@ export async function recordDiscoveryObservation(
     ],
   );
 
-  await query(
-    `INSERT INTO token_discovery_events (
-       token_id, discovery_source, venue, pool_address, launch_mechanism,
-       dbc_status, migration_status, observed_at, payload, data_mode
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8,$9)`,
-    [
-      tokenId,
-      token.discoverySource,
-      token.dexVenue ?? null,
-      token.poolAddress ?? null,
-      launchMechanism,
-      dbcStatus,
-      migrationStatus,
-      JSON.stringify({
-        symbol: token.symbol,
-        name: token.name,
-        paidBoost: token.discoverySource === 'DEXSCREENER_BOOST',
-        metadata: token.metadata ?? {},
-        discoveryPath:
-          typeof token.metadata?.discoveryPath === 'string'
-            ? token.metadata.discoveryPath
-            : null,
-        demoFixture: token.address.startsWith('Demo'),
-        dbcStatus: token.metadata?.dbcStatus ?? null,
-        migrationStatus: token.metadata?.migrationStatus ?? null,
-      }),
-      dataMode,
-    ],
-  );
+  const discoveryKey = `${tokenId}|${token.discoverySource}`;
+  const discoveryWindowMs = env.DISCOVERY_EVENT_DEDUPE_MINUTES * 60_000;
+  const isRepeatSighting = discoveryDedupe.recent(discoveryKey, '', discoveryWindowMs) != null;
+  if (!isRepeatSighting && researchWritesAllowed()) {
+    discoveryDedupe.remember(discoveryKey, '');
+    await query(
+      `INSERT INTO token_discovery_events (
+         token_id, discovery_source, venue, pool_address, launch_mechanism,
+         dbc_status, migration_status, observed_at, payload, data_mode
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8,$9)`,
+      [
+        tokenId,
+        token.discoverySource,
+        token.dexVenue ?? null,
+        token.poolAddress ?? null,
+        launchMechanism,
+        dbcStatus,
+        migrationStatus,
+        JSON.stringify({
+          symbol: token.symbol,
+          name: token.name,
+          paidBoost: token.discoverySource === 'DEXSCREENER_BOOST',
+          metadata: token.metadata ?? {},
+          discoveryPath:
+            typeof token.metadata?.discoveryPath === 'string' ? token.metadata.discoveryPath : null,
+          demoFixture: token.address.startsWith('Demo'),
+          dbcStatus: token.metadata?.dbcStatus ?? null,
+          migrationStatus: token.metadata?.migrationStatus ?? null,
+        }),
+        dataMode,
+      ],
+    );
+  }
 
   return {
     tokenId,
@@ -127,28 +148,11 @@ export async function recordDiscoveryObservation(
   };
 }
 
-export async function markTrackingStarted(tokenId: string): Promise<void> {
-  await query(
-    `UPDATE tokens SET
-       tracking_started = TRUE,
-       tracking_started_at = COALESCE(tracking_started_at, NOW()),
-       intelligence_status = CASE
-         WHEN intelligence_status IN ('DISCOVERED', 'NORMALIZED') THEN 'TRACKED'
-         ELSE intelligence_status
-       END
-     WHERE id = $1`,
-    [tokenId],
-  );
-}
-
-export async function bumpSnapshotCount(tokenId: string): Promise<void> {
-  await query(
-    `UPDATE tokens SET snapshot_count = snapshot_count + 1 WHERE id = $1`,
-    [tokenId],
-  );
-}
-
-export async function setInitialMarketSnapshot(
+/**
+ * One row version per market tick (snapshot counter, tracking start, first-seen market values)
+ * instead of three separate UPDATEs.
+ */
+export async function recordMarketTick(
   tokenId: string,
   snap: {
     priceUsd?: number | null;
@@ -161,6 +165,13 @@ export async function setInitialMarketSnapshot(
 ): Promise<void> {
   await query(
     `UPDATE tokens SET
+       snapshot_count = snapshot_count + 1,
+       tracking_started = TRUE,
+       tracking_started_at = COALESCE(tracking_started_at, NOW()),
+       intelligence_status = CASE
+         WHEN intelligence_status IN ('DISCOVERED', 'NORMALIZED') THEN 'TRACKED'
+         ELSE intelligence_status
+       END,
        initial_price_usd = COALESCE(initial_price_usd, $2),
        initial_market_cap_usd = COALESCE(initial_market_cap_usd, $3),
        initial_liquidity_usd = COALESCE(initial_liquidity_usd, $4),
@@ -223,6 +234,18 @@ export async function recordDecisionAudit(opts: {
   riskDecisionId?: string | null;
   features?: Record<string, unknown> | null;
 }): Promise<string> {
+  const stage = String(opts.stage);
+  const highFrequency = HIGH_FREQUENCY_STAGES.has(stage);
+  const deduped =
+    highFrequency || (opts.result === 'FAIL' && REPEATING_REJECTION_STAGES.has(stage));
+  const dedupeKey = `${opts.tokenId}|${opts.stage}|${opts.strategyId ?? ''}`;
+  const signature = `${opts.result}|${opts.reasonCode ?? ''}`;
+  if (deduped) {
+    const prev = auditDedupe.recent(dedupeKey, signature, env.DECISION_AUDIT_DEDUPE_MINUTES * 60_000);
+    if (prev?.value) return prev.value;
+  }
+  if (highFrequency && !researchWritesAllowed()) return '';
+
   const { rows } = await query<{ id: string }>(
     `INSERT INTO token_decision_audits (
        token_id, portfolio_id, stage, result, reason_code,
@@ -246,6 +269,7 @@ export async function recordDecisionAudit(opts: {
     ],
   );
   const decisionId = rows[0]!.id;
+  if (deduped) auditDedupe.remember(dedupeKey, signature, decisionId);
 
   if (opts.features && Object.keys(opts.features).length > 0) {
     await query(

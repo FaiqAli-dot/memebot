@@ -165,10 +165,19 @@ npm start
    - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
    - `NODE_ENV=production`
    - delete `TEST_DATABASE_URL`, `API_PORT` and `CORS_ORIGIN` (Railway's `PORT` is used; the UI is same-origin)
-   - for the trial's 0.5GB Postgres volume: `DB_MAX_WAL_SIZE=64MB`, `RAW_DATA_RETENTION_HOURS=1`, `STORAGE_SOFT_LIMIT_BYTES=250000000`
+   - the defaults are sized for the trial's 0.5GB Postgres volume; nothing else is required
 4. **Settings → Networking → Generate Domain**. Open it — that's the dashboard.
 
-Raw market tables are pruned to `RAW_DATA_RETENTION_HOURS` (default 3) and logs to `EVENT_RETENTION_DAYS` (default 3) so the database stays small. Postgres keeps up to 1GB of write-ahead log by default, which alone fills a 0.5GB volume; `DB_MAX_WAL_SIZE` caps it at startup. The trial is a one-time $5 credit for up to 30 days; when it runs out, services stop until a plan is added.
+The trial is a one-time $5 credit for up to 30 days; when it runs out, services stop until a plan is added.
+
+### Database storage
+
+The dashboard's **Storage** tab shows database size, largest tables and indexes, reclaimable bloat, cleanup history and the retention policy. A banner appears on every board when storage leaves NORMAL.
+
+- **Retention** (every 5 minutes, batched deletes + plain `VACUUM`): market snapshots 20 minutes per token (3 hours for tokens with an open position, shadow trade or tracker), liquidity latest-only, trade events and safety 30 minutes, sampled raw features and outcome checkpoints 24 hours, logs 3 days, compact research (decision audits, discovery events, missed opportunities) 8 days within a 150 MB budget. Trades, positions, orders, signals, risk decisions and outcome summaries are never pruned.
+- **Storage guard** (every minute, `STORAGE_*_MB`): NORMAL < 300 MB, WARNING, AGGRESSIVE cleanup ≥ 350, EMERGENCY > 400 (tighter windows, `VACUUM FULL` of non-trading research tables with a short lock timeout), STOP non-essential writes > 450 (research writes skipped; trading keeps running). The worker also checks and cleans up at startup.
+- **WAL**: Postgres keeps up to 1GB of write-ahead log by default, which alone fills a 0.5GB volume; in production the start script caps it to 64 MB (`DB_MAX_WAL_SIZE`).
+- **Manual compaction**: `npm run db:compact -w @memebot/server` rewrites bloated research tables (`-- --all` includes trading-path tables; run when the bot is idle).
 
 ## Project layout
 

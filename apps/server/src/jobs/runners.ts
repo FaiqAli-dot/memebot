@@ -103,6 +103,12 @@ import {
 import { captureDueOutcomeCheckpoints } from '../intelligence/outcomes.js';
 import { ensureSourceHealthRows } from '../intelligence/source-health.js';
 import { snapshotStorageMonitor } from '../intelligence/storage.js';
+import { refreshStorageState, researchWritesAllowed, stateRank } from '../db/storage-guard.js';
+import { WriteDedupe } from '../db/write-dedupe.js';
+import { AUTO_COMPACT_TABLES, compactTables } from '../db/compact.js';
+
+/** token_phases: one row per phase change (or per dedupe window), not per signal tick. */
+const phaseWrites = new WriteDedupe();
 import {
   classifyTradingEligibility,
   computeActivityScore,
@@ -451,7 +457,9 @@ async function ingestQuote(token: TrackedTokenRow, quote: MarketQuote): Promise<
           WHEN first_meaningful_volume_at IS NULL AND $3::numeric >= 1000 THEN $2
           ELSE first_meaningful_volume_at
         END
-       WHERE id = $1`,
+       WHERE id = $1
+         AND (first_liquidity_at IS NULL OR first_trade_at IS NULL
+              OR (first_meaningful_volume_at IS NULL AND $3::numeric >= 1000))`,
       [token.id, quote.observedAt, quote.volume5mUsd],
     );
   }
@@ -485,32 +493,35 @@ async function jobTradeStream(): Promise<void> {
       priceUsd: market.price_usd,
       observedAt: market.observed_at,
     });
-    const flow = computeFlowFeatures(ticks, new Date());
-    await query(
-      `INSERT INTO feature_snapshots (token_id, observed_at, window_label, features, data_mode)
-       VALUES ($1, NOW(), 'multi', $2, $3)`,
-      [
-        token.id,
-        JSON.stringify({
-          flow: Object.fromEntries(
-            Object.entries(flow).map(([k, v]) => [
-              k,
-              {
-                buyVolumeUsd: toMeasuredJson(v.buyVolumeUsd),
-                sellVolumeUsd: toMeasuredJson(v.sellVolumeUsd),
-                netFlowUsd: toMeasuredJson(v.netFlowUsd),
-                buySellRatio: toMeasuredJson(v.buySellRatio),
-                uniqueBuyers: toMeasuredJson(v.uniqueBuyers),
-                uniqueSellers: toMeasuredJson(v.uniqueSellers),
-                whaleFlowPct: toMeasuredJson(v.whaleFlowPct),
-                confidenceNote: 'tx_count_approximation_low_confidence',
-              },
-            ]),
-          ),
-        }),
-        dataMode,
-      ],
-    );
+    if (!researchWritesAllowed()) continue;
+    if (env.PERSIST_FEATURE_SNAPSHOTS) {
+      const flow = computeFlowFeatures(ticks, new Date());
+      await query(
+        `INSERT INTO feature_snapshots (token_id, observed_at, window_label, features, data_mode)
+         VALUES ($1, NOW(), 'multi', $2, $3)`,
+        [
+          token.id,
+          JSON.stringify({
+            flow: Object.fromEntries(
+              Object.entries(flow).map(([k, v]) => [
+                k,
+                {
+                  buyVolumeUsd: toMeasuredJson(v.buyVolumeUsd),
+                  sellVolumeUsd: toMeasuredJson(v.sellVolumeUsd),
+                  netFlowUsd: toMeasuredJson(v.netFlowUsd),
+                  buySellRatio: toMeasuredJson(v.buySellRatio),
+                  uniqueBuyers: toMeasuredJson(v.uniqueBuyers),
+                  uniqueSellers: toMeasuredJson(v.uniqueSellers),
+                  whaleFlowPct: toMeasuredJson(v.whaleFlowPct),
+                  confidenceNote: 'tx_count_approximation_low_confidence',
+                },
+              ]),
+            ),
+          }),
+          dataMode,
+        ],
+      );
+    }
 
     // Persist a sample of approximated trade events for replay (deduped by synthetic sig)
     for (const t of ticks.slice(0, 6)) {
@@ -916,10 +927,16 @@ async function jobSignals(): Promise<void> {
       largeWalletSellPct: null,
       volatility5mPct: Math.abs(market.price_change_5m_pct),
     });
-    await query(
-      `INSERT INTO token_phases (token_id, phase, reasons, data_mode) VALUES ($1,$2,$3,$4)`,
-      [token.id, phase.phase, JSON.stringify(phase.reasons), dataMode],
-    );
+    if (
+      researchWritesAllowed() &&
+      !phaseWrites.recent(token.id, phase.phase, env.DECISION_AUDIT_DEDUPE_MINUTES * 60_000)
+    ) {
+      phaseWrites.remember(token.id, phase.phase);
+      await query(
+        `INSERT INTO token_phases (token_id, phase, reasons, data_mode) VALUES ($1,$2,$3,$4)`,
+        [token.id, phase.phase, JSON.stringify(phase.reasons), dataMode],
+      ).catch((err) => logger.warn({ err: (err as Error).message }, 'token_phases write failed'));
+    }
 
     const dataConf = assessDataConfidence({
       liquidityStatus: market.liquidity_status,
@@ -2059,7 +2076,19 @@ export function registerAllJobs(): void {
   registerJob('storage_monitor', intervals.storage_monitor, async () => {
     await snapshotStorageMonitor();
   });
+  registerJob('storage_guard', intervals.storage_guard, async () => {
+    const m = await refreshStorageState();
+    if (stateRank(m.state) >= stateRank('AGGRESSIVE_CLEANUP')) {
+      await pruneOldData(new Date(), m.state);
+      const after = await refreshStorageState();
+      if (stateRank(after.state) >= stateRank('EMERGENCY_CLEANUP')) {
+        await compactTables({ tables: AUTO_COMPACT_TABLES, lockTimeoutMs: 1_000 });
+        await refreshStorageState();
+      }
+    }
+  });
   registerJob('retention', intervals.retention, async () => {
+    await refreshStorageState();
     await pruneOldData();
   });
 }

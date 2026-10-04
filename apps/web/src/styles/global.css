@@ -405,6 +405,13 @@ tr.flash td { animation: flashRow 0.8s ease; }
 }
 .week1-banner strong { letter-spacing: 0.05em; }
 .week1-windows { margin-left: auto; display: flex; gap: 0.25rem; }
+.storage-warn { color: var(--warn); }
+.storage-banner {
+  margin-bottom: 0.5rem; padding: 0.5rem 0.75rem; border: 1px solid currentColor; border-radius: 6px;
+  font-size: 0.78rem; background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.storage-bar { height: 8px; border-radius: 4px; background: var(--bg-3); overflow: hidden; margin: 0.25rem 0 0.4rem; }
+.storage-bar-fill { height: 100%; background: currentColor; }
 .week1-windows .btn { padding: 0.15rem 0.5rem; font-size: 0.7rem; }
 
 .mobile-nav {

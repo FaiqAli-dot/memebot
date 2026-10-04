@@ -43,7 +43,8 @@ async function waitForDatabase(timeoutMs = 180_000): Promise<void> {
 async function main(): Promise<void> {
   await waitForDatabase();
   await migrate();
-  if (env.DB_MAX_WAL_SIZE) await capWal(env.DB_MAX_WAL_SIZE);
+  const maxWal = env.DB_MAX_WAL_SIZE ?? (env.NODE_ENV === 'production' ? '64MB' : 'off');
+  if (maxWal !== 'off') await capWal(maxWal);
   await closePool();
 
   const children: ChildProcess[] = ['index.js', 'worker.js'].map((file) => fork(join(here, file)));

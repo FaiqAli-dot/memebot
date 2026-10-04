@@ -6,43 +6,47 @@ import { logger } from '../utils/logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/** Serializes concurrent migrators (API and worker both migrate on boot in dev). */
+const MIGRATION_LOCK_KEY = 727_001;
+
 export async function migrate(connectionString?: string): Promise<void> {
   const pool = getPool(connectionString);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      id TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+  const client = await pool.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-  const dir = join(__dirname, 'migrations');
-  const files = readdirSync(dir)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
+    const dir = join(__dirname, 'migrations');
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
 
-  for (const file of files) {
-    const { rows } = await pool.query(
-      'SELECT 1 FROM schema_migrations WHERE id = $1',
-      [file],
-    );
-    if (rows.length > 0) {
-      logger.info({ file }, 'Migration already applied');
-      continue;
+    for (const file of files) {
+      const { rows } = await client.query('SELECT 1 FROM schema_migrations WHERE id = $1', [file]);
+      if (rows.length > 0) {
+        logger.info({ file }, 'Migration already applied');
+        continue;
+      }
+      const sql = readFileSync(join(dir, file), 'utf8');
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query('INSERT INTO schema_migrations (id) VALUES ($1)', [file]);
+        await client.query('COMMIT');
+        logger.info({ file }, 'Applied migration');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      }
     }
-    const sql = readFileSync(join(dir, file), 'utf8');
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query('INSERT INTO schema_migrations (id) VALUES ($1)', [file]);
-      await client.query('COMMIT');
-      logger.info({ file }, 'Applied migration');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => undefined);
+    client.release();
   }
 }
 

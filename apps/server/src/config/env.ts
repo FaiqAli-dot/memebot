@@ -96,12 +96,13 @@ const envSchema = z.object({
   /** Soft storage budget (bytes) for Railway Free — emergency prune backstop only. */
   STORAGE_SOFT_LIMIT_BYTES: z.coerce.number().int().positive().default(450_000_000),
   /**
-   * Optional Postgres WAL cap applied at startup via ALTER SYSTEM (needs superuser, e.g. Railway).
+   * Postgres WAL cap applied at startup via ALTER SYSTEM (needs superuser, e.g. Railway).
    * Postgres defaults to 1GB of WAL, which alone can fill a 0.5GB volume.
+   * Defaults to 64MB when NODE_ENV=production; "off" disables.
    */
   DB_MAX_WAL_SIZE: z
     .string()
-    .regex(/^\d+(MB|GB)$/, 'e.g. 64MB')
+    .regex(/^(\d+(MB|GB)|off)$/, 'e.g. 64MB or off')
     .optional(),
 
   DEFAULT_PRIORITY_FEE_LAMPORTS: z.coerce.number().default(5000),
@@ -217,13 +218,61 @@ const envSchema = z.object({
    */
   RAW_DATA_RETENTION_HOURS: z.coerce.number().positive().default(3),
   /**
-   * Compact research raw data only: token_raw_feature_observations and
-   * outcome checkpoints (after 24h compaction). Permanent decision audits /
-   * decision feature snapshots / summaries are never pruned by this.
+   * Market snapshots are kept at full resolution for every token only this long
+   * (strategy history reads ≤ 16 minutes). Older rows survive only for tokens with an open
+   * position / shadow trade / pending opportunity tracker, capped at RAW_DATA_RETENTION_HOURS.
    */
-  RESEARCH_DATA_RETENTION_HOURS: z.coerce.number().positive().default(72),
-  /** Bot log and missed-opportunity rows are pruned past this age */
+  MARKET_SNAPSHOT_FULL_RES_MINUTES: z.coerce.number().min(17).default(20),
+  /** Synthetic trade ticks (token detail page only). */
+  TRADE_EVENTS_RETENTION_MINUTES: z.coerce.number().positive().default(30),
+  /** Safety assessments older than this are pruned (latest per token always kept). */
+  SAFETY_RETENTION_MINUTES: z.coerce.number().positive().default(30),
+  /**
+   * Research raw data only: token_raw_feature_observations and compacted outcome
+   * checkpoints (after 24h compaction).
+   */
+  RESEARCH_DATA_RETENTION_HOURS: z.coerce.number().positive().default(24),
+  /** Raw feature observations: at most one per token per this many minutes. */
+  RAW_FEATURE_SAMPLE_MINUTES: z.coerce.number().positive().default(15),
+  /** Bot log, regime/health/market-event rows are pruned past this age */
   EVENT_RETENTION_DAYS: z.coerce.number().positive().default(3),
+  /** Token phase timeline rows (latest per token always kept). */
+  TOKEN_PHASE_RETENTION_HOURS: z.coerce.number().positive().default(24),
+  /** Closed shadow trades (research simulation). Open ones are never pruned. */
+  SHADOW_RETENTION_DAYS: z.coerce.number().positive().default(3),
+  /**
+   * Compact research kept for the research period: decision audits + decision-time features,
+   * missed-opportunity summaries. Outcome summaries are permanent.
+   */
+  COMPACT_RESEARCH_RETENTION_DAYS: z.coerce.number().positive().default(8),
+  /**
+   * Hard cap on compact research tables (MB, incl. indexes). When exceeded, the oldest rows go
+   * first (never the last 24h), so research can never fill the volume on its own.
+   */
+  COMPACT_RESEARCH_BUDGET_MB: z.coerce.number().positive().default(150),
+  /**
+   * Per-tick decision stages (lifecycle, eligibility, signal, repeated risk/capacity rejections)
+   * are re-recorded only when the outcome changes or after this many minutes. 0 records every call.
+   */
+  DECISION_AUDIT_DEDUPE_MINUTES: z.coerce.number().min(0).default(360),
+  /** Repeat sightings of a token from the same discovery source within this window are not stored. */
+  DISCOVERY_EVENT_DEDUPE_MINUTES: z.coerce.number().min(0).default(1440),
+  /** One 5m…24h outcome checkpoint set per token per this many hours. */
+  OUTCOME_TRACKING_DEDUPE_HOURS: z.coerce.number().min(0).default(24),
+  /** Same token + rejection reason is recorded as a missed opportunity at most once per window. */
+  MISSED_OPPORTUNITY_DEDUPE_MINUTES: z.coerce.number().min(0).default(60),
+  /** feature_snapshots has no reader; off unless explicitly enabled. */
+  PERSIST_FEATURE_SNAPSHOTS: z
+    .string()
+    .transform((v) => v === 'true')
+    .default('false'),
+  /** Storage guard thresholds (whole Postgres volume: all databases + WAL when measurable). */
+  STORAGE_LIMIT_MB: z.coerce.number().positive().default(500),
+  STORAGE_WARNING_MB: z.coerce.number().positive().default(300),
+  STORAGE_AGGRESSIVE_MB: z.coerce.number().positive().default(350),
+  STORAGE_EMERGENCY_MB: z.coerce.number().positive().default(400),
+  STORAGE_STOP_WRITES_MB: z.coerce.number().positive().default(450),
+  JOB_STORAGE_GUARD_INTERVAL_MS: z.coerce.number().positive().default(60_000),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),

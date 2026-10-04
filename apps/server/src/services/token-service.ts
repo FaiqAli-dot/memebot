@@ -206,7 +206,17 @@ export async function insertMarketSnapshot(
   await query(
     `INSERT INTO liquidity_snapshots (
       token_id, pool_address, venue, liquidity_usd, base_reserve, quote_reserve, fee_bps, observed_at, data_mode
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT (token_id) DO UPDATE SET
+      pool_address = EXCLUDED.pool_address,
+      venue = EXCLUDED.venue,
+      liquidity_usd = EXCLUDED.liquidity_usd,
+      base_reserve = EXCLUDED.base_reserve,
+      quote_reserve = EXCLUDED.quote_reserve,
+      fee_bps = EXCLUDED.fee_bps,
+      observed_at = EXCLUDED.observed_at,
+      data_mode = EXCLUDED.data_mode
+    WHERE EXCLUDED.observed_at >= liquidity_snapshots.observed_at`,
     [
       tokenId,
       quote.poolAddress ?? null,

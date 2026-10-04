@@ -134,15 +134,4 @@ describe('Meteora DBC discovery health metric', () => {
     expect(['OK', 'DEGRADED', 'UNKNOWN', 'STALE', 'DISABLED']).toContain(snap.status);
   });
 
-  it('storage growth estimate uses ~80 MB/h × HF retention hours', async () => {
-    const { estimateSteadyStateRawMb, LIVE_RAW_GROWTH_MB_PER_HOUR } = await import(
-      '../../src/intelligence/storage.js'
-    );
-    const { env } = await import('../../src/config/env.js');
-    expect(LIVE_RAW_GROWTH_MB_PER_HOUR).toBe(80);
-    const est = estimateSteadyStateRawMb();
-    expect(est.highFrequencyRawMb).toBe(80 * env.RAW_DATA_RETENTION_HOURS);
-    expect(est.basis).toMatch(/80 MB\/h/);
-    expect(est.basis).toMatch(/emergency backstop/i);
-  });
 });

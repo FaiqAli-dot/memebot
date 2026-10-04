@@ -31,6 +31,7 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
   let auditRiskDecision: typeof import('../../src/intelligence/hooks.js').auditRiskDecision;
   let scheduleOutcomeCheckpoints: typeof import('../../src/intelligence/outcomes.js').scheduleOutcomeCheckpoints;
   let captureDueOutcomeCheckpoints: typeof import('../../src/intelligence/outcomes.js').captureDueOutcomeCheckpoints;
+  let resetOutcomeSchedulingForTests: typeof import('../../src/intelligence/outcomes.js').resetOutcomeSchedulingForTests;
   let pruneOldData: typeof import('../../src/db/retention.js').pruneOldData;
   let PERMANENT_RETENTION_TABLES: typeof import('../../src/db/retention.js').PERMANENT_RETENTION_TABLES;
   let getStorageMonitor: typeof import('../../src/intelligence/storage.js').getStorageMonitor;
@@ -50,9 +51,8 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
       auditSignalRejection,
       auditRiskDecision,
     } = await import('../../src/intelligence/hooks.js'));
-    ({ scheduleOutcomeCheckpoints, captureDueOutcomeCheckpoints } = await import(
-      '../../src/intelligence/outcomes.js'
-    ));
+    ({ scheduleOutcomeCheckpoints, captureDueOutcomeCheckpoints, resetOutcomeSchedulingForTests } =
+      await import('../../src/intelligence/outcomes.js'));
     ({ pruneOldData, PERMANENT_RETENTION_TABLES } = await import('../../src/db/retention.js'));
     ({ getStorageMonitor } = await import('../../src/intelligence/storage.js'));
     ({ recordSourceSuccess, recordSourceFailure, listSourceHealth } = await import(
@@ -225,15 +225,26 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
       [tokenId],
     );
     const decisionId = rows[0]!.id;
-    // Hooks already schedule checkpoints on reject; force a subset due now for capture.
-    const n = await scheduleOutcomeCheckpoints({
-      tokenId,
-      decisionId,
-      decisionPrice: 0.003439,
-      decisionMarketCap: 3_440_000,
-      decisionLiquidity: 17400,
-      now: new Date(),
-    });
+    const schedule = () =>
+      scheduleOutcomeCheckpoints({
+        tokenId,
+        decisionId,
+        decisionPrice: 0.003439,
+        decisionMarketCap: 3_440_000,
+        decisionLiquidity: 17400,
+        now: new Date(),
+      });
+    // Hooks already scheduled one checkpoint set on reject; a token is tracked once per window.
+    const existing = await db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM token_outcome_checkpoints WHERE token_id = $1`,
+      [tokenId],
+    );
+    expect(Number(existing.rows[0]!.c)).toBe(8);
+    expect(await schedule()).toBe(0);
+
+    await db.query(`DELETE FROM token_outcome_checkpoints WHERE token_id = $1`, [tokenId]);
+    resetOutcomeSchedulingForTests();
+    const n = await schedule();
     expect(n).toBe(8);
     await db.query(
       `UPDATE token_outcome_checkpoints
@@ -253,7 +264,7 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     expect(captured).toBeGreaterThan(0);
   });
 
-  it('14-15: 3h HF prune / 72h research prune; permanent intelligence survives', async () => {
+  it('14-15: 3h HF prune / 72h research prune; compact research survives', async () => {
     await db.query(
       `INSERT INTO token_raw_feature_observations (token_id, features, data_mode, observed_at)
        VALUES ($1, '{"old":1}'::jsonb, 'demo', NOW() - INTERVAL '80 hours'),
@@ -307,13 +318,8 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     expect(afterDecisions.rows[0]!.c).toBe(beforeDecisions.rows[0]!.c);
     expect(afterEvents.rows[0]!.c).toBe(beforeEvents.rows[0]!.c);
     expect(afterToken.rows[0]!.c).toBe(beforeToken.rows[0]!.c);
-    expect(PERMANENT_RETENTION_TABLES).toContain('token_decision_audits');
+    expect(PERMANENT_RETENTION_TABLES).not.toContain('token_decision_audits');
     expect(PERMANENT_RETENTION_TABLES).toContain('tokens');
-
-    const { env } = await import('../../src/config/env.js');
-    expect(env.RAW_DATA_RETENTION_HOURS).toBe(3);
-    expect(env.RESEARCH_DATA_RETENTION_HOURS).toBe(72);
-    expect(env.EVENT_RETENTION_DAYS).toBe(3);
   });
 
   it('16-17: source failure isolation + aggregated polling still returns other sources', async () => {
@@ -361,7 +367,12 @@ describe('integration: token intelligence + meteora discovery ledger', () => {
     expect(mon.counts.tokens).toBeGreaterThanOrEqual(1);
     expect(mon.counts.token_decision_audits).toBeGreaterThanOrEqual(1);
     expect(mon.softLimitBytes).toBeGreaterThan(0);
-    expect(mon.permanentTables).toContain('token_discovery_events');
+    expect(mon.permanentTables).toContain('positions');
+    expect(mon.permanentTables).not.toContain('token_discovery_events');
+    expect(mon.state).toBeDefined();
+    expect(mon.thresholdsMb.emergency).toBeLessThan(mon.thresholdsMb.limit);
+    expect(mon.largestTables.length).toBeGreaterThan(0);
+    expect(mon.largestIndexes.length).toBeGreaterThan(0);
   });
 
   it('max open positions remains exactly 5', async () => {

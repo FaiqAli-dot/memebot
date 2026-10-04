@@ -4,9 +4,18 @@
  */
 import { OUTCOME_CHECKPOINT_LABELS, type OutcomeCheckpointLabel } from '@memebot/shared';
 import { query } from '../db/client.js';
-import { dataMode } from '../config/env.js';
+import { dataMode, env } from '../config/env.js';
 import { getLatestMarketByToken } from '../services/token-service.js';
 import { logger } from '../utils/logger.js';
+import { WriteDedupe } from '../db/write-dedupe.js';
+import { researchWritesAllowed } from '../db/storage-guard.js';
+
+/** Tokens that already have a 5m…24h checkpoint set in flight (one set per token per window). */
+const scheduledTokens = new WriteDedupe();
+
+export function resetOutcomeSchedulingForTests(): void {
+  scheduledTokens.clear();
+}
 
 const CHECKPOINT_OFFSET_MS: Record<OutcomeCheckpointLabel, number> = {
   '5m': 5 * 60_000,
@@ -40,6 +49,21 @@ export async function scheduleOutcomeCheckpoints(opts: {
   now?: Date;
 }): Promise<number> {
   const now = opts.now ?? new Date();
+  const windowMs = env.OUTCOME_TRACKING_DEDUPE_HOURS * 60 * 60_000;
+  if (windowMs > 0) {
+    if (scheduledTokens.recent(opts.tokenId, '', windowMs, now.getTime())) return 0;
+    const { rows } = await query(
+      `SELECT 1 FROM token_outcome_checkpoints
+       WHERE token_id = $1 AND checkpoint_label = '24h' AND due_at > $2 LIMIT 1`,
+      [opts.tokenId, new Date(now.getTime() + CHECKPOINT_OFFSET_MS['24h'] - windowMs)],
+    );
+    if (rows.length > 0) {
+      scheduledTokens.remember(opts.tokenId, '', undefined, now.getTime());
+      return 0;
+    }
+  }
+  if (!researchWritesAllowed()) return 0;
+  scheduledTokens.remember(opts.tokenId, '', undefined, now.getTime());
   let n = 0;
   for (const label of PRACTICAL_CHECKPOINTS) {
     const due = new Date(now.getTime() + CHECKPOINT_OFFSET_MS[label]);

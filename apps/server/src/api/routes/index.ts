@@ -466,14 +466,16 @@ apiRouter.get('/intelligence/tokens/:id', async (req, res, next) => {
   }
 });
 
-apiRouter.get('/intelligence/storage', async (_req, res, next) => {
+const storageReport = async (_req: unknown, res: Response, next: NextFunction) => {
   try {
     const { getStorageMonitor } = await import('../../intelligence/storage.js');
     res.json(await getStorageMonitor());
   } catch (err) {
     next(err);
   }
-});
+};
+apiRouter.get('/storage', storageReport);
+apiRouter.get('/intelligence/storage', storageReport);
 
 apiRouter.get('/intelligence/sources', async (_req, res, next) => {
   try {

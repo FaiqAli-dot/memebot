@@ -21,11 +21,13 @@ import { useRealtime, useThrottled } from '../hooks/useRealtime';
 import { ReadinessPanel } from '../components/ReadinessPanel';
 import { LearningPanel } from '../components/LearningPanel';
 import { Week1Panel } from '../components/Week1Panel';
+import { StorageBanner, StoragePanel } from '../components/StoragePanel';
 
 const BOARD_TABS = [
   { id: 'observation', label: 'Observation mode' },
   { id: 'trading', label: 'Trading' },
   { id: 'learning', label: 'Learning' },
+  { id: 'storage', label: 'Storage' },
 ] as const;
 type BoardTab = (typeof BOARD_TABS)[number]['id'];
 
@@ -137,6 +139,7 @@ export function DashboardPage() {
         </button>
       </div>
 
+      <StorageBanner />
       <div className="tabs" role="tablist">
         {BOARD_TABS.map((t) => (
           <button
@@ -153,6 +156,7 @@ export function DashboardPage() {
       {board === 'observation' && <Week1Panel />}
       {board === 'trading' && <ReadinessPanel />}
       {board === 'learning' && <LearningPanel />}
+      {board === 'storage' && <StoragePanel />}
 
       <div className="grid grid-4" style={{ marginBottom: '0.75rem' }}>
         <Metric label="Starting balance" value={money(portfolio?.startingBalanceUsd)} />

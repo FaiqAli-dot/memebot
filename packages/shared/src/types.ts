@@ -1077,3 +1077,68 @@ export interface MomentumStrategyParams {
   minOverallScore: number;
   maxTopHolderPct: number;
 }
+
+export type StorageState =
+  | 'NORMAL'
+  | 'WARNING'
+  | 'AGGRESSIVE_CLEANUP'
+  | 'EMERGENCY_CLEANUP'
+  | 'STOP_NON_ESSENTIAL_WRITES';
+
+export type DataClass = 'CRITICAL' | 'COMPACT_RESEARCH' | 'RESEARCH' | 'OPERATIONAL';
+
+export interface TableStorageRow {
+  table: string;
+  totalBytes: number;
+  heapBytes: number;
+  indexBytes: number;
+  liveRows: number;
+  deadRows: number;
+  dataClass: DataClass | null;
+}
+
+export interface BloatRow {
+  table: string;
+  /** Table + indexes on disk. */
+  heapBytes: number;
+  estimatedLiveBytes: number;
+  reclaimableBytes: number;
+}
+
+export interface StorageReport {
+  state: StorageState;
+  thresholdsMb: { warning: number; aggressive: number; emergency: number; stopWrites: number; limit: number };
+  usedBytes: number;
+  usedPct: number;
+  databaseBytes: number;
+  allDatabasesBytes: number;
+  walBytes: number | null;
+  largestTables: TableStorageRow[];
+  largestIndexes: Array<{ index: string; table: string; bytes: number }>;
+  /** Space freed by deletes but still held in table files (reusable; VACUUM FULL returns it). */
+  bloat: BloatRow[];
+  rawSnapshotRows: number;
+  compactResearchRows: number;
+  /** Live (post-delete) size of compact research vs its hard budget. */
+  compactResearchLiveBytes: number;
+  compactResearchBudgetMb: number;
+  counts: Record<string, number>;
+  oldestRawSnapshotAt: string | null;
+  rawDataAgeMinutes: number | null;
+  lastCleanup: {
+    finishedAt: string | null;
+    state: string | null;
+    rowsDeleted: number;
+    byTable: Record<string, number>;
+  } | null;
+  nextCleanupAt: string;
+  cleanupIntervalMs: number;
+  retention: Array<{ table: string; retention: string; permanent: boolean }>;
+  permanentTables: string[];
+  estimatedDbBytes: number;
+  softLimitBytes: number;
+  approachingLimit: boolean;
+  rawRetentionHours: number;
+  researchRetentionHours: number;
+  eventRetentionDays: number;
+}

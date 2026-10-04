@@ -18,6 +18,7 @@ export const api = {
   botStatus: () => request<import('@memebot/shared').BotStatusInfo>('/api/bot/status'),
   botReadiness: () => request<import('@memebot/shared').BotReadiness>('/api/bot/readiness'),
   learningStatus: () => request<import('@memebot/shared').LearningStatus>('/api/learning/status'),
+  storage: () => request<import('@memebot/shared').StorageReport>('/api/storage'),
   week1Overview: (hours = 24) =>
     request<import('@memebot/shared').Week1Overview>(`/api/week1/overview?hours=${hours}`),
   control: (action: 'start' | 'pause') =>

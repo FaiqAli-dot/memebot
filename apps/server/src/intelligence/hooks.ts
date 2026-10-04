@@ -6,9 +6,7 @@ import type { DecisionReasonCode, DecisionStage } from '@memebot/shared';
 import {
   recordDecisionAudit,
   recordDiscoveryObservation,
-  markTrackingStarted,
-  setInitialMarketSnapshot,
-  bumpSnapshotCount,
+  recordMarketTick,
   updateIntelligenceStatus,
 } from './ledger.js';
 import {
@@ -21,7 +19,9 @@ import {
 import { scheduleOutcomeCheckpoints } from './outcomes.js';
 import type { EnrichedDiscoveredToken } from '../providers/discovery/multi-source.js';
 import { query } from '../db/client.js';
-import { dataMode } from '../config/env.js';
+import { dataMode, env } from '../config/env.js';
+import { WriteDedupe } from '../db/write-dedupe.js';
+import { researchWritesAllowed } from '../db/storage-guard.js';
 
 export async function onTokenDiscovered(
   token: EnrichedDiscoveredToken,
@@ -72,9 +72,7 @@ export async function onMarketTracked(
   holders: number | null,
   ageMinutes: number | null,
 ): Promise<void> {
-  await markTrackingStarted(tokenId);
-  await bumpSnapshotCount(tokenId);
-  await setInitialMarketSnapshot(tokenId, {
+  await recordMarketTick(tokenId, {
     priceUsd: market.price_usd,
     marketCapUsd: market.market_cap_usd,
     liquidityUsd: market.liquidity_usd,
@@ -299,6 +297,7 @@ async function maybeScheduleOutcomes(
   decisionId: string,
   features?: Record<string, unknown>,
 ): Promise<void> {
+  if (!decisionId) return;
   await scheduleOutcomeCheckpoints({
     tokenId,
     decisionId,
@@ -308,11 +307,16 @@ async function maybeScheduleOutcomes(
   });
 }
 
-/** Persist a temporary raw observation (subject to retention). */
+const rawObservationSamples = new WriteDedupe();
+
+/** Persist a temporary raw observation: sampled per token, subject to retention. */
 export async function persistRawFeatureObservation(
   tokenId: string,
   features: Record<string, unknown>,
 ): Promise<void> {
+  if (rawObservationSamples.recent(tokenId, '', env.RAW_FEATURE_SAMPLE_MINUTES * 60_000)) return;
+  if (!researchWritesAllowed()) return;
+  rawObservationSamples.remember(tokenId, '');
   await query(
     `INSERT INTO token_raw_feature_observations (token_id, features, data_mode)
      VALUES ($1,$2,$3)`,

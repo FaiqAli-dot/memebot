@@ -20,6 +20,7 @@ export type JobName =
   | 'learning'
   | 'outcome_checkpoints'
   | 'storage_monitor'
+  | 'storage_guard'
   | 'retention';
 
 interface Job {
@@ -89,7 +90,7 @@ export function defaultIntervals(): Record<JobName, number> {
     learning: 30_000,
     outcome_checkpoints: env.JOB_OUTCOME_CHECKPOINTS_INTERVAL_MS,
     storage_monitor: env.JOB_STORAGE_MONITOR_INTERVAL_MS,
-    /** Primary Free-tier protection: prune HF raw every 15 minutes. */
+    storage_guard: env.JOB_STORAGE_GUARD_INTERVAL_MS,
     retention: RETENTION_JOB_INTERVAL_MS,
   };
 }

@@ -13,7 +13,9 @@
 import { v4 as uuid } from 'uuid';
 import type { RealismProfile, RejectionReason } from '@memebot/shared';
 import { query } from '../db/client.js';
-import { dataMode } from '../config/env.js';
+import { dataMode, env } from '../config/env.js';
+import { researchWrite, researchWritesAllowed } from '../db/storage-guard.js';
+import { WriteDedupe } from '../db/write-dedupe.js';
 import { SeededRng } from '../domain/seeded-rng.js';
 import { simulateRealisticTrade, type RealisticSimResult } from '../execution/realism.js';
 import { sellProceedsUsd } from '../engines/cost/simulator.js';
@@ -71,7 +73,7 @@ export interface ShadowOpenInput {
 
 export type ShadowOpenResult =
   | { status: 'OPENED' | 'ENTRY_FAILED'; id: string }
-  | { status: 'COOLDOWN'; id: null };
+  | { status: 'COOLDOWN' | 'STORAGE_PAUSED'; id: null };
 
 interface StoredPoint {
   observedAt: string;
@@ -91,6 +93,7 @@ interface ShadowJournal {
 }
 
 export async function openShadowTrade(input: ShadowOpenInput): Promise<ShadowOpenResult> {
+  if (!researchWritesAllowed()) return { status: 'STORAGE_PAUSED', id: null };
   const strategyKey = input.strategyId ?? '-';
   const now = input.now ?? new Date();
   const recent = await query(
@@ -437,6 +440,13 @@ export async function updateOpenShadowTrades(opts: {
   return { updated, closed, legacyClosed: legacy.rowCount ?? 0 };
 }
 
+/** Same token + reason is one missed opportunity per window, not one per signal tick. */
+const missedDedupe = new WriteDedupe();
+
+export function resetMissedOpportunityDedupeForTests(): void {
+  missedDedupe.clear();
+}
+
 export async function recordMissedOpportunity(opts: {
   portfolioId: string;
   tokenId: string;
@@ -446,20 +456,25 @@ export async function recordMissedOpportunity(opts: {
   helped?: boolean | null;
   evidence?: Record<string, unknown>;
 }): Promise<void> {
-  await query(
-    `INSERT INTO missed_opportunities (
-      portfolio_id, token_id, rejection_reason, filter_name,
-      would_have_returned_pct, helped, evidence, data_mode
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [
-      opts.portfolioId,
-      opts.tokenId,
-      opts.rejectionReason,
-      opts.filterName ?? null,
-      opts.wouldHaveReturnedPct ?? null,
-      opts.helped ?? null,
-      JSON.stringify(opts.evidence ?? {}),
-      dataMode,
-    ],
-  );
+  const key = `${opts.portfolioId}|${opts.tokenId}|${opts.rejectionReason}`;
+  if (missedDedupe.recent(key, '', env.MISSED_OPPORTUNITY_DEDUPE_MINUTES * 60_000)) return;
+  await researchWrite('missed_opportunity', async () => {
+    missedDedupe.remember(key, '');
+    await query(
+      `INSERT INTO missed_opportunities (
+        portfolio_id, token_id, rejection_reason, filter_name,
+        would_have_returned_pct, helped, evidence, data_mode
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        opts.portfolioId,
+        opts.tokenId,
+        opts.rejectionReason,
+        opts.filterName ?? null,
+        opts.wouldHaveReturnedPct ?? null,
+        opts.helped ?? null,
+        JSON.stringify(opts.evidence ?? {}),
+        dataMode,
+      ],
+    );
+  });
 }

@@ -289,6 +289,23 @@ describe('integration: research archive (export → verify → delete)', () => {
     expect(Object.keys(r.tables)).toHaveLength(0);
   });
 
+  it('copies tables with generated and identity columns (generated values recomputed, hashes match)', async () => {
+    const ddl = `CREATE TABLE zz_archive_gen (
+      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      x NUMERIC NOT NULL,
+      doubled NUMERIC GENERATED ALWAYS AS (x * 2) STORED)`;
+    for (const p of [source, archive]) await p.query(`DROP TABLE IF EXISTS zz_archive_gen; ${ddl}`);
+    try {
+      await source.query(`INSERT INTO zz_archive_gen (x) SELECT g * 1.5 FROM generate_series(1, 30) g`);
+      const r = await run({ mode: 'archive', tables: ['zz_archive_gen'] });
+      expect(r.status).toBe('SUCCEEDED');
+      expect(r.tables.zz_archive_gen!.verified).toBe(30);
+      expect(await count(archive, `SELECT COUNT(*) FROM zz_archive_gen WHERE doubled = x * 2`)).toBe(30);
+    } finally {
+      for (const p of [source, archive]) await p.query(`DROP TABLE IF EXISTS zz_archive_gen`);
+    }
+  });
+
   it('a second concurrent run is refused by the advisory lock', async () => {
     const holder = await source.connect();
     try {

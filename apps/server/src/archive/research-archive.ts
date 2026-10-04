@@ -252,7 +252,8 @@ export async function prepareArchiveSchema(archive: pg.Pool): Promise<void> {
 
 interface TableMeta {
   name: string;
-  columns: Array<{ name: string; type: string }>;
+  /** `generated` columns are recomputed by the archive, never inserted. */
+  columns: Array<{ name: string; type: string; generated: boolean }>;
   pk: Array<{ name: string; type: string }>;
   hasTokenId: boolean;
 }
@@ -267,8 +268,8 @@ interface ForeignKey {
 }
 
 async function loadCatalog(pool: pg.Pool): Promise<Map<string, TableMeta>> {
-  const { rows: cols } = await pool.query<{ tbl: string; col: string; typ: string }>(
-    `SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS typ
+  const { rows: cols } = await pool.query<{ tbl: string; col: string; typ: string; gen: boolean }>(
+    `SELECT c.relname AS tbl, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS typ, a.attgenerated <> '' AS gen
      FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
      WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
      ORDER BY c.relname, a.attnum`,
@@ -284,7 +285,7 @@ async function loadCatalog(pool: pg.Pool): Promise<Map<string, TableMeta>> {
   const map = new Map<string, TableMeta>();
   for (const r of cols) {
     const t = map.get(r.tbl) ?? { name: r.tbl, columns: [], pk: [], hasTokenId: false };
-    t.columns.push({ name: r.col, type: r.typ });
+    t.columns.push({ name: r.col, type: r.typ, generated: r.gen });
     if (r.col === 'token_id') t.hasTokenId = true;
     map.set(r.tbl, t);
   }
@@ -369,16 +370,17 @@ const rowSelect = (meta: TableMeta, alias: string) =>
 
 async function upsertRows(archive: pg.Pool, meta: TableMeta, rows: SourceRow[]): Promise<void> {
   if (rows.length === 0) return;
-  const cols = meta.columns.map((c) => q(c.name));
+  const writable = meta.columns.filter((c) => !c.generated);
+  const cols = writable.map((c) => q(c.name));
   const pkNames = new Set(meta.pk.map((c) => c.name));
-  const rest = meta.columns.filter((c) => !pkNames.has(c.name)).map((c) => q(c.name));
+  const rest = writable.filter((c) => !pkNames.has(c.name)).map((c) => q(c.name));
   const conflict =
     rest.length === 0
       ? 'DO NOTHING'
       : `DO UPDATE SET ${rest.map((c) => `${c} = EXCLUDED.${c}`).join(', ')}
          WHERE (${rest.map((c) => `a.${c}`).join(', ')}) IS DISTINCT FROM (${rest.map((c) => `EXCLUDED.${c}`).join(', ')})`;
   await archive.query(
-    `INSERT INTO ${q(meta.name)} AS a (${cols.join(', ')})
+    `INSERT INTO ${q(meta.name)} AS a (${cols.join(', ')}) OVERRIDING SYSTEM VALUE
      SELECT ${cols.join(', ')} FROM jsonb_populate_recordset(NULL::${q(meta.name)}, $1::jsonb)
      ON CONFLICT (${meta.pk.map((c) => q(c.name)).join(', ')}) ${conflict}`,
     [`[${rows.map((r) => r.j).join(',')}]`],

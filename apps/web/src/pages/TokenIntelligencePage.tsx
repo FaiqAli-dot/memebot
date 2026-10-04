@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, money, pct } from '../lib/api';
+import { TokenInvestigation } from '../components/TokenInvestigation';
 
 type IntelRow = {
   tokenId: string;
@@ -76,6 +77,9 @@ export function TokenIntelligencePage() {
   const [signalGenerated, setSignalGenerated] = useState<'all' | 'yes' | 'no'>('all');
   const [bucketFilter, setBucketFilter] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [investigateQ, setInvestigateQ] = useState('');
+  const [search, setSearch] = useState<Awaited<ReturnType<typeof api.intelligenceSearch>> | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -140,6 +144,17 @@ export function TokenIntelligencePage() {
     setSelected(detail);
   }
 
+  async function runInvestigate() {
+    setSearchError(null);
+    try {
+      const res = await api.intelligenceSearch(investigateQ);
+      setSearch(res);
+      if (res.exactQuery && res.tokens.length === 1) await openDetail(res.tokens[0]!.tokenId);
+    } catch (e) {
+      setSearchError((e as Error).message);
+    }
+  }
+
   const breakdown = summary.rejectionBreakdown ?? {};
 
   return (
@@ -169,6 +184,72 @@ export function TokenIntelligencePage() {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="panel">
+        <h3>Investigate a token</h3>
+        <p className="muted">
+          Exact mint / pool address, token / signal / order / position ID, or symbol / name. Addresses
+          and IDs only match exactly.
+        </p>
+        <div className="filters">
+          <input
+            placeholder="e.g. Hg5Ja55T5wESq4vyFoiVCMeHXtGyVA69X2UHq8hgpump"
+            value={investigateQ}
+            style={{ minWidth: '28rem' }}
+            onChange={(e) => setInvestigateQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void runInvestigate();
+            }}
+          />
+          <button type="button" onClick={() => void runInvestigate()}>
+            Investigate
+          </button>
+        </div>
+        {searchError && <div className="badge danger">{searchError}</div>}
+        {search && (
+          <div style={{ marginTop: '0.5rem' }}>
+            {search.found ? (
+              <div className="muted">
+                {search.tokens.length} match{search.tokens.length === 1 ? '' : 'es'} by {search.matchType}
+              </div>
+            ) : (
+              <div className="badge pause">{search.message ?? 'Not found'}</div>
+            )}
+            {search.tokens.length > 0 && !(search.exactQuery && search.tokens.length === 1) && (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Name</th>
+                      <th>Mint</th>
+                      <th>Matched on</th>
+                      <th>First seen</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {search.tokens.map((t) => (
+                      <tr key={t.tokenId}>
+                        <td>
+                          <button type="button" className="linkish" onClick={() => void openDetail(t.tokenId)}>
+                            {String(t.symbol ?? '—')}
+                          </button>
+                        </td>
+                        <td>{String(t.name ?? '—')}</td>
+                        <td style={{ wordBreak: 'break-all' }}>{String(t.address ?? '—')}</td>
+                        <td>{t.matchedOn}</td>
+                        <td>{t.discoveredAt ? new Date(String(t.discoveredAt)).toLocaleString() : '—'}</td>
+                        <td>{String(t.intelligenceStatus ?? '—')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="panel">
@@ -309,7 +390,7 @@ export function TokenIntelligencePage() {
               Close
             </button>
           </div>
-          <pre className="code-block">{JSON.stringify(selected, null, 2)}</pre>
+          <TokenInvestigation detail={selected} />
         </div>
       )}
 

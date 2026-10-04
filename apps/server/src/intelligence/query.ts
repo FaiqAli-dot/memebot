@@ -203,6 +203,7 @@ export async function listIntelligenceTokens(filters: IntelligenceListFilters): 
 }
 
 export async function getIntelligenceTokenDetail(tokenId: string): Promise<Record<string, unknown> | null> {
+  if (!UUID_RE.test(tokenId)) return null;
   const { rows } = await query(`SELECT * FROM tokens WHERE id = $1 AND data_mode = $2`, [
     tokenId,
     dataMode,
@@ -231,6 +232,41 @@ export async function getIntelligenceTokenDetail(tokenId: string): Promise<Recor
     [tokenId],
   );
 
+  const signals = await query(
+    `SELECT id, created_at, lane, strategy_name AS strategy_id, strategy_version, overall_score,
+            confidence, data_confidence, expected_value, market_state, explanation
+     FROM signals WHERE token_id = $1 ORDER BY created_at ASC`,
+    [tokenId],
+  );
+  const attempts = await query(
+    `SELECT * FROM signal_execution_attempts WHERE token_id = $1 ORDER BY first_attempt_at ASC`,
+    [tokenId],
+  );
+  const riskDecisions = await query(
+    `SELECT id, portfolio_id, signal_id, strategy_id, lane, decision, rejection_reason, detail,
+            final_size_usd, max_viable_size_usd, expected_net_value, ev_threshold, multipliers,
+            attempts, first_evaluated_at, evaluated_at, execution_status, execution_reason, position_id
+     FROM risk_decisions WHERE token_id = $1 ORDER BY first_evaluated_at ASC`,
+    [tokenId],
+  );
+  const orders = await query(
+    `SELECT o.id, o.portfolio_id, o.signal_id, o.position_id, o.side, o.status, o.created_at, o.filled_at,
+            o.requested_amount_usd, o.filled_amount_usd, o.requested_price_usd, o.executed_price_usd,
+            o.token_quantity, o.total_cost_usd, o.failure_reason, o.attempt_count, o.last_attempt_at,
+            COALESCE((SELECT json_agg(f ORDER BY f.created_at) FROM paper_fills f WHERE f.order_id = o.id), '[]') AS fills
+     FROM paper_orders o WHERE o.token_id = $1 ORDER BY o.created_at ASC`,
+    [tokenId],
+  );
+  const positions = await query(
+    `SELECT * FROM positions WHERE token_id = $1 ORDER BY opened_at ASC`,
+    [tokenId],
+  );
+  const pools = await query(`SELECT * FROM pools WHERE token_id = $1 ORDER BY first_seen_at ASC`, [tokenId]);
+  const latestMarket = await query(
+    `SELECT * FROM market_snapshots WHERE token_id = $1 ORDER BY observed_at DESC LIMIT 1`,
+    [tokenId],
+  );
+
   return {
     token: t,
     discoveryEvents: events.rows,
@@ -238,7 +274,239 @@ export async function getIntelligenceTokenDetail(tokenId: string): Promise<Recor
     featureSnapshots: features.rows,
     outcomeCheckpoints: checkpoints.rows,
     outcomeSummaries: summaries.rows,
+    signals: signals.rows,
+    executionAttempts: attempts.rows,
+    riskDecisions: riskDecisions.rows,
+    orders: orders.rows,
+    positions: positions.rows,
+    pools: pools.rows,
+    latestMarket: latestMarket.rows[0] ?? null,
+    timeline: buildTimeline({
+      token: t,
+      discoveryEvents: events.rows,
+      decisions: decisions.rows,
+      signals: signals.rows,
+      attempts: attempts.rows,
+      orders: orders.rows,
+      positions: positions.rows,
+      checkpoints: checkpoints.rows,
+    }),
   };
+}
+
+export interface TimelineEvent {
+  at: string;
+  kind: string;
+  result: string | null;
+  summary: string;
+  ref: string | null;
+}
+
+type Row = Record<string, unknown>;
+
+function iso(v: unknown): string | null {
+  if (v == null) return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/** Chronological story of one token assembled from every table that mentions it. */
+export function buildTimeline(src: {
+  token: Row;
+  discoveryEvents: Row[];
+  decisions: Row[];
+  signals: Row[];
+  attempts: Row[];
+  orders: Row[];
+  positions: Row[];
+  checkpoints: Row[];
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  const push = (at: unknown, kind: string, result: string | null, summary: string, ref: unknown = null) => {
+    const ts = iso(at);
+    if (ts) out.push({ at: ts, kind, result, summary, ref: ref == null ? null : String(ref) });
+  };
+  const short = (v: unknown) => (v == null ? '' : String(v).slice(0, 8));
+
+  push(src.token.discovered_at, 'DISCOVERED', null, `discovered via ${src.token.discovery_source ?? 'unknown'}`);
+  for (const e of src.discoveryEvents) {
+    push(e.observed_at, 'DISCOVERY_EVENT', null, `seen by ${e.discovery_source ?? 'unknown'}`, e.id);
+  }
+  for (const d of src.decisions) {
+    if (d.stage === 'DISCOVERED') continue;
+    const reason = d.reason_code ? ` (${d.reason_code})` : '';
+    const sig = d.signal_id ? ` signal ${short(d.signal_id)}` : '';
+    push(d.decided_at, String(d.stage), String(d.result), `${d.stage} ${d.result}${reason}${sig}`, d.id);
+  }
+  for (const s of src.signals) {
+    push(
+      s.created_at,
+      'SIGNAL_CREATED',
+      String(s.lane),
+      `${s.lane} BUY signal ${short(s.id)} by ${s.strategy_id} (score ${Number(s.overall_score).toFixed(1)})`,
+      s.id,
+    );
+  }
+  for (const a of src.attempts) {
+    push(
+      a.first_attempt_at,
+      'EXECUTION_ATTEMPTS',
+      String(a.status),
+      `execution attempts for signal ${short(a.signal_id)}: ${a.attempts} tick(s), final status ${a.status}` +
+        (a.status_reason ? ` (${a.status_reason})` : ''),
+      a.id,
+    );
+    if (a.revalidated_at) {
+      push(
+        a.revalidated_at,
+        'STRATEGY_REVALIDATION',
+        String(a.revalidation_result),
+        `strategy revalidation ${a.revalidation_result}` + (a.revalidation_reason ? ` (${a.revalidation_reason})` : ''),
+        a.id,
+      );
+    }
+  }
+  for (const o of src.orders) {
+    const attempts = Number(o.attempt_count ?? 1);
+    push(
+      o.created_at,
+      'ORDER',
+      String(o.status),
+      `${o.side} order ${short(o.id)} ${o.status}` +
+        (o.failure_reason ? ` (${o.failure_reason})` : '') +
+        (attempts > 1 ? ` x${attempts}` : ''),
+      o.id,
+    );
+  }
+  for (const p of src.positions) {
+    push(p.opened_at, 'POSITION_OPENED', 'OPEN', `position ${short(p.id)} opened`, p.id);
+    if (p.closed_at) {
+      const pnl = p.net_pnl_usd ?? p.realized_pnl_usd;
+      push(
+        p.closed_at,
+        'POSITION_CLOSED',
+        'CLOSED',
+        `position ${short(p.id)} closed (${p.close_reason ?? 'unknown'})` +
+          (pnl != null ? `, P&L $${Number(pnl).toFixed(4)}` : ''),
+        p.id,
+      );
+    }
+  }
+  for (const c of src.checkpoints) {
+    if (c.status !== 'CAPTURED') continue;
+    push(
+      c.observed_at,
+      'OUTCOME_CHECKPOINT',
+      String(c.checkpoint_label),
+      `outcome ${c.checkpoint_label}` + (c.change_pct != null ? `: ${Number(c.change_pct).toFixed(1)}%` : ''),
+      c.id,
+    );
+  }
+  return out.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BASE58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+export type TokenSearchMatch =
+  | 'token_id'
+  | 'signal_id'
+  | 'order_id'
+  | 'position_id'
+  | 'risk_decision_id'
+  | 'mint'
+  | 'pool_address'
+  | 'symbol'
+  | 'name'
+  | 'partial';
+
+export interface TokenSearchResult {
+  query: string;
+  /** True when the query was an identifier (UUID or address): only exact matches are returned. */
+  exactQuery: boolean;
+  matchType: TokenSearchMatch | 'none';
+  found: boolean;
+  message: string | null;
+  tokens: Array<Record<string, unknown> & { matchedOn: TokenSearchMatch }>;
+}
+
+const SEARCH_COLUMNS = `t.id AS "tokenId", t.address, t.symbol, t.name, t.chain, t.dex_venue AS venue,
+  t.discovered_at AS "discoveredAt", t.last_discovered_at AS "lastDiscoveredAt",
+  t.lifecycle_state AS "lifecycleState", t.intelligence_status AS "intelligenceStatus",
+  t.trade_status AS "tradeStatus", t.last_rejection_reason AS "rejectionReason"`;
+
+/**
+ * Resolves any identifier to tokens. Identifiers (UUIDs, Solana addresses) only ever match
+ * exactly, so an exact mint never falls back to a same-named token. Plain text matches
+ * symbol / name, exact matches first.
+ */
+export async function searchTokens(raw: string): Promise<TokenSearchResult> {
+  const q = raw.trim();
+  const result = (
+    matchType: TokenSearchMatch | 'none',
+    tokens: TokenSearchResult['tokens'],
+    exactQuery: boolean,
+    message: string | null = null,
+  ): TokenSearchResult => ({ query: q, exactQuery, matchType, found: tokens.length > 0, message, tokens });
+
+  if (!q) return result('none', [], false, 'Enter a mint address, symbol, name or ID');
+
+  const byIds = async (match: TokenSearchMatch, sql: string): Promise<TokenSearchResult['tokens']> => {
+    const { rows } = await query(
+      `SELECT ${SEARCH_COLUMNS} FROM tokens t WHERE t.data_mode = $2 AND t.id IN (${sql})`,
+      [q, dataMode],
+    );
+    return rows.map((r) => ({ ...r, matchedOn: match }));
+  };
+
+  if (UUID_RE.test(q)) {
+    const lookups: Array<[TokenSearchMatch, string]> = [
+      ['token_id', `SELECT $1::uuid`],
+      ['signal_id', `SELECT token_id FROM signals WHERE id = $1::uuid`],
+      ['order_id', `SELECT token_id FROM paper_orders WHERE id = $1::uuid`],
+      ['position_id', `SELECT token_id FROM positions WHERE id = $1::uuid`],
+      ['risk_decision_id', `SELECT token_id FROM risk_decisions WHERE id = $1::uuid`],
+    ];
+    for (const [match, sql] of lookups) {
+      const tokens = await byIds(match, sql);
+      if (tokens.length) return result(match, tokens, true);
+    }
+    return result('none', [], true, 'No token, signal, order, position or risk decision has this ID');
+  }
+
+  if (BASE58_ADDRESS_RE.test(q)) {
+    const mint = await byIds('mint', `SELECT id FROM tokens WHERE address = $1`);
+    if (mint.length) return result('mint', mint, true);
+    const pool = await byIds(
+      'pool_address',
+      `SELECT token_id FROM pools WHERE pool_address = $1
+       UNION SELECT id FROM tokens WHERE pool_address = $1 OR dbc_pool_address = $1
+       UNION SELECT token_id FROM token_discovery_events WHERE pool_address = $1 AND token_id IS NOT NULL`,
+    );
+    if (pool.length) return result('pool_address', pool, true);
+    return result(
+      'none',
+      [],
+      true,
+      'Not discovered: no token with this mint or pool address has been recorded',
+    );
+  }
+
+  const { rows } = await query(
+    `SELECT ${SEARCH_COLUMNS},
+            CASE WHEN lower(t.symbol) = lower($1) THEN 'symbol'
+                 WHEN lower(t.name) = lower($1) THEN 'name'
+                 ELSE 'partial' END AS "matchedOn"
+     FROM tokens t
+     WHERE t.data_mode = $2
+       AND (t.symbol ILIKE $3 OR t.name ILIKE $3 OR t.address ILIKE $3)
+     ORDER BY (lower(t.symbol) = lower($1) OR lower(t.name) = lower($1)) DESC,
+              t.last_discovered_at DESC NULLS LAST, t.discovered_at DESC
+     LIMIT 50`,
+    [q, dataMode, `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`],
+  );
+  const tokens = rows as TokenSearchResult['tokens'];
+  return result(tokens[0]?.matchedOn ?? 'none', tokens, false, tokens.length ? null : 'No token matches this text');
 }
 
 export async function getMissedOpportunityAnalysis(): Promise<{

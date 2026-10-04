@@ -73,6 +73,14 @@ import {
   type RiskConfig,
 } from '../risk/position-risk.js';
 import { markRiskExecution, recordRiskDecision } from '../services/risk-decision-service.js';
+import {
+  beginExecutionAttempt,
+  recordRevalidation,
+  revalidateSignalStrategy,
+  revalidationFeatures,
+  updateExecutionAttempt,
+  type StrategyRevalidation,
+} from '../services/signal-revalidation.js';
 import { estimateRoundTripCost, networkFeePerLegUsd } from '../execution/cost-estimate.js';
 import {
   getRealismKnobs,
@@ -95,6 +103,7 @@ import {
   auditRiskDecision,
   auditSignalPass,
   auditSignalRejection,
+  auditStrategyRevalidation,
   buildFeatureSnapshot,
   onMarketTracked,
   onTokenDiscovered,
@@ -119,6 +128,7 @@ import {
 import {
   applyQuoteToToken,
   getExposureTokenIds,
+  getTrackedToken,
   getUniverseCounts,
   listEvaluationCandidates,
   listTopActiveTokens,
@@ -727,6 +737,124 @@ async function recentResearchSignal(tokenId: string, cooldownSec: number): Promi
 }
 
 /**
+ * Everything a strategy's `evaluate()` sees for one token at one market snapshot. Shared by the
+ * signal job and execution-time revalidation so both judge a token on identical inputs.
+ */
+async function buildStrategyContext(
+  token: Pick<
+    TrackedTokenRow,
+    'id' | 'address' | 'symbol' | 'chain' | 'discovered_at' | 'first_observed_at' | 'pool_created_at' | 'created_at_onchain'
+  > & { discovery_source?: string | null },
+  market: MarketRow,
+  history: SnapshotHistoryRow[],
+  now: Date,
+) {
+  const staleSec = getStalePriceMaxAgeMs() / 1000;
+  const snapshotAgeSec = (now.getTime() - market.observed_at.getTime()) / 1000;
+  const holders = await getLatestHolders(token.id);
+  const age = tokenAgeOf(token, now);
+  const hist = history.map(toMetricSnapshot);
+  const current: MetricSnapshot = {
+    observedAt: market.observed_at,
+    volume5mUsd: market.volume_5m_usd,
+    volume1hUsd: market.volume_1h_usd,
+    volume24hUsd: market.volume_24h_usd,
+    txCount5m: market.tx_count_5m,
+    buys5m: market.buys_5m,
+    sells5m: market.sells_5m,
+    buys24h: market.buys_24h,
+    sells24h: market.sells_24h,
+  };
+  const metrics = computeMarketMetrics({
+    current,
+    history: hist,
+    ageMinutes: age.minutes,
+    config: { minBaselineUsd: env.VOLUME_ACCEL_MIN_BASELINE_USD, maxAccel: env.VOLUME_ACCEL_MAX },
+  });
+  const prevWindow = previousCompletedWindow(
+    hist.filter((s) => s.observedAt.getTime() < current.observedAt.getTime()),
+    current,
+  );
+  const ticks = approximateTradesFromSnapshot({
+    buyVolume5mUsd: market.buy_volume_5m_usd,
+    sellVolume5mUsd: market.sell_volume_5m_usd,
+    txCount5m: market.tx_count_5m,
+    priceUsd: market.price_usd,
+    observedAt: market.observed_at,
+  });
+  const flow = computeFlowFeatures(ticks);
+  const safety = (await latestSafety(token.id)) ?? assessSafety(safetyInputFor(token, market, holders));
+  const phase = detectTokenPhase({
+    ageMinutes: age.minutes,
+    priceChange2mPct: market.price_change_5m_pct,
+    priceChange5mPct: market.price_change_5m_pct,
+    priceChange1hPct: market.price_change_1h_pct,
+    volumeAcceleration: metrics.volumeAcceleration.capped,
+    liquidityUsd: market.liquidity_usd,
+    liquidityChangePct: null,
+    uniqueBuyers5m: flow['5m']?.uniqueBuyers.value ?? null,
+    uniqueSellers5m: flow['5m']?.uniqueSellers.value ?? null,
+    netFlow5mUsd: flow['5m']?.netFlowUsd.value ?? null,
+    holderGrowthPct: null,
+    largeWalletSellPct: null,
+    volatility5mPct: Math.abs(market.price_change_5m_pct),
+  });
+  const dataConf = assessDataConfidence({
+    liquidityStatus: market.liquidity_status,
+    liquidityUsd: market.liquidity_usd,
+    snapshotAgeSec,
+    staleAfterSec: staleSec,
+    volume5mUsd: market.volume_5m_usd,
+    volume1hUsd: market.volume_1h_usd,
+    txCount5m: market.tx_count_5m,
+    buys5m: market.buys_5m,
+    sells5m: market.sells_5m,
+    ageSource: age.source,
+    observations10m: metrics.observations10m,
+    volumeAccelConfidence: metrics.volumeAcceleration.confidence,
+    agreeingProviders: 1,
+  });
+  const buySellConf = assessBuySellConfidence({
+    buys5m: market.buys_5m,
+    sells5m: market.sells_5m,
+    buys1h: market.buys_1h,
+    sells1h: market.sells_1h,
+    txCount5m: market.tx_count_5m,
+    snapshotAgeSec,
+    staleAfterSec: staleSec,
+  });
+  const ctx: StrategyContext = {
+    tokenId: token.id,
+    address: token.address,
+    symbol: token.symbol,
+    chain: token.chain,
+    ageMinutes: age.minutes,
+    priceUsd: market.price_usd,
+    liquidityUsd: market.liquidity_usd,
+    volume5mUsd: market.volume_5m_usd,
+    volume1hUsd: market.volume_1h_usd,
+    buyVolume5mUsd: market.buy_volume_5m_usd,
+    sellVolume5mUsd: market.sell_volume_5m_usd,
+    txCount5m: market.tx_count_5m,
+    priceChange5mPct: market.price_change_5m_pct,
+    priceChange1hPct: market.price_change_1h_pct,
+    holderCount: holders?.holder_count ?? null,
+    topHolderPct: holders?.top_holder_pct ?? null,
+    observedAt: market.observed_at,
+    priorVolume5mUsd: prevWindow?.volume5mUsd ?? null,
+    flow,
+    safety,
+    regime: latestRegime ?? undefined,
+    phase: phase.phase,
+    buySellConfidence: buySellConf.level,
+    discoverySource: token.discovery_source ?? undefined,
+    volumeAccel: metrics.volumeAcceleration,
+    liquidityStatus: market.liquidity_status,
+  };
+  return { ctx, holders, age, metrics, flow, safety, phase, dataConf, buySellConf };
+}
+
+/**
  * Signal pipeline over the evaluation budget:
  * market data → basic quality → safety → strategy → data confidence → EV (actual size).
  * Every stage is counted in a funnel snapshot so zero trades is explainable.
@@ -815,38 +943,12 @@ async function jobSignals(): Promise<void> {
       continue;
     }
 
-    const holders = await getLatestHolders(token.id);
-    const age = tokenAgeOf(token, now);
-    const hist = (history.get(token.id) ?? []).map(toMetricSnapshot);
-    const current: MetricSnapshot = {
-      observedAt: market.observed_at,
-      volume5mUsd: market.volume_5m_usd,
-      volume1hUsd: market.volume_1h_usd,
-      volume24hUsd: market.volume_24h_usd,
-      txCount5m: market.tx_count_5m,
-      buys5m: market.buys_5m,
-      sells5m: market.sells_5m,
-      buys24h: market.buys_24h,
-      sells24h: market.sells_24h,
-    };
-    const metrics = computeMarketMetrics({
-      current,
-      history: hist,
-      ageMinutes: age.minutes,
-      config: { minBaselineUsd: env.VOLUME_ACCEL_MIN_BASELINE_USD, maxAccel: env.VOLUME_ACCEL_MAX },
-    });
-    const prevWindow = previousCompletedWindow(
-      hist.filter((s) => s.observedAt.getTime() < current.observedAt.getTime()),
-      current,
+    const { ctx, holders, age, metrics, safety, phase, dataConf, buySellConf } = await buildStrategyContext(
+      token,
+      market,
+      history.get(token.id) ?? [],
+      now,
     );
-    const ticks = approximateTradesFromSnapshot({
-      buyVolume5mUsd: market.buy_volume_5m_usd,
-      sellVolume5mUsd: market.sell_volume_5m_usd,
-      txCount5m: market.tx_count_5m,
-      priceUsd: market.price_usd,
-      observedAt: market.observed_at,
-    });
-    const flow = computeFlowFeatures(ticks);
     const quote = quoteFromMarket(market);
 
     // Reference size for EV/shadows: the tier-sized amount before EV tier and portfolio
@@ -854,7 +956,6 @@ async function jobSignals(): Promise<void> {
     const absChange5m = Math.abs(market.price_change_5m_pct);
     const sizeAt = (conf: ConfidenceLevel) => referenceSizeUsd(riskCfg, conf, absChange5m, regimeMult);
 
-    const safety = (await latestSafety(token.id)) ?? assessSafety(safetyInputFor(token, market, holders));
     const shadowSim = {
       quote,
       gas,
@@ -912,21 +1013,6 @@ async function jobSignals(): Promise<void> {
     }
     funnel.stage('safetyPassed');
 
-    const phase = detectTokenPhase({
-      ageMinutes: age.minutes,
-      priceChange2mPct: market.price_change_5m_pct,
-      priceChange5mPct: market.price_change_5m_pct,
-      priceChange1hPct: market.price_change_1h_pct,
-      volumeAcceleration: metrics.volumeAcceleration.capped,
-      liquidityUsd: market.liquidity_usd,
-      liquidityChangePct: null,
-      uniqueBuyers5m: flow['5m']?.uniqueBuyers.value ?? null,
-      uniqueSellers5m: flow['5m']?.uniqueSellers.value ?? null,
-      netFlow5mUsd: flow['5m']?.netFlowUsd.value ?? null,
-      holderGrowthPct: null,
-      largeWalletSellPct: null,
-      volatility5mPct: Math.abs(market.price_change_5m_pct),
-    });
     if (
       researchWritesAllowed() &&
       !phaseWrites.recent(token.id, phase.phase, env.DECISION_AUDIT_DEDUPE_MINUTES * 60_000)
@@ -937,60 +1023,6 @@ async function jobSignals(): Promise<void> {
         [token.id, phase.phase, JSON.stringify(phase.reasons), dataMode],
       ).catch((err) => logger.warn({ err: (err as Error).message }, 'token_phases write failed'));
     }
-
-    const dataConf = assessDataConfidence({
-      liquidityStatus: market.liquidity_status,
-      liquidityUsd: market.liquidity_usd,
-      snapshotAgeSec,
-      staleAfterSec: staleSec,
-      volume5mUsd: market.volume_5m_usd,
-      volume1hUsd: market.volume_1h_usd,
-      txCount5m: market.tx_count_5m,
-      buys5m: market.buys_5m,
-      sells5m: market.sells_5m,
-      ageSource: age.source,
-      observations10m: metrics.observations10m,
-      volumeAccelConfidence: metrics.volumeAcceleration.confidence,
-      agreeingProviders: 1,
-    });
-    const buySellConf = assessBuySellConfidence({
-      buys5m: market.buys_5m,
-      sells5m: market.sells_5m,
-      buys1h: market.buys_1h,
-      sells1h: market.sells_1h,
-      txCount5m: market.tx_count_5m,
-      snapshotAgeSec,
-      staleAfterSec: staleSec,
-    });
-
-    const ctx: StrategyContext = {
-      tokenId: token.id,
-      address: token.address,
-      symbol: token.symbol,
-      chain: token.chain,
-      ageMinutes: age.minutes,
-      priceUsd: market.price_usd,
-      liquidityUsd: market.liquidity_usd,
-      volume5mUsd: market.volume_5m_usd,
-      volume1hUsd: market.volume_1h_usd,
-      buyVolume5mUsd: market.buy_volume_5m_usd,
-      sellVolume5mUsd: market.sell_volume_5m_usd,
-      txCount5m: market.tx_count_5m,
-      priceChange5mPct: market.price_change_5m_pct,
-      priceChange1hPct: market.price_change_1h_pct,
-      holderCount: holders?.holder_count ?? null,
-      topHolderPct: holders?.top_holder_pct ?? null,
-      observedAt: market.observed_at,
-      priorVolume5mUsd: prevWindow?.volume5mUsd ?? null,
-      flow,
-      safety,
-      regime: latestRegime ?? undefined,
-      phase: phase.phase,
-      buySellConfidence: buySellConf.level,
-      discoverySource: token.discovery_source ?? undefined,
-      volumeAccel: metrics.volumeAcceleration,
-      liquidityStatus: market.liquidity_status,
-    };
 
     const { all } = evaluateAllStrategies(strategies, ctx, strategyParams);
     const rejections = all.filter((s) => s.action === 'NO_TRADE');
@@ -1331,7 +1363,7 @@ function signalFromStored(row: {
   };
 }
 
-async function executeLane(
+export async function executeLane(
   portfolioId: string,
   lane: SignalLane,
   botStatus: string,
@@ -1361,11 +1393,13 @@ async function executeLane(
     data_confidence: ConfidenceLevel | null;
     market_state: Record<string, unknown> | null;
     created_at: Date;
+    token_address: string | null;
   }>(
     `SELECT s.id, s.token_id, s.overall_score, s.confidence, s.expected_value,
             s.strategy_name AS strategy_id, s.strategy_version, s.data_confidence,
-            s.market_state, s.created_at
+            s.market_state, s.created_at, t.address AS token_address
      FROM signals s
+     LEFT JOIN tokens t ON t.id = s.token_id
      WHERE s.data_mode = $1
        AND s.side = 'BUY'
        AND s.lane = $3
@@ -1375,6 +1409,10 @@ async function executeLane(
        )
        AND NOT EXISTS (
          SELECT 1 FROM positions p WHERE p.token_id = s.token_id AND p.portfolio_id = $2 AND p.status = 'OPEN'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM signal_execution_attempts a
+         WHERE a.signal_id = s.id AND a.portfolio_id = $2 AND a.status = 'STRATEGY_INVALIDATED'
        )
      ORDER BY COALESCE(s.confidence, s.overall_score) DESC
      LIMIT 5`,
@@ -1439,7 +1477,23 @@ async function executeLane(
 
     const market = await getLatestMarketByToken(signal.token_id);
     if (!market) continue;
+    // Production BUYs are re-checked against their own strategy at execution time.
+    const attemptId =
+      lane === 'PRODUCTION'
+        ? await beginExecutionAttempt({
+            portfolioId,
+            signalId: signal.id,
+            tokenId: signal.token_id,
+            tokenAddress: signal.token_address,
+            strategyId: signal.strategy_id,
+            lane,
+            signalCreatedAt: signal.created_at,
+            marketObservedAt: market.observed_at,
+            status: 'PENDING',
+          })
+        : null;
     if (market.stale || Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs()) {
+      if (attemptId) await updateExecutionAttempt(attemptId, { status: 'STALE_DATA', statusReason: 'market_snapshot_stale' });
       funnel.reject('staleData');
       await logBotEvent({
         portfolioId,
@@ -1457,11 +1511,76 @@ async function executeLane(
       continue;
     }
     if (market.liquidity_status !== 'KNOWN' || market.liquidity_usd <= 0) {
+      if (attemptId) {
+        await updateExecutionAttempt(attemptId, { status: 'UNKNOWN_LIQUIDITY', statusReason: market.liquidity_status });
+      }
       funnel.reject('unknownLiquidity');
       continue;
     }
     const quote = quoteFromMarket(market);
     const quoteAgeMs = Date.now() - market.observed_at.getTime();
+
+    let revalidation: Record<string, unknown> | null = null;
+    if (attemptId) {
+      const now = new Date();
+      const token = await getTrackedToken(signal.token_id);
+      const built = token
+        ? await buildStrategyContext(token, market, (await getSnapshotHistory([token.id], now)).get(token.id) ?? [], now)
+        : null;
+      const reval: StrategyRevalidation = built
+        ? revalidateSignalStrategy({
+            strategyId: signal.strategy_id,
+            catalog: strategyCatalog,
+            activeIds: settings.activeStrategyIds,
+            params: resolveStrategyParams(settings.strategyParams),
+            ctx: built.ctx,
+          })
+        : { passed: false, reason: 'token_missing', reasons: ['token_missing'], sharedRejection: null, confidence: null, signal: null };
+      const features = built ? revalidationFeatures(built.ctx) : {};
+      const signalAgeMs = now.getTime() - signal.created_at.getTime();
+      await recordRevalidation(attemptId, reval, features);
+      await auditStrategyRevalidation({
+        tokenId: signal.token_id,
+        portfolioId,
+        passed: reval.passed,
+        strategyId: signal.strategy_id,
+        signalId: signal.id,
+        signalAgeMs,
+        reasons: reval.reasons,
+        sharedRejection: reval.sharedRejection,
+        confidence: reval.confidence,
+        features,
+      }).catch(() => undefined);
+      if (!reval.passed) {
+        funnel.reject('strategyFailed');
+        funnel.details.strategyInvalidated = Number(funnel.details.strategyInvalidated ?? 0) + 1;
+        await auditFinalOutcome({
+          tokenId: signal.token_id,
+          portfolioId,
+          traded: false,
+          reasonCode: 'SIGNAL_INVALIDATED',
+          details: { reason: reval.reason, reasons: reval.reasons, signalAgeMs, lane },
+          strategyId: signal.strategy_id,
+          signalId: signal.id,
+        }).catch(() => undefined);
+        await logBotEvent({
+          portfolioId,
+          level: 'info',
+          category: 'execution',
+          message: `Signal invalidated at execution: ${signal.strategy_id} no longer passes (${reval.reason})`,
+          details: { tokenId: signal.token_id, signalId: signal.id, signalAgeMs, reasons: reval.reasons, lane },
+        });
+        continue;
+      }
+      revalidation = {
+        result: 'PASS',
+        at: now.toISOString(),
+        signalAgeMs,
+        confidence: reval.confidence,
+        reasons: reval.reasons,
+        features,
+      };
+    }
 
     const risk = evaluateRisk({
       equityUsd: latest.equityUsd,
@@ -1549,6 +1668,21 @@ async function executeLane(
       ...exec,
     };
 
+    if (attemptId) {
+      const rejected = assessment.decision === 'REJECTED';
+      await updateExecutionAttempt(attemptId, {
+        status: !rejected
+          ? 'PENDING'
+          : assessment.rejectionReason === 'maxOpenPositions'
+            ? 'CAPACITY_BLOCKED'
+            : 'RISK_REJECTED',
+        statusReason: rejected ? (assessment.rejectionReason ?? 'minimumPositionSize') : null,
+        riskDecisionId,
+        riskResult: rejected ? 'FAIL' : 'PASS',
+        riskReason: rejected ? (assessment.rejectionReason ?? 'minimumPositionSize') : assessment.decision,
+      });
+    }
+
     if (assessment.decision === 'REJECTED') {
       funnel.stage('riskRejected');
       funnel.reject('riskFailed');
@@ -1599,6 +1733,21 @@ async function executeLane(
     }
     funnel.stage(assessment.decision === 'RESIZED' ? 'riskResized' : 'riskSized');
     funnel.riskSample(assessment, signal.strategy_id);
+    await auditRiskDecision({
+      tokenId: signal.token_id,
+      portfolioId,
+      rejected: false,
+      actual: {
+        decision: assessment.decision,
+        openPositions: latest.openPositions,
+        finalSizeUsd: assessment.finalSizeUsd,
+        bindingConstraint: assessment.bindingConstraint,
+      },
+      required: { maxOpenPositions: riskCfg.maxOpenPositions, minSizeUsd: riskCfg.minSizeUsd },
+      strategyId: signal.strategy_id,
+      signalId: signal.id,
+      riskDecisionId,
+    }).catch(() => undefined);
 
     const amountUsd = assessment.finalSizeUsd;
     const finalCost = assessment.cost ?? costAt(amountUsd);
@@ -1621,6 +1770,9 @@ async function executeLane(
     if (!evOk) {
       funnel.reject('evFailed');
       await markRiskExecution(riskDecisionId, 'EV_FAILED_AT_FINAL_SIZE', finalEv.reasons.join(','));
+      if (attemptId) {
+        await updateExecutionAttempt(attemptId, { status: 'EV_FAILED', statusReason: finalEv.reasons.join(',') || null });
+      }
       await openShadowTrade({
         portfolioId,
         tokenId: signal.token_id,
@@ -1685,17 +1837,29 @@ async function executeLane(
         maxPlannedLossUsd: assessment.maximumPlannedLossUsd,
         expectedNetValue: finalEv.expectedNetValue,
       },
-      entrySnapshot: buildEntrySnapshot({
-        signalMarketState: signal.market_state,
-        signalAt: signal.created_at,
-        signalOverallScore: Number(signal.overall_score),
-        market,
-        quoteAgeMs,
-        regime: latestRegime,
-        dataConfidence: signal.data_confidence,
-        maxHoldSec: settings.maxHoldingTimeSec,
-      }),
+      entrySnapshot: {
+        ...buildEntrySnapshot({
+          signalMarketState: signal.market_state,
+          signalAt: signal.created_at,
+          signalOverallScore: Number(signal.overall_score),
+          market,
+          quoteAgeMs,
+          regime: latestRegime,
+          dataConfidence: signal.data_confidence,
+          maxHoldSec: settings.maxHoldingTimeSec,
+        }),
+        ...(revalidation ? { strategyRevalidation: revalidation } : {}),
+      },
     });
+
+    if (attemptId) {
+      await updateExecutionAttempt(attemptId, {
+        status: result.success && result.orderId ? 'EXECUTED' : result.limitBlocked ? 'CAPACITY_BLOCKED' : 'EXECUTION_FAILED',
+        statusReason: result.success ? null : (result.limitBlocked ?? result.reason ?? null),
+        orderId: result.orderId ?? null,
+        positionId: result.positionId ?? null,
+      });
+    }
 
     if (result.limitBlocked) {
       funnel.reject('riskFailed');
@@ -1723,6 +1887,9 @@ async function executeLane(
         traded: false,
         reasonCode: result.limitBlocked === 'maxOpenPositions' ? 'MAX_OPEN_POSITIONS' : 'INSUFFICIENT_CAPACITY',
         details: { limitBlocked: result.limitBlocked },
+        strategyId: signal.strategy_id,
+        signalId: signal.id,
+        riskDecisionId,
       }).catch(() => undefined);
     } else if (result.success && result.orderId) {
       await markRiskExecution(riskDecisionId, 'EXECUTED', null, result.positionId ?? null);
@@ -1731,7 +1898,16 @@ async function executeLane(
         portfolioId,
         traded: true,
         reasonCode: 'TRADED',
-        details: { orderId: result.orderId, positionId: result.positionId, lane },
+        details: {
+          orderId: result.orderId,
+          positionId: result.positionId,
+          lane,
+          signalAgeMs: Date.now() - signal.created_at.getTime(),
+          strategyRevalidatedAt: revalidation?.at ?? null,
+        },
+        strategyId: signal.strategy_id,
+        signalId: signal.id,
+        riskDecisionId,
       }).catch(() => undefined);
       funnel.stage('executed');
       await query(

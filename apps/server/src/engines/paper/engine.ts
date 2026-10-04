@@ -77,6 +77,21 @@ export async function executePaperBuy(opts: {
         return { success: false, reason: 'Duplicate open position for token (blocked)' };
       }
 
+      // A signal is executed at most once and never after execution-time invalidation.
+      if (opts.signalId) {
+        const used = await client.query(
+          `SELECT 1 FROM paper_orders WHERE portfolio_id = $1 AND signal_id = $2 AND side = 'BUY'
+           UNION ALL
+           SELECT 1 FROM signal_execution_attempts
+           WHERE portfolio_id = $1 AND signal_id = $2 AND status = 'STRATEGY_INVALIDATED'
+           LIMIT 1`,
+          [opts.portfolioId, opts.signalId],
+        );
+        if (used.rows.length > 0) {
+          return { success: false, reason: 'Signal already executed or invalidated (blocked)' };
+        }
+      }
+
       if (opts.risk) {
         const r = opts.risk;
         const agg = await client.query<{ n: string; exposure: string; strategy_exposure: string }>(

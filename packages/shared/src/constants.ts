@@ -165,6 +165,8 @@ export const DECISION_REASON_CODES = [
   // Position capacity
   'MAX_OPEN_POSITIONS',
   'INSUFFICIENT_CAPACITY',
+  // Execution-time strategy revalidation
+  'SIGNAL_INVALIDATED',
   // Outcomes
   'TRADED',
   'NOT_TRADED',
@@ -178,6 +180,7 @@ export const DECISION_STAGES = [
   'TRACKED',
   'ELIGIBILITY',
   'SIGNAL',
+  'STRATEGY_REVALIDATION',
   'RISK_GATE',
   'POSITION_CAPACITY',
   'FINAL_OUTCOME',

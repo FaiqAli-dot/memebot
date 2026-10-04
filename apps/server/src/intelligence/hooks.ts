@@ -281,6 +281,9 @@ export async function auditFinalOutcome(opts: {
   traded: boolean;
   reasonCode?: DecisionReasonCode | string | null;
   details?: Record<string, unknown>;
+  strategyId?: string | null;
+  signalId?: string | null;
+  riskDecisionId?: string | null;
 }): Promise<string> {
   return recordDecisionAudit({
     tokenId: opts.tokenId,
@@ -289,6 +292,43 @@ export async function auditFinalOutcome(opts: {
     result: opts.traded ? 'TRADED' : 'NOT_TRADED',
     reasonCode: opts.reasonCode ?? (opts.traded ? 'TRADED' : 'NOT_TRADED'),
     details: opts.details,
+    strategyId: opts.strategyId,
+    signalId: opts.signalId,
+    riskDecisionId: opts.riskDecisionId,
+  });
+}
+
+/** Execution-time re-run of the signal's strategy against the current market. */
+export async function auditStrategyRevalidation(opts: {
+  tokenId: string;
+  portfolioId?: string | null;
+  passed: boolean;
+  strategyId: string | null;
+  signalId: string;
+  signalAgeMs: number;
+  reasons: string[];
+  sharedRejection?: string | null;
+  confidence?: number | null;
+  features?: Record<string, unknown>;
+}): Promise<string> {
+  const reasonCode: DecisionReasonCode | null = opts.passed
+    ? null
+    : opts.sharedRejection
+      ? mapSharedRejection(opts.sharedRejection)
+      : opts.reasons[0]
+        ? mapStrategyReason(opts.reasons[0])
+        : 'SIGNAL_INVALIDATED';
+  return recordDecisionAudit({
+    tokenId: opts.tokenId,
+    portfolioId: opts.portfolioId,
+    stage: 'STRATEGY_REVALIDATION',
+    result: opts.passed ? 'PASS' : 'FAIL',
+    reasonCode,
+    actualValues: { confidence: opts.confidence ?? null, reasons: opts.reasons },
+    details: { signalAgeMs: opts.signalAgeMs, sharedRejection: opts.sharedRejection ?? null },
+    features: opts.passed ? undefined : opts.features,
+    strategyId: opts.strategyId,
+    signalId: opts.signalId,
   });
 }
 

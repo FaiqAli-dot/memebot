@@ -13,6 +13,7 @@ export const CRITICAL_TABLES = [
   'fee_records',
   'signals',
   'risk_decisions',
+  'signal_execution_attempts',
   'portfolio_snapshots',
   'strategy_runs',
   'trade_observations',

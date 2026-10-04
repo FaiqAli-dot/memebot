@@ -17,6 +17,12 @@ import { researchWritesAllowed } from '../db/storage-guard.js';
 const HIGH_FREQUENCY_STAGES = new Set(['DISCOVERED', 'NORMALIZED', 'TRACKED', 'ELIGIBILITY', 'SIGNAL']);
 /** Rejections re-evaluated every tick while a slot is full; deduped but always recorded once. */
 const REPEATING_REJECTION_STAGES = new Set(['RISK_GATE', 'POSITION_CAPACITY']);
+/**
+ * Re-run on every execution tick for a live signal. With a signal id, each distinct
+ * result + reason is recorded once per signal (PASS included), so rows stay bounded by the
+ * number of outcomes, not the number of ticks.
+ */
+const EXECUTION_STAGES = new Set(['STRATEGY_REVALIDATION', 'RISK_GATE', 'POSITION_CAPACITY']);
 const auditDedupe = new WriteDedupe<string>();
 const discoveryDedupe = new WriteDedupe();
 
@@ -236,10 +242,13 @@ export async function recordDecisionAudit(opts: {
 }): Promise<string> {
   const stage = String(opts.stage);
   const highFrequency = HIGH_FREQUENCY_STAGES.has(stage);
+  const perSignal = EXECUTION_STAGES.has(stage) && !!opts.signalId;
   const deduped =
-    highFrequency || (opts.result === 'FAIL' && REPEATING_REJECTION_STAGES.has(stage));
-  const dedupeKey = `${opts.tokenId}|${opts.stage}|${opts.strategyId ?? ''}`;
+    highFrequency || perSignal || (opts.result === 'FAIL' && REPEATING_REJECTION_STAGES.has(stage));
   const signature = `${opts.result}|${opts.reasonCode ?? ''}`;
+  const dedupeKey = perSignal
+    ? `${opts.tokenId}|${stage}|${opts.signalId}|${signature}`
+    : `${opts.tokenId}|${opts.stage}|${opts.strategyId ?? ''}`;
   if (deduped) {
     const prev = auditDedupe.recent(dedupeKey, signature, env.DECISION_AUDIT_DEDUPE_MINUTES * 60_000);
     if (prev?.value) return prev.value;

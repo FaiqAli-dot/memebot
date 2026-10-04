@@ -108,6 +108,15 @@ export const api = {
     request<{ rows: Record<string, unknown>[]; total: number }>(`/api/intelligence/tokens${qs}`),
   intelligenceToken: (id: string) =>
     request<Record<string, unknown>>(`/api/intelligence/tokens/${id}`),
+  intelligenceSearch: (q: string) =>
+    request<{
+      query: string;
+      exactQuery: boolean;
+      matchType: string;
+      found: boolean;
+      message: string | null;
+      tokens: Array<Record<string, unknown> & { tokenId: string; matchedOn: string }>;
+    }>(`/api/intelligence/search?q=${encodeURIComponent(q)}`),
   intelligenceStorage: () => request<Record<string, unknown>>('/api/intelligence/storage'),
   intelligenceSources: () =>
     request<{ sources: Record<string, unknown>[] }>('/api/intelligence/sources'),

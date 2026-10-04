@@ -461,6 +461,15 @@ apiRouter.get('/intelligence/tokens', async (req, res, next) => {
   }
 });
 
+apiRouter.get('/intelligence/search', async (req, res, next) => {
+  try {
+    const { searchTokens } = await import('../../intelligence/query.js');
+    res.json(await searchTokens(typeof req.query.q === 'string' ? req.query.q : ''));
+  } catch (err) {
+    next(err);
+  }
+});
+
 apiRouter.get('/intelligence/tokens/:id', async (req, res, next) => {
   try {
     const { getIntelligenceTokenDetail } = await import('../../intelligence/query.js');

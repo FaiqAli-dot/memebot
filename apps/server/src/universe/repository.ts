@@ -63,6 +63,14 @@ export async function listEvaluationCandidates(staleAfterSec: number): Promise<T
   return rows;
 }
 
+export async function getTrackedToken(tokenId: string): Promise<TrackedTokenRow | null> {
+  const { rows } = await query<TrackedTokenRow>(
+    `SELECT ${TRACKED_COLUMNS} FROM tokens WHERE id = $1 AND data_mode = $2`,
+    [tokenId, dataMode],
+  );
+  return rows[0] ?? null;
+}
+
 export async function applyQuoteToToken(opts: {
   tokenId: string;
   observedAt: Date;

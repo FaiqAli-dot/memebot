@@ -26,7 +26,15 @@ export interface StrategyContext {
   liquidityUsd: number;
   volume5mUsd: number;
   volume1hUsd: number;
-  volume24hUsd: number;
+  /** Provider rolling 24h window; covers min(24h, token age) */
+  volume24hUsd?: number | null;
+  /** Provider rolling 1h/24h transaction counts (null when the provider omits them) */
+  buys1h?: number | null;
+  sells1h?: number | null;
+  buys24h?: number | null;
+  sells24h?: number | null;
+  /** Minutes since this system first observed the token (a lower bound on token age) */
+  observedSpanMinutes?: number | null;
   buyVolume5mUsd: number;
   sellVolume5mUsd: number;
   txCount5m: number;
@@ -104,6 +112,8 @@ export interface Strategy {
   readonly name: string;
   readonly version: string;
   readonly activeByDefault: boolean;
+  /** Research-lane only: never selected for the production lane, whatever activeStrategyIds says */
+  readonly researchOnly?: boolean;
   /** `params` are this strategy's resolved thresholds; omitted keys use registry defaults */
   evaluate(context: StrategyContext, params?: StrategyParamValues): Signal;
 }
@@ -141,8 +151,9 @@ export function buySignal(
   strategy: Pick<Strategy, 'id' | 'version'>,
   opts: {
     confidence: number;
-    expectedReturn: number;
-    expectedLoss: number;
+    /** null = no empirical estimate; EV is then unknown and can never pass */
+    expectedReturn: number | null;
+    expectedLoss: number | null;
     expectedHoldTimeSec: number;
     reasons: string[];
     scores?: Signal['scores'];

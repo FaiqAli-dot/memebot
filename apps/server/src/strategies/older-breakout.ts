@@ -1,36 +1,36 @@
 /**
- * Older-Breakout Research Strategy
+ * Older-Breakout research strategy: a token with an established trading history whose
+ * current 5m activity breaks well above its own prior-history regime, with momentum.
  *
- * Detects established tokens breaking out of their recent trading range with supporting activity.
- * RESEARCH ONLY - isolated from production lane.
- *
- * Key concepts:
- * - Relative behavior, not arbitrary absolute values
- * - Uses historical baseline for volume/activity comparisons
- * - Requires sufficient historical data (no hard age cutoff)
+ * RESEARCH ONLY. Eligibility is "enough prior history to measure a regime" (coverage and
+ * volume before the last hour), never a minimum token age. All thresholds come from the
+ * strategy parameter registry. No return/loss estimate is emitted until one can be fitted
+ * from research outcomes, so EV stays unknown rather than fabricated.
  */
-import { clamp, safeDiv } from '../utils/helpers.js';
+import { clamp } from '../utils/helpers.js';
+import { fmtRatio, historicalBaseline, insufficientHistory, ratioTo } from './historical-baseline.js';
 import {
   buySignal,
   liquidityIsKnown,
   noTrade,
   paramsFor,
   strategyVolumeAccel,
+  type Signal,
   type Strategy,
   type StrategyContext,
-  type Signal,
 } from './types.js';
+import type { StrategyParamValues } from '@memebot/shared';
 
 export class OlderBreakoutStrategy implements Strategy {
   readonly id = 'older-breakout';
   readonly name = 'Older Breakout (Research)';
-  readonly version = 'ob-r1';
-  readonly activeByDefault = false; // Only active in RESEARCH lane
+  readonly version = 'ob-r2';
+  readonly activeByDefault = false;
+  readonly researchOnly = true;
 
-  evaluate(ctx: StrategyContext, params?: Record<string, number>): Signal {
+  evaluate(ctx: StrategyContext, params?: StrategyParamValues): Signal {
     const p = paramsFor(this.id, params);
 
-    // Base gates - same as production
     if (ctx.safety?.blocked) {
       return noTrade(this, ['safety_blocked', ...(ctx.safety.reasons ?? [])], 'SAFETY_REJECTION');
     }
@@ -41,22 +41,25 @@ export class OlderBreakoutStrategy implements Strategy {
       return noTrade(this, ['liquidity_below_min'], 'LIQUIDITY_REJECTION');
     }
 
-    // Require sufficient historical data for baseline
-    // Check if we have enough market history to establish a baseline
-    const hasHistory = ctx.volume1hUsd > 0;
-    if (!hasHistory) {
-      return noTrade(this, ['insufficient_historical_data'], 'UNKNOWN', 0);
+    const base = historicalBaseline(ctx);
+    const missing = insufficientHistory(base, p);
+    if (missing) return noTrade(this, [missing], 'UNKNOWN');
+
+    if (ctx.volume5mUsd < p.minVolume5mUsd) {
+      return noTrade(this, ['volume_5m_below_min'], 'VOLUME_REJECTION', 10);
+    }
+    const volumeVsPrior = ratioTo(ctx.volume5mUsd, base.priorVolumePer5mUsd)!;
+    if (volumeVsPrior < p.minVolumeRelativeBaseline) {
+      return noTrade(this, [`volume_vs_prior_${fmtRatio(volumeVsPrior)}`], 'VOLUME_REJECTION', 15);
+    }
+    const txVsPrior = ratioTo(ctx.txCount5m, base.priorTxPer5m);
+    if (txVsPrior == null) {
+      return noTrade(this, ['history_tx_baseline_missing'], 'UNKNOWN', 15);
+    }
+    if (txVsPrior < p.minActivityAcceleration) {
+      return noTrade(this, [`activity_vs_prior_${fmtRatio(txVsPrior)}`], 'VOLUME_REJECTION', 15);
     }
 
-    // Volume relative to historical baseline
-    const volumeRatioTo1h = safeDiv(ctx.volume5mUsd, ctx.volume1hUsd / 12, 0); // 5m vs average 5m over 1h
-
-    // Use a hardcoded 2.0x baseline requirement for research
-    if (volumeRatioTo1h < 2.0) {
-      return noTrade(this, ['volume_below_historical_baseline'], 'VOLUME_REJECTION', 20);
-    }
-
-    // Volume acceleration (non-overlapping preferred)
     const accelInfo = strategyVolumeAccel(ctx);
     if (accelInfo.value == null) {
       return noTrade(this, ['accel_insufficient_data'], 'VOLUME_REJECTION', 15);
@@ -65,60 +68,38 @@ export class OlderBreakoutStrategy implements Strategy {
     if (accel < p.minVolumeAcceleration) {
       return noTrade(this, ['accel_insufficient'], 'VOLUME_REJECTION', 20);
     }
-
-    // Price breakout from recent range
-    // Use 5m change as breakout indicator
     if (ctx.priceChange5mPct < p.minPriceChange5mPct) {
       return noTrade(this, ['no_breakout_momentum'], 'MOMENTUM_REJECTION', 20);
     }
-
-    // Activity acceleration (transaction count)
     if (ctx.txCount5m < p.minActivityTx5m) {
-      return noTrade(this, ['activity_insufficient'], 'VOLUME_REJECTION', 15);
+      return noTrade(this, ['activity_low'], 'VOLUME_REJECTION', 20);
     }
 
-    // Data freshness check
-    const ageMinutes = ctx.ageMinutes;
-    if (ageMinutes != null && ageMinutes < p.minTokenAgeMinutes) {
-      return noTrade(this, ['token_too_young_for_older_strategy'], 'MOMENTUM_REJECTION', 10);
-    }
-
-    // Confidence calculation based on relative strength
-    // Higher confidence when:
-    // - Volume is much higher than baseline
-    // - Strong acceleration
-    // - Good liquidity
-    // - Strong price momentum
-    const volumeScore = clamp(Math.log10(volumeRatioTo1h + 1) * 30, 0, 100);
+    // Ranking score only (orders research signals); it feeds no EV or sizing.
+    const volumeScore = clamp(Math.log10(volumeVsPrior + 1) * 40, 0, 100);
+    const activityScore = clamp(Math.log10(txVsPrior + 1) * 40, 0, 100);
     const accelScore = clamp(accel * 20, 0, 100);
     const momentumScore = clamp(ctx.priceChange5mPct * 5, 0, 100);
-    const liquidityScore = clamp(Math.log10(ctx.liquidityUsd) * 8, 0, 100);
-
-    const confidence = clamp(
-      volumeScore * 0.35 +
-        accelScore * 0.25 +
-        momentumScore * 0.25 +
-        liquidityScore * 0.15,
-      0,
-      95,
-    );
+    const confidence = clamp(volumeScore * 0.3 + activityScore * 0.2 + accelScore * 0.25 + momentumScore * 0.25, 0, 95);
 
     return buySignal(this, {
       confidence,
-      expectedReturn: 0.15, // Placeholder - will be calibrated from research data
-      expectedLoss: 0.10, // Placeholder - will be calibrated from research data
-      expectedHoldTimeSec: 1800, // 30 minutes average hold for established tokens
+      expectedReturn: null,
+      expectedLoss: null,
+      expectedHoldTimeSec: 1800,
       reasons: [
-        `volume_ratio_1h_${volumeRatioTo1h.toFixed(2)}x`,
+        `history_${(base.priorMinutes / 60).toFixed(1)}h`,
+        `volume_vs_prior_${fmtRatio(volumeVsPrior)}`,
+        `activity_vs_prior_${fmtRatio(txVsPrior)}`,
         `accel_${accelInfo.label}`,
         `5m_change_${ctx.priceChange5mPct.toFixed(1)}%`,
       ],
       scores: {
         momentum: momentumScore,
-        liquidity: liquidityScore,
+        liquidity: 50,
         volume: volumeScore,
-        holderDistribution: 50, // Not primary for older tokens
-        risk: 40,
+        holderDistribution: 50,
+        risk: 50,
         overall: confidence,
       },
     });

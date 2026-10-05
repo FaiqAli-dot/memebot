@@ -21,6 +21,8 @@ import {
   evaluateAllStrategies,
 } from '../../src/strategies/catalog.js';
 import { MomentumBreakoutStrategy } from '../../src/strategies/momentum-breakout.js';
+import { OlderBreakoutStrategy } from '../../src/strategies/older-breakout.js';
+import { OlderRevivalStrategy } from '../../src/strategies/older-revival.js';
 import type { Strategy, StrategyContext } from '../../src/strategies/types.js';
 import {
   OUTCOME_FIELDS,
@@ -178,8 +180,50 @@ describe('Week-1: parameter usage', () => {
       [EVE]: new EarlyVolumeExpansionStrategy(),
       [LIQ]: new LiquidityExpansionStrategy(),
     };
+    const OB = 'older-breakout';
+    const OR = 'older-revival';
+    const byId: Record<string, Strategy> = {
+      ...strategies,
+      [OB]: new OlderBreakoutStrategy(),
+      [OR]: new OlderRevivalStrategy(),
+    };
+    // 12h of history: prior 11h averaged 500 USD / 10 tx per 5m; the last hour was quiet
+    const older: Partial<StrategyContext> = {
+      ageMinutes: 720,
+      volume1hUsd: 10_200,
+      volume24hUsd: 76_200,
+      buys1h: 50,
+      sells1h: 30,
+      buys24h: 800,
+      sells24h: 600,
+    };
     // A value that rejects `base` (or the given context) while the default accepts it
     const cases: Array<{ id: string; key: StrategyParamKey; value: number; ctx?: Partial<StrategyContext> }> = [
+      { id: OB, key: 'minLiquidityUsd', value: 40_000, ctx: older },
+      { id: OB, key: 'minVolume5mUsd', value: 9_000, ctx: older },
+      { id: OB, key: 'minVolumeAcceleration', value: 2.9, ctx: older },
+      { id: OB, key: 'minPriceChange5mPct', value: 6, ctx: older },
+      { id: OB, key: 'minActivityTx5m', value: 50, ctx: older },
+      { id: OB, key: 'minHistoryCoverageHours', value: 12, ctx: older },
+      { id: OB, key: 'minHistoryVolumeUsd', value: 70_000, ctx: older },
+      { id: OB, key: 'minVolumeRelativeBaseline', value: 17, ctx: older },
+      { id: OB, key: 'minActivityAcceleration', value: 5, ctx: older },
+      { id: OR, key: 'minLiquidityUsd', value: 40_000, ctx: older },
+      { id: OR, key: 'minVolume5mUsd', value: 9_000, ctx: older },
+      { id: OR, key: 'minVolumeAcceleration', value: 2.9, ctx: older },
+      { id: OR, key: 'minPriceChange5mPct', value: 6, ctx: older },
+      { id: OR, key: 'minBuySellRatio', value: 2.8, ctx: { ...older, buyVolume5mUsd: 5_000 } },
+      { id: OR, key: 'minHistoryCoverageHours', value: 12, ctx: older },
+      { id: OR, key: 'minHistoryVolumeUsd', value: 70_000, ctx: older },
+      { id: OR, key: 'maxDormancyActivityRatio', value: 0.35, ctx: older },
+      {
+        id: OR,
+        key: 'minRevivalVolumeRatio',
+        value: 25,
+        ctx: { ...older, volume5mUsd: 4_000, volume1hUsd: 6_200, volume24hUsd: 72_200, priorVolume5mUsd: 1_500 },
+      },
+      { id: OR, key: 'minVolumeRelativeBaseline', value: 17, ctx: older },
+      { id: OR, key: 'maxPriceChange1hPct', value: 8, ctx: older },
       { id: MOMENTUM, key: 'minLiquidityUsd', value: 40_000 },
       { id: MOMENTUM, key: 'minVolume5mUsd', value: 9_000 },
       { id: MOMENTUM, key: 'minVolumeAcceleration', value: 2.9 },
@@ -200,7 +244,7 @@ describe('Week-1: parameter usage', () => {
 
     for (const c of cases) {
       const ctx = { ...base, ...c.ctx };
-      const s = strategies[c.id]!;
+      const s = byId[c.id]!;
       expect(s.evaluate(ctx).action, `${c.id}.${c.key} default`).toBe('BUY');
       expect(s.evaluate(ctx, { [c.key]: c.value }).action, `${c.id}.${c.key}=${c.value}`).toBe('NO_TRADE');
     }

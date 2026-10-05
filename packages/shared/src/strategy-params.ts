@@ -29,16 +29,14 @@ export type StrategyParamKey =
   | 'maxTokenAgeMinutes'
   | 'minOverallScore'
   | 'maxTopHolderPct'
-  // Research strategy parameters (older-breakout)
+  // Older-token research strategies
+  | 'minHistoryCoverageHours'
+  | 'minHistoryVolumeUsd'
   | 'minVolumeRelativeBaseline'
   | 'minActivityAcceleration'
-  | 'referencePositionSizeUsd'
-  | 'maxPriceImpactPct'
-  // Research strategy parameters (older-revival)
   | 'maxDormancyActivityRatio'
   | 'minRevivalVolumeRatio'
-  | 'maxPriceChange1hPct'
-  | 'minLiquidityRetentionRatio';
+  | 'maxPriceChange1hPct';
 
 export interface StrategyParamDef {
   key: StrategyParamKey;
@@ -101,7 +99,10 @@ export const STRATEGY_PARAM_REGISTRY: Record<string, { name: string; params: Str
       P({ key: 'minVolumeAcceleration', label: 'Min volume acceleration', default: 1.5, min: 1.1, max: 5, minStep: 0.05, decimals: 2, direction: 'min', feature: 'volumeAcceleration', safety: false }),
       P({ key: 'minPriceChange5mPct', label: 'Min 5m price change (%)', default: 2.0, min: 0.5, max: 15, minStep: 0.1, decimals: 2, direction: 'min', feature: 'priceChange5mPct', safety: false }),
       P({ key: 'minActivityTx5m', label: 'Min tx per 5m', default: 20, min: 5, max: 200, minStep: 1, decimals: 0, direction: 'min', feature: 'txCount5m', safety: false }),
-      P({ key: 'minTokenAgeMinutes', label: 'Min token age (min)', default: 30, min: 10, max: 1440, minStep: 5, decimals: 0, direction: 'min', feature: 'ageMinutes', safety: false }),
+      P({ key: 'minHistoryCoverageHours', label: 'Min prior history covered (h)', default: 6, min: 1, max: 23, minStep: 0.5, decimals: 1, direction: 'min', feature: null, safety: true }),
+      P({ key: 'minHistoryVolumeUsd', label: 'Min prior-history volume (USD)', default: 20_000, min: 1000, max: 5_000_000, minStep: 1000, decimals: 0, direction: 'min', feature: null, safety: true }),
+      P({ key: 'minVolumeRelativeBaseline', label: 'Min 5m volume vs prior baseline (x)', default: 3, min: 1.2, max: 20, minStep: 0.1, decimals: 2, direction: 'min', feature: null, safety: false }),
+      P({ key: 'minActivityAcceleration', label: 'Min 5m tx vs prior baseline (x)', default: 2, min: 1.1, max: 20, minStep: 0.1, decimals: 2, direction: 'min', feature: null, safety: false }),
     ],
   },
   'older-revival': {
@@ -112,7 +113,12 @@ export const STRATEGY_PARAM_REGISTRY: Record<string, { name: string; params: Str
       P({ key: 'minVolumeAcceleration', label: 'Min volume acceleration', default: 1.8, min: 1.2, max: 6, minStep: 0.05, decimals: 2, direction: 'min', feature: 'volumeAcceleration', safety: false }),
       P({ key: 'minPriceChange5mPct', label: 'Min 5m price change (%)', default: 1.5, min: 0.3, max: 12, minStep: 0.1, decimals: 2, direction: 'min', feature: 'priceChange5mPct', safety: false }),
       P({ key: 'minBuySellRatio', label: 'Min buy/sell ratio', default: 1.2, min: 1.0, max: 3.0, minStep: 0.05, decimals: 2, direction: 'min', feature: 'buySellRatio', safety: false }),
-      P({ key: 'minTokenAgeMinutes', label: 'Min token age (min)', default: 60, min: 20, max: 2880, minStep: 10, decimals: 0, direction: 'min', feature: 'ageMinutes', safety: false }),
+      P({ key: 'minHistoryCoverageHours', label: 'Min prior history covered (h)', default: 6, min: 1, max: 23, minStep: 0.5, decimals: 1, direction: 'min', feature: null, safety: true }),
+      P({ key: 'minHistoryVolumeUsd', label: 'Min prior-history volume (USD)', default: 20_000, min: 1000, max: 5_000_000, minStep: 1000, decimals: 0, direction: 'min', feature: null, safety: true }),
+      P({ key: 'maxDormancyActivityRatio', label: 'Max last-hour vs prior activity (x)', default: 0.5, min: 0.05, max: 1, minStep: 0.05, decimals: 2, direction: 'max', feature: null, safety: false }),
+      P({ key: 'minRevivalVolumeRatio', label: 'Min 5m volume vs last hour (x)', default: 3, min: 1.2, max: 30, minStep: 0.1, decimals: 2, direction: 'min', feature: null, safety: false }),
+      P({ key: 'minVolumeRelativeBaseline', label: 'Min 5m volume vs prior baseline (x)', default: 1.5, min: 1, max: 20, minStep: 0.1, decimals: 2, direction: 'min', feature: null, safety: false }),
+      P({ key: 'maxPriceChange1hPct', label: 'Max 1h price change (%)', default: 30, min: 5, max: 200, minStep: 1, decimals: 1, direction: 'max', feature: null, safety: false }),
     ],
   },
 };

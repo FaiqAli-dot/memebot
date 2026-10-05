@@ -259,14 +259,20 @@ export function createStrategyCatalog(): Strategy[] {
   ];
 }
 
+/** Production-lane strategies. Research-only strategies are never selected, even if listed. */
 export function activeStrategies(
   catalog: Strategy[],
   activeIds?: string[],
 ): Strategy[] {
+  const eligible = catalog.filter((s) => !s.researchOnly);
   if (activeIds?.length) {
-    return catalog.filter((s) => activeIds.includes(s.id));
+    return eligible.filter((s) => activeIds.includes(s.id));
   }
-  return catalog.filter((s) => s.activeByDefault);
+  return eligible.filter((s) => s.activeByDefault);
+}
+
+export function researchOnlyStrategies(catalog: Strategy[]): Strategy[] {
+  return catalog.filter((s) => s.researchOnly);
 }
 
 /**

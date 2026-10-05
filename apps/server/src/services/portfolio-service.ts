@@ -8,6 +8,8 @@ import { query, withTransaction } from '../db/client.js';
 import { env, dataMode } from '../config/env.js';
 import { defaultPortfolioSettings, normalizeSettings } from '../engines/risk/engine.js';
 import { RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
+// Older token research portfolio ID - defined in constants.ts
+const OLDER_TOKEN_RESEARCH_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000003';
 
 export async function ensureDefaultPortfolio(): Promise<string> {
   const id = env.DEFAULT_PORTFOLIO_ID;
@@ -56,6 +58,31 @@ export async function ensureResearchPortfolio(): Promise<string> {
     [
       id,
       'Research Paper (exploration — not production)',
+      dataMode,
+      env.INITIAL_BALANCE_USD,
+      JSON.stringify(defaultPortfolioSettings()),
+    ],
+  );
+  return id;
+}
+
+/**
+ * Separate OLDER-TOKEN RESEARCH paper portfolio for established/older token momentum.
+ * Its trades never appear in production statistics (all stats are portfolio-scoped).
+ */
+export async function ensureOlderTokenResearchPortfolio(): Promise<string> {
+  const id = OLDER_TOKEN_RESEARCH_PORTFOLIO_ID;
+  const existing = await query(`SELECT id FROM user_portfolios WHERE id = $1`, [id]);
+  if (existing.rows.length > 0) return id;
+  await query(
+    `INSERT INTO user_portfolios (
+      id, name, data_mode, starting_balance_usd, cash_usd, peak_equity_usd,
+      bot_status, settings, portfolio_type
+    ) VALUES ($1, $2, $3, $4, $4, $4, 'RUNNING', $5, 'RESEARCH')
+    ON CONFLICT (id) DO NOTHING`,
+    [
+      id,
+      'Older-Token Research (established token momentum — not production)',
       dataMode,
       env.INITIAL_BALANCE_USD,
       JSON.stringify(defaultPortfolioSettings()),

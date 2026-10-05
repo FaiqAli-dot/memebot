@@ -26,6 +26,7 @@ export interface StrategyContext {
   liquidityUsd: number;
   volume5mUsd: number;
   volume1hUsd: number;
+  volume24hUsd: number;
   buyVolume5mUsd: number;
   sellVolume5mUsd: number;
   txCount5m: number;

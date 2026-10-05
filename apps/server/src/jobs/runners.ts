@@ -21,6 +21,7 @@ import {
 import {
   ensureDefaultPortfolio,
   ensureResearchPortfolio,
+  ensureOlderTokenResearchPortfolio,
   getPortfolio,
   getPortfolioSettings,
   setRiskState,
@@ -151,7 +152,7 @@ import type {
   RejectionReason,
   SignalLane,
 } from '@memebot/shared';
-import { resolveStrategyParams } from '@memebot/shared';
+import { resolveStrategyParams, RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
 
 const providers = createProviders();
 const discovery = createDiscoveryProviders(dataMode);
@@ -833,6 +834,7 @@ async function buildStrategyContext(
     liquidityUsd: market.liquidity_usd,
     volume5mUsd: market.volume_5m_usd,
     volume1hUsd: market.volume_1h_usd,
+    volume24hUsd: market.volume_24h_usd,
     buyVolume5mUsd: market.buy_volume_5m_usd,
     sellVolume5mUsd: market.sell_volume_5m_usd,
     txCount5m: market.tx_count_5m,
@@ -862,6 +864,7 @@ async function buildStrategyContext(
 async function jobSignals(): Promise<void> {
   const portfolioId = await ensureDefaultPortfolio();
   const researchId = env.RESEARCH_EXPLORATION_ENABLED ? await ensureResearchPortfolio() : null;
+  const olderTokenResearchId = env.OLDER_TOKEN_RESEARCH_ENABLED ? await ensureOlderTokenResearchPortfolio() : null;
   const now = new Date();
   const funnel = new FunnelRecorder();
   const evCalibrations = await getActiveEvCalibrations();
@@ -1308,6 +1311,196 @@ async function jobSignals(): Promise<void> {
     `UPDATE strategy_runs SET finished_at = NOW(), tokens_evaluated = $2, signals_generated = $3 WHERE id = $1`,
     [runId, tokens.length, generated],
   );
+
+  // Older-token research lane: separate evaluation for established/older tokens
+  if (olderTokenResearchId) {
+    await runOlderTokenResearchSignals(olderTokenResearchId, portfolioId, now, funnel);
+  }
+}
+
+/**
+ * Older-token research lane: evaluates older-breakout and older-revival strategies
+ * on tokens with sufficient historical data. Isolated from production decisions.
+ */
+async function runOlderTokenResearchSignals(
+  researchPortfolioId: string,
+  controlPortfolioId: string,
+  now: Date,
+  funnel: FunnelRecorder,
+): Promise<void> {
+  const settings = await getPortfolioSettings(researchPortfolioId);
+  const strategyParams = resolveStrategyParams(settings.strategyParams);
+
+  // Only older-token research strategies
+  const olderTokenStrategies = strategyCatalog.filter(
+    (s) => s.id === 'older-breakout' || s.id === 'older-revival',
+  );
+
+  // Use same evaluation candidates as production (tokens with fresh market data)
+  const candidates = await listEvaluationCandidates(env.TOKEN_STALE_AFTER_SEC);
+  const selected = selectForEvaluation(
+    candidates.map((c) => ({ ...c, activityScore: Number(c.activity_score), lastEvaluatedAt: c.last_evaluated_at })),
+    Math.min(env.TOKEN_EVALUATION_CAP_PER_TICK, 100), // Smaller budget for research
+    0.5, // More rotation for research
+  );
+  const tokens = selected.map((s) => s.item);
+
+  const history = await getSnapshotHistory(tokens.map((t) => t.id), now);
+  const gas = await providers.gasFee.getFeeEstimate();
+  const exec = execSettingsFrom(settings);
+  const knobs = getRealismKnobs(exec.profile);
+  const netLeg = networkFeePerLegUsd(gas, {
+    priorityFeeLamports: exec.priorityFeeLamports,
+    jitoTipLamports: exec.jitoTipLamports * knobs.jitoTipMult,
+  });
+  const exitParams = exitParamsFrom(settings);
+  const portfolio = await getPortfolio(researchPortfolioId);
+  const riskCfg = riskConfigFrom(settings, portfolio?.equityUsd ?? settings.startingBalanceUsd);
+  const staleSec = getStalePriceMaxAgeMs() / 1000;
+  const minEv = settings.minExpectedNetValue ?? env.MIN_EXPECTED_NET_VALUE;
+
+  let generated = 0;
+
+  for (const token of tokens) {
+    const market = await getLatestMarketByToken(token.id);
+    if (!market) continue;
+    const snapshotAgeSec = (now.getTime() - market.observed_at.getTime()) / 1000;
+    if (market.stale || snapshotAgeSec > staleSec) continue;
+    if (market.liquidity_status !== 'KNOWN') continue;
+
+    const { ctx, holders, age, metrics, safety, phase, dataConf, buySellConf } = await buildStrategyContext(
+      token,
+      market,
+      history.get(token.id) ?? [],
+      now,
+    );
+
+    // Safety check - same as production
+    if (safety.blocked) continue;
+
+    // Evaluate only older-token research strategies
+    const { all } = evaluateAllStrategies(olderTokenStrategies, ctx, strategyParams);
+    const buys = all.filter((s) => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
+
+    if (buys.length === 0) continue;
+
+    const best = buys[0]!;
+    const absChange5m = Math.abs(market.price_change_5m_pct);
+    const sizeAt = (conf: ConfidenceLevel) => referenceSizeUsd(riskCfg, conf, absChange5m, 1);
+    const proposedSizeUsd = sizeAt(dataConf.level);
+
+    const cost = estimateRoundTripCost({
+      positionSizeUsd: proposedSizeUsd,
+      liquidityUsd: market.liquidity_usd,
+      venue: market.venue,
+      feeBps: market.fee_bps,
+      absPriceChange5mPct: Math.abs(market.price_change_5m_pct),
+      networkFeePerLegUsd: netLeg,
+      adverseSelectionRatePerLeg: snapshotAgeSec > 2 ? 0.002 * knobs.adverseSelectionMult : 0,
+    });
+
+    const ev = estimateExpectedValue({
+      signal: best,
+      cost,
+      failureProbability: knobs.failureRate,
+      minExpectedNetValue: minEv,
+      dataConfidence: dataConf.level,
+      lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER,
+      calibration: null, // No calibration for research
+    });
+
+    // Research lane: allow small EV shortfall
+    const researchEv = ev.rawExpectedNetValue ?? ev.expectedNetValue;
+    const shortfall = researchEv != null ? ev.threshold - researchEv : null;
+    const researchEligible =
+      (ev.passes || (shortfall != null && shortfall <= env.OLDER_TOKEN_RESEARCH_MAX_EV_SHORTFALL)) &&
+      cost.networkFeePriced &&
+      dataConf.checks.filter((c) => c.critical).every((c) => c.ok);
+
+    if (!researchEligible) continue;
+
+    const scores = best.scores ?? {
+      momentum: best.confidence,
+      liquidity: 50,
+      volume: 50,
+      holderDistribution: 50,
+      risk: 50,
+      overall: best.confidence,
+    };
+
+    // Record signal with RESEARCH lane
+    const { rows } = await query<{ id: string }>(
+      `INSERT INTO signals (
+        token_id, strategy_name, strategy_version, side,
+        momentum_score, liquidity_score, volume_score, holder_score, risk_score, overall_score,
+        risk_label, explanation, market_state, data_mode,
+        action, confidence, expected_value, lane, position_size_usd, data_confidence
+      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16,'RESEARCH',$17,$18)
+      RETURNING id`,
+      [
+        token.id,
+        best.strategyId,
+        best.strategyVersion,
+        scores.momentum,
+        scores.liquidity,
+        scores.volume,
+        scores.holderDistribution,
+        scores.risk,
+        scores.overall,
+        best.riskLabel ?? 'MODERATE',
+        JSON.stringify({ reasons: best.reasons, warnings: [], factors: { ev }, lane: 'RESEARCH' }),
+        JSON.stringify({
+          ...ctx,
+          flow: undefined,
+          volumeAccel: metrics.volumeAcceleration,
+          safety: { score: safety.score, class: safety.safetyClass, reasons: safety.reasons },
+          phase: phase.phase,
+          regime: latestRegime,
+          dataConfidence: dataConf.level,
+          ageSource: age.source,
+          strategyParams: strategyParams[best.strategyId] ?? {},
+        }),
+        dataMode,
+        best.confidence,
+        JSON.stringify(ev),
+        proposedSizeUsd,
+        dataConf.level,
+      ],
+    );
+
+    generated++;
+
+    await logBotEvent({
+      portfolioId: researchPortfolioId,
+      level: 'info',
+      category: 'signal',
+      message: `Older-token research signal ${best.strategyId} for ${token.symbol}`,
+      details: {
+        signalId: rows[0]!.id,
+        lane: 'RESEARCH',
+        strategy: best.strategyId,
+        confidence: best.confidence,
+        expectedNetValue: ev.expectedNetValue,
+        threshold: ev.threshold,
+        disclaimer: 'Research only - not production',
+      },
+    });
+  }
+
+  await query(
+    `UPDATE strategy_runs SET finished_at = NOW(), tokens_evaluated = $2, signals_generated = $3 WHERE id = $1`,
+    [
+      (
+        await query<{ id: string }>(
+          `INSERT INTO strategy_runs (strategy_name, strategy_version, portfolio_id, data_mode, started_at)
+           VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
+          ['older-token-research', 'framework-v1', researchPortfolioId, dataMode],
+        )
+      ).rows[0]!.id,
+      tokens.length,
+      generated,
+    ],
+  );
 }
 
 async function jobPaperExecution(): Promise<void> {
@@ -1319,6 +1512,11 @@ async function jobPaperExecution(): Promise<void> {
     const researchId = await ensureResearchPortfolio();
     // Research follows the production bot status / kill switch
     await executeLane(researchId, 'RESEARCH', production.botStatus, productionId);
+  }
+  if (env.OLDER_TOKEN_RESEARCH_ENABLED) {
+    const olderTokenResearchId = await ensureOlderTokenResearchPortfolio();
+    // Older-token research follows the production bot status / kill switch
+    await executeLane(olderTokenResearchId, 'RESEARCH', production.botStatus, productionId);
   }
 }
 
@@ -1378,8 +1576,14 @@ export async function executeLane(
   if (botStatus === 'KILLED' || (await isKillSwitchActive(controlPortfolioId))) return;
   if (botStatus !== 'RUNNING') return;
 
-  if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= env.RESEARCH_MAX_TRADES_PER_DAY) {
-    return;
+  if (lane === 'RESEARCH') {
+    const tradesToday = await researchTradesToday(portfolioId);
+    const maxTrades = portfolioId === env.RESEARCH_PORTFOLIO_ID
+      ? env.RESEARCH_MAX_TRADES_PER_DAY
+      : env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY;
+    if (tradesToday >= maxTrades) {
+      return;
+    }
   }
 
   const { rows: signals } = await query<{

@@ -176,6 +176,7 @@ export function runDeterministicReplay(
         liquidityUsd: Number(p.liquidityUsd ?? 0),
         volume5mUsd: Number(p.volume5mUsd ?? 0),
         volume1hUsd: Number(p.volume1hUsd ?? 0),
+        volume24hUsd: Number(p.volume24hUsd ?? 0),
         buyVolume5mUsd: Number(p.buyVolume5mUsd ?? 0),
         sellVolume5mUsd: Number(p.sellVolume5mUsd ?? 0),
         txCount5m: Number(p.txCount5m ?? 0),

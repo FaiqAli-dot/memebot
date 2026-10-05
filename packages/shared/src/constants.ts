@@ -1,6 +1,8 @@
 export const DEFAULT_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000001';
 /** Separate paper portfolio for borderline research trades — never mixed into production stats. */
 export const RESEARCH_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000002';
+/** Separate paper portfolio for older-token momentum research — never mixed into production stats. */
+export const OLDER_TOKEN_RESEARCH_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000003';
 
 export const PORTFOLIO_TYPES = ['PRODUCTION', 'RESEARCH'] as const;
 export type PortfolioType = (typeof PORTFOLIO_TYPES)[number];

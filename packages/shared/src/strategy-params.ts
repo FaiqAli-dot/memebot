@@ -28,7 +28,17 @@ export type StrategyParamKey =
   | 'minTokenAgeMinutes'
   | 'maxTokenAgeMinutes'
   | 'minOverallScore'
-  | 'maxTopHolderPct';
+  | 'maxTopHolderPct'
+  // Research strategy parameters (older-breakout)
+  | 'minVolumeRelativeBaseline'
+  | 'minActivityAcceleration'
+  | 'referencePositionSizeUsd'
+  | 'maxPriceImpactPct'
+  // Research strategy parameters (older-revival)
+  | 'maxDormancyActivityRatio'
+  | 'minRevivalVolumeRatio'
+  | 'maxPriceChange1hPct'
+  | 'minLiquidityRetentionRatio';
 
 export interface StrategyParamDef {
   key: StrategyParamKey;
@@ -81,6 +91,28 @@ export const STRATEGY_PARAM_REGISTRY: Record<string, { name: string; params: Str
     params: [
       P({ key: 'minLiquidityUsd', label: 'Min liquidity (USD)', default: 10_000, min: 5000, max: 250_000, minStep: 500, decimals: 0, direction: 'min', feature: 'liquidityUsd', safety: true }),
       P({ key: 'minPriceChange5mPct', label: 'Min 5m price change (%)', default: 0.5, min: 0.2, max: 10, minStep: 0.1, decimals: 2, direction: 'min', feature: 'priceChange5mPct', safety: false }),
+    ],
+  },
+  'older-breakout': {
+    name: 'Older Breakout (Research)',
+    params: [
+      P({ key: 'minLiquidityUsd', label: 'Min liquidity (USD)', default: 8000, min: 3000, max: 200_000, minStep: 500, decimals: 0, direction: 'min', feature: 'liquidityUsd', safety: true }),
+      P({ key: 'minVolume5mUsd', label: 'Min 5m volume (USD)', default: 3000, min: 1000, max: 50_000, minStep: 100, decimals: 0, direction: 'min', feature: 'volume5mUsd', safety: false }),
+      P({ key: 'minVolumeAcceleration', label: 'Min volume acceleration', default: 1.5, min: 1.1, max: 5, minStep: 0.05, decimals: 2, direction: 'min', feature: 'volumeAcceleration', safety: false }),
+      P({ key: 'minPriceChange5mPct', label: 'Min 5m price change (%)', default: 2.0, min: 0.5, max: 15, minStep: 0.1, decimals: 2, direction: 'min', feature: 'priceChange5mPct', safety: false }),
+      P({ key: 'minActivityTx5m', label: 'Min tx per 5m', default: 20, min: 5, max: 200, minStep: 1, decimals: 0, direction: 'min', feature: 'txCount5m', safety: false }),
+      P({ key: 'minTokenAgeMinutes', label: 'Min token age (min)', default: 30, min: 10, max: 1440, minStep: 5, decimals: 0, direction: 'min', feature: 'ageMinutes', safety: false }),
+    ],
+  },
+  'older-revival': {
+    name: 'Older Revival (Research)',
+    params: [
+      P({ key: 'minLiquidityUsd', label: 'Min liquidity (USD)', default: 5000, min: 2000, max: 150_000, minStep: 500, decimals: 0, direction: 'min', feature: 'liquidityUsd', safety: true }),
+      P({ key: 'minVolume5mUsd', label: 'Min 5m volume (USD)', default: 2000, min: 500, max: 50_000, minStep: 100, decimals: 0, direction: 'min', feature: 'volume5mUsd', safety: false }),
+      P({ key: 'minVolumeAcceleration', label: 'Min volume acceleration', default: 1.8, min: 1.2, max: 6, minStep: 0.05, decimals: 2, direction: 'min', feature: 'volumeAcceleration', safety: false }),
+      P({ key: 'minPriceChange5mPct', label: 'Min 5m price change (%)', default: 1.5, min: 0.3, max: 12, minStep: 0.1, decimals: 2, direction: 'min', feature: 'priceChange5mPct', safety: false }),
+      P({ key: 'minBuySellRatio', label: 'Min buy/sell ratio', default: 1.2, min: 1.0, max: 3.0, minStep: 0.05, decimals: 2, direction: 'min', feature: 'buySellRatio', safety: false }),
+      P({ key: 'minTokenAgeMinutes', label: 'Min token age (min)', default: 60, min: 20, max: 2880, minStep: 10, decimals: 0, direction: 'min', feature: 'ageMinutes', safety: false }),
     ],
   },
 };

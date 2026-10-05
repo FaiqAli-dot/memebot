@@ -5,6 +5,7 @@ import { z } from 'zod';
 import {
   DEFAULT_PORTFOLIO_ID,
   INITIAL_BALANCE_USD,
+  RESEARCH_PORTFOLIO_ID,
   type DataMode,
   type RealismProfile,
 } from '@memebot/shared';
@@ -39,6 +40,7 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   TEST_DATABASE_URL: z.string().optional(),
   DEFAULT_PORTFOLIO_ID: z.string().uuid().default(DEFAULT_PORTFOLIO_ID),
+  RESEARCH_PORTFOLIO_ID: z.string().uuid().default(RESEARCH_PORTFOLIO_ID),
   INITIAL_BALANCE_USD: z.coerce.number().default(INITIAL_BALANCE_USD),
   JOB_TOKEN_DISCOVERY_INTERVAL_MS: z.coerce.number().default(15_000),
   JOB_MARKET_DATA_INTERVAL_MS: z.coerce.number().default(10_000),
@@ -144,6 +146,13 @@ const envSchema = z.object({
     .default('true'),
   RESEARCH_MAX_TRADES_PER_DAY: z.coerce.number().int().nonnegative().default(5),
   RESEARCH_MAX_EV_SHORTFALL: z.coerce.number().nonnegative().default(0.015),
+  // Older-token research lane (never mixed with production stats)
+  OLDER_TOKEN_RESEARCH_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('false'),
+  OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY: z.coerce.number().int().nonnegative().default(10),
+  OLDER_TOKEN_RESEARCH_MAX_EV_SHORTFALL: z.coerce.number().nonnegative().default(0.02),
   // Risk sizing (provisional paper/research values). Base size, per-trade max loss and
   // max open positions come from the existing portfolio settings (maxPositionPct,
   // maxRiskPerTradePct, maxSimultaneousPositions) — not duplicated here.

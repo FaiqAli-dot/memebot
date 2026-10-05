@@ -7,9 +7,7 @@ import type {
 import { query, withTransaction } from '../db/client.js';
 import { env, dataMode } from '../config/env.js';
 import { defaultPortfolioSettings, normalizeSettings } from '../engines/risk/engine.js';
-import { RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
-// Older token research portfolio ID - defined in constants.ts
-const OLDER_TOKEN_RESEARCH_PORTFOLIO_ID = '00000000-0000-4000-8000-000000000003';
+import { OLDER_TOKEN_RESEARCH_PORTFOLIO_ID, RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
 
 export async function ensureDefaultPortfolio(): Promise<string> {
   const id = env.DEFAULT_PORTFOLIO_ID;
@@ -250,10 +248,12 @@ export async function resetPaperAccount(portfolioId: string): Promise<void> {
 
 export async function resetAllSimulationData(portfolioId: string): Promise<void> {
   await resetPaperAccount(portfolioId);
-  const research = await query(`SELECT id FROM user_portfolios WHERE id = $1`, [RESEARCH_PORTFOLIO_ID]);
-  if (research.rows.length > 0 && portfolioId !== RESEARCH_PORTFOLIO_ID) {
-    await resetPaperAccount(RESEARCH_PORTFOLIO_ID);
-    await setBotStatus(RESEARCH_PORTFOLIO_ID, 'RUNNING');
+  for (const id of [RESEARCH_PORTFOLIO_ID, OLDER_TOKEN_RESEARCH_PORTFOLIO_ID]) {
+    const research = await query(`SELECT id FROM user_portfolios WHERE id = $1`, [id]);
+    if (research.rows.length > 0 && portfolioId !== id) {
+      await resetPaperAccount(id);
+      await setBotStatus(id, 'RUNNING');
+    }
   }
   await withTransaction(async (client) => {
     await client.query(`DELETE FROM bot_events WHERE portfolio_id = $1 OR data_mode = $2`, [

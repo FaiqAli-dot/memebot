@@ -64,7 +64,9 @@ import {
   activeStrategies,
   createStrategyCatalog,
   evaluateAllStrategies,
+  researchOnlyStrategies,
 } from '../strategies/catalog.js';
+import { historyCoverageMinutes, olderLaneRejection } from '../research/older-token-lane.js';
 import type { Signal, StrategyContext } from '../strategies/types.js';
 import { estimateExpectedValue } from '../risk/expected-value.js';
 import {
@@ -152,7 +154,7 @@ import type {
   RejectionReason,
   SignalLane,
 } from '@memebot/shared';
-import { resolveStrategyParams, RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
+import { OLDER_TOKEN_RESEARCH_PORTFOLIO_ID, resolveStrategyParams } from '@memebot/shared';
 
 const providers = createProviders();
 const discovery = createDiscoveryProviders(dataMode);
@@ -728,11 +730,19 @@ async function researchTradesToday(portfolioId: string): Promise<number> {
   return Number(rows[0]?.n ?? 0);
 }
 
-async function recentResearchSignal(tokenId: string, cooldownSec: number): Promise<boolean> {
+/** Signals without a target portfolio predate per-portfolio routing and belong to the lane's original portfolio. */
+function ownsUntargetedSignals(portfolioId: string): boolean {
+  return portfolioId !== OLDER_TOKEN_RESEARCH_PORTFOLIO_ID;
+}
+
+/** A research signal for this token was already routed to this research portfolio within the cooldown. */
+async function recentTargetedSignal(tokenId: string, portfolioId: string, cooldownSec: number): Promise<boolean> {
   const { rows } = await query(
     `SELECT 1 FROM signals WHERE token_id = $1 AND lane = 'RESEARCH' AND data_mode = $2
-       AND created_at > NOW() - ($3::text || ' seconds')::interval LIMIT 1`,
-    [tokenId, dataMode, String(cooldownSec)],
+       AND created_at > NOW() - ($3::text || ' seconds')::interval
+       AND (target_portfolio_id = $4 OR (target_portfolio_id IS NULL AND $5))
+     LIMIT 1`,
+    [tokenId, dataMode, String(cooldownSec), portfolioId, ownsUntargetedSignals(portfolioId)],
   );
   return rows.length > 0;
 }
@@ -834,7 +844,6 @@ async function buildStrategyContext(
     liquidityUsd: market.liquidity_usd,
     volume5mUsd: market.volume_5m_usd,
     volume1hUsd: market.volume_1h_usd,
-    volume24hUsd: market.volume_24h_usd,
     buyVolume5mUsd: market.buy_volume_5m_usd,
     sellVolume5mUsd: market.sell_volume_5m_usd,
     txCount5m: market.tx_count_5m,
@@ -861,7 +870,7 @@ async function buildStrategyContext(
  * market data → basic quality → safety → strategy → data confidence → EV (actual size).
  * Every stage is counted in a funnel snapshot so zero trades is explainable.
  */
-async function jobSignals(): Promise<void> {
+export async function jobSignals(): Promise<void> {
   const portfolioId = await ensureDefaultPortfolio();
   const researchId = env.RESEARCH_EXPLORATION_ENABLED ? await ensureResearchPortfolio() : null;
   const olderTokenResearchId = env.OLDER_TOKEN_RESEARCH_ENABLED ? await ensureOlderTokenResearchPortfolio() : null;
@@ -1221,7 +1230,11 @@ async function jobSignals(): Promise<void> {
         filterName: 'expected_value',
         evidence: { ev },
       });
-      if (researchEligible && !(await recentResearchSignal(token.id, env.OPPORTUNITY_COOLDOWN_SECONDS))) {
+      if (
+        researchEligible &&
+        researchId &&
+        !(await recentTargetedSignal(token.id, researchId, env.OPPORTUNITY_COOLDOWN_SECONDS))
+      ) {
         lane = 'RESEARCH';
       }
     }
@@ -1241,8 +1254,8 @@ async function jobSignals(): Promise<void> {
         token_id, strategy_name, strategy_version, side,
         momentum_score, liquidity_score, volume_score, holder_score, risk_score, overall_score,
         risk_label, explanation, market_state, data_mode,
-        action, confidence, expected_value, lane, position_size_usd, data_confidence
-      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16,$17,$18)
+        action, confidence, expected_value, lane, position_size_usd, data_confidence, target_portfolio_id
+      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16,$17,$18,$19)
       RETURNING id`,
       [
         token.id,
@@ -1273,6 +1286,7 @@ async function jobSignals(): Promise<void> {
         lane,
         proposedSizeUsd,
         dataConf.level,
+        lane === 'RESEARCH' ? researchId : portfolioId,
       ],
     );
 
@@ -1312,38 +1326,43 @@ async function jobSignals(): Promise<void> {
     [runId, tokens.length, generated],
   );
 
-  // Older-token research lane: separate evaluation for established/older tokens
   if (olderTokenResearchId) {
-    await runOlderTokenResearchSignals(olderTokenResearchId, portfolioId, now, funnel);
+    await runOlderTokenResearchSignals(olderTokenResearchId, now);
   }
 }
 
 /**
- * Older-token research lane: evaluates older-breakout and older-revival strategies
- * on tokens with sufficient historical data. Isolated from production decisions.
+ * Older-token research lane: research-only strategies on tokens with enough prior history,
+ * traded only in the older-token research portfolio. Production signals, risk state and
+ * calibration are untouched. Every strategy-qualified candidate is recorded as an opportunity
+ * (forward returns tracked) whether the lane trades it or rejects it.
  */
-async function runOlderTokenResearchSignals(
-  researchPortfolioId: string,
-  controlPortfolioId: string,
-  now: Date,
-  funnel: FunnelRecorder,
-): Promise<void> {
+async function runOlderTokenResearchSignals(researchPortfolioId: string, now: Date): Promise<void> {
   const settings = await getPortfolioSettings(researchPortfolioId);
   const strategyParams = resolveStrategyParams(settings.strategyParams);
+  const strategies = researchOnlyStrategies(strategyCatalog);
+  if (strategies.length === 0) return;
 
-  // Only older-token research strategies
-  const olderTokenStrategies = strategyCatalog.filter(
-    (s) => s.id === 'older-breakout' || s.id === 'older-revival',
+  // Spend the budget on tokens that can qualify: coverage beyond the most recent hour
+  const minPriorMinutes = Math.min(
+    ...strategies.map((s) => (strategyParams[s.id]?.minHistoryCoverageHours ?? 0) * 60),
   );
-
-  // Use same evaluation candidates as production (tokens with fresh market data)
-  const candidates = await listEvaluationCandidates(env.TOKEN_STALE_AFTER_SEC);
+  const candidates = (await listEvaluationCandidates(env.TOKEN_STALE_AFTER_SEC)).filter(
+    (c) => historyCoverageMinutes(c, now).coverage - 60 >= minPriorMinutes,
+  );
   const selected = selectForEvaluation(
     candidates.map((c) => ({ ...c, activityScore: Number(c.activity_score), lastEvaluatedAt: c.last_evaluated_at })),
-    Math.min(env.TOKEN_EVALUATION_CAP_PER_TICK, 100), // Smaller budget for research
-    0.5, // More rotation for research
+    env.OLDER_TOKEN_RESEARCH_EVALUATION_CAP,
+    env.OLDER_TOKEN_RESEARCH_ROTATION_SHARE,
   );
   const tokens = selected.map((s) => s.item);
+  const runId = (
+    await query<{ id: string }>(
+      `INSERT INTO strategy_runs (strategy_name, strategy_version, portfolio_id, data_mode, started_at)
+       VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
+      ['older-token-research', 'framework-v1', researchPortfolioId, dataMode],
+    )
+  ).rows[0]!.id;
 
   const history = await getSnapshotHistory(tokens.map((t) => t.id), now);
   const gas = await providers.gasFee.getFeeEstimate();
@@ -1368,27 +1387,25 @@ async function runOlderTokenResearchSignals(
     if (market.stale || snapshotAgeSec > staleSec) continue;
     if (market.liquidity_status !== 'KNOWN') continue;
 
-    const { ctx, holders, age, metrics, safety, phase, dataConf, buySellConf } = await buildStrategyContext(
-      token,
-      market,
-      history.get(token.id) ?? [],
-      now,
-    );
-
-    // Safety check - same as production
+    const built = await buildStrategyContext(token, market, history.get(token.id) ?? [], now);
+    const { age, metrics, safety, phase, dataConf, buySellConf } = built;
     if (safety.blocked) continue;
+    const ctx: StrategyContext = {
+      ...built.ctx,
+      volume24hUsd: market.volume_24h_usd,
+      buys1h: market.buys_1h,
+      sells1h: market.sells_1h,
+      buys24h: market.buys_24h,
+      sells24h: market.sells_24h,
+      observedSpanMinutes: historyCoverageMinutes(token, now).observedSpanMinutes,
+    };
 
-    // Evaluate only older-token research strategies
-    const { all } = evaluateAllStrategies(olderTokenStrategies, ctx, strategyParams);
+    const { all } = evaluateAllStrategies(strategies, ctx, strategyParams);
     const buys = all.filter((s) => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
-
     if (buys.length === 0) continue;
 
     const best = buys[0]!;
-    const absChange5m = Math.abs(market.price_change_5m_pct);
-    const sizeAt = (conf: ConfidenceLevel) => referenceSizeUsd(riskCfg, conf, absChange5m, 1);
-    const proposedSizeUsd = sizeAt(dataConf.level);
-
+    const proposedSizeUsd = referenceSizeUsd(riskCfg, dataConf.level, Math.abs(market.price_change_5m_pct), 1);
     const cost = estimateRoundTripCost({
       positionSizeUsd: proposedSizeUsd,
       liquidityUsd: market.liquidity_usd,
@@ -1398,26 +1415,80 @@ async function runOlderTokenResearchSignals(
       networkFeePerLegUsd: netLeg,
       adverseSelectionRatePerLeg: snapshotAgeSec > 2 ? 0.002 * knobs.adverseSelectionMult : 0,
     });
-
-    const ev = estimateExpectedValue({
-      signal: best,
-      cost,
-      failureProbability: knobs.failureRate,
-      minExpectedNetValue: minEv,
-      dataConfidence: dataConf.level,
-      lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER,
-      calibration: null, // No calibration for research
+    // Research-only strategies emit no return/loss estimate, so EV is reported as unknown
+    // (never passes). The lane gates on measurable cost viability instead.
+    const evFor = (sig: Signal) =>
+      estimateExpectedValue({
+        signal: sig,
+        cost,
+        failureProbability: knobs.failureRate,
+        minExpectedNetValue: minEv,
+        dataConfidence: dataConf.level,
+        lowConfidenceMultiplier: env.LOW_CONFIDENCE_EV_MULTIPLIER,
+        calibration: null,
+      });
+    const ev = evFor(best);
+    const rejection = olderLaneRejection({
+      costRate: cost.totalCostRate,
+      networkFeePriced: cost.networkFeePriced,
+      maxRoundTripCostPct: env.OLDER_TOKEN_RESEARCH_MAX_ROUND_TRIP_COST_PCT,
+      criticalDataOk: dataConf.checks.filter((c) => c.critical).every((c) => c.ok),
+      inCooldown: await recentTargetedSignal(token.id, researchPortfolioId, env.OPPORTUNITY_COOLDOWN_SECONDS),
     });
 
-    // Research lane: allow small EV shortfall
-    const researchEv = ev.rawExpectedNetValue ?? ev.expectedNetValue;
-    const shortfall = researchEv != null ? ev.threshold - researchEv : null;
-    const researchEligible =
-      (ev.passes || (shortfall != null && shortfall <= env.OLDER_TOKEN_RESEARCH_MAX_EV_SHORTFALL)) &&
-      cost.networkFeePriced &&
-      dataConf.checks.filter((c) => c.critical).every((c) => c.ok);
-
-    if (!researchEligible) continue;
+    for (const sig of buys) {
+      const sigEv = sig === best ? ev : evFor(sig);
+      await recordOpportunity({
+        tokenId: token.id,
+        strategyId: sig.strategyId,
+        strategyVersion: sig.strategyVersion,
+        decision:
+          sig !== best ? 'OLDER_RESEARCH_NOT_SELECTED' : rejection ? 'OLDER_RESEARCH_REJECTED' : 'OLDER_RESEARCH_SIGNAL',
+        observedAt: market.observed_at,
+        priceUsd: market.price_usd,
+        liquidityUsd: market.liquidity_usd,
+        liquidityStatus: market.liquidity_status,
+        volume5mUsd: market.volume_5m_usd,
+        volume1hUsd: market.volume_1h_usd,
+        buys5m: market.buys_5m,
+        sells5m: market.sells_5m,
+        txCount5m: market.tx_count_5m,
+        uniqueBuyers: null,
+        uniqueSellers: null,
+        marketRegime: latestRegime,
+        tokenAgeMin: age.minutes,
+        ageSource: age.source,
+        sinceFirstObservedSec: ctx.observedSpanMinutes != null ? Math.round(ctx.observedSpanMinutes * 60) : null,
+        dataConfidence: dataConf.level,
+        buySellConfidence: buySellConf.level,
+        volumeAccelRaw: metrics.volumeAcceleration.raw,
+        volumeAccelCapped: metrics.volumeAcceleration.capped,
+        volumeAccelConfidence: metrics.volumeAcceleration.confidence,
+        expectedValue: sigEv,
+        evNet: sigEv.expectedNetValue,
+        evThreshold: sigEv.threshold,
+        executionCostRate: sigEv.executionCostRate,
+        executionCostUsd: sigEv.executionCostUsd,
+        positionSizeUsd: sigEv.positionSizeUsd,
+        features: {
+          lane: 'RESEARCH',
+          portfolioId: researchPortfolioId,
+          rejectionReason: sig === best ? rejection : 'lower_confidence_than_best',
+          confidence: sig.confidence,
+          reasons: sig.reasons,
+          phase: phase.phase,
+          priceChange5mPct: market.price_change_5m_pct,
+          priceChange1hPct: market.price_change_1h_pct,
+          volume24hUsd: market.volume_24h_usd,
+          dataConfidenceChecks: dataConf.checks,
+          volumeAccel: metrics.volumeAcceleration,
+          txAccel: metrics.transactionAcceleration,
+        },
+        exitParams,
+        cooldownSec: env.OPPORTUNITY_COOLDOWN_SECONDS,
+      });
+    }
+    if (rejection) continue;
 
     const scores = best.scores ?? {
       momentum: best.confidence,
@@ -1428,14 +1499,13 @@ async function runOlderTokenResearchSignals(
       overall: best.confidence,
     };
 
-    // Record signal with RESEARCH lane
     const { rows } = await query<{ id: string }>(
       `INSERT INTO signals (
         token_id, strategy_name, strategy_version, side,
         momentum_score, liquidity_score, volume_score, holder_score, risk_score, overall_score,
         risk_label, explanation, market_state, data_mode,
-        action, confidence, expected_value, lane, position_size_usd, data_confidence
-      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,$16,'RESEARCH',$17,$18)
+        action, confidence, expected_value, lane, position_size_usd, data_confidence, target_portfolio_id
+      ) VALUES ($1,$2,$3,'BUY',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'BUY',$14,$15,'RESEARCH',$16,$17,$18)
       RETURNING id`,
       [
         token.id,
@@ -1448,7 +1518,12 @@ async function runOlderTokenResearchSignals(
         scores.risk,
         scores.overall,
         best.riskLabel ?? 'MODERATE',
-        JSON.stringify({ reasons: best.reasons, warnings: [], factors: { ev }, lane: 'RESEARCH' }),
+        JSON.stringify({
+          reasons: best.reasons,
+          warnings: ['no_empirical_return_estimate'],
+          factors: { ev, costRate: cost.totalCostRate },
+          lane: 'RESEARCH',
+        }),
         JSON.stringify({
           ...ctx,
           flow: undefined,
@@ -1465,6 +1540,7 @@ async function runOlderTokenResearchSignals(
         JSON.stringify(ev),
         proposedSizeUsd,
         dataConf.level,
+        researchPortfolioId,
       ],
     );
 
@@ -1480,30 +1556,20 @@ async function runOlderTokenResearchSignals(
         lane: 'RESEARCH',
         strategy: best.strategyId,
         confidence: best.confidence,
-        expectedNetValue: ev.expectedNetValue,
-        threshold: ev.threshold,
-        disclaimer: 'Research only - not production',
+        expectedNetValue: null,
+        roundTripCostRate: cost.totalCostRate,
+        disclaimer: 'Research only - no empirical return estimate yet',
       },
     });
   }
 
   await query(
     `UPDATE strategy_runs SET finished_at = NOW(), tokens_evaluated = $2, signals_generated = $3 WHERE id = $1`,
-    [
-      (
-        await query<{ id: string }>(
-          `INSERT INTO strategy_runs (strategy_name, strategy_version, portfolio_id, data_mode, started_at)
-           VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
-          ['older-token-research', 'framework-v1', researchPortfolioId, dataMode],
-        )
-      ).rows[0]!.id,
-      tokens.length,
-      generated,
-    ],
+    [runId, tokens.length, generated],
   );
 }
 
-async function jobPaperExecution(): Promise<void> {
+export async function jobPaperExecution(): Promise<void> {
   const productionId = await ensureDefaultPortfolio();
   const production = await getPortfolio(productionId);
   if (!production) return;
@@ -1540,20 +1606,43 @@ async function openExposure(
   };
 }
 
-function signalFromStored(row: {
-  confidence: string | null;
-  overall_score: string;
-  strategy_id: string | null;
-  strategy_version: string;
-  expected_value: unknown;
-}): Signal | null {
-  const ev = (row.expected_value ?? {}) as { grossUpside?: number; downside?: number; timeToTargetSec?: number };
-  if (ev.grossUpside == null || ev.downside == null) return null;
+function isResearchOnlyStrategy(strategyId: string | null): boolean {
+  return strategyCatalog.some((s) => s.id === strategyId && s.researchOnly);
+}
+
+function researchDailyCap(portfolioId: string): number {
+  return portfolioId === OLDER_TOKEN_RESEARCH_PORTFOLIO_ID
+    ? env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY
+    : env.RESEARCH_MAX_TRADES_PER_DAY;
+}
+
+/**
+ * Stored BUY → Signal for the final EV check. A missing return/loss estimate is only accepted
+ * for research-only strategies in the research lane (their EV stays unknown); anywhere else
+ * the signal is unusable.
+ */
+function signalFromStored(
+  row: {
+    confidence: string | null;
+    overall_score: string;
+    strategy_id: string | null;
+    strategy_version: string;
+    expected_value: unknown;
+  },
+  allowUnknownEv: boolean,
+): Signal | null {
+  const ev = (row.expected_value ?? {}) as {
+    grossUpside?: number | null;
+    downside?: number | null;
+    timeToTargetSec?: number;
+  };
+  const known = ev.grossUpside != null && ev.downside != null;
+  if (!known && !allowUnknownEv) return null;
   return {
     action: 'BUY',
     confidence: Number(row.confidence ?? row.overall_score),
-    expectedReturn: ev.grossUpside,
-    expectedLoss: ev.downside,
+    expectedReturn: known ? ev.grossUpside! : null,
+    expectedLoss: known ? ev.downside! : null,
     expectedHoldTimeSec: ev.timeToTargetSec ?? null,
     reasons: [],
     strategyId: row.strategy_id ?? 'unknown',
@@ -1576,14 +1665,8 @@ export async function executeLane(
   if (botStatus === 'KILLED' || (await isKillSwitchActive(controlPortfolioId))) return;
   if (botStatus !== 'RUNNING') return;
 
-  if (lane === 'RESEARCH') {
-    const tradesToday = await researchTradesToday(portfolioId);
-    const maxTrades = portfolioId === env.RESEARCH_PORTFOLIO_ID
-      ? env.RESEARCH_MAX_TRADES_PER_DAY
-      : env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY;
-    if (tradesToday >= maxTrades) {
-      return;
-    }
+  if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= researchDailyCap(portfolioId)) {
+    return;
   }
 
   const { rows: signals } = await query<{
@@ -1607,6 +1690,7 @@ export async function executeLane(
      WHERE s.data_mode = $1
        AND s.side = 'BUY'
        AND s.lane = $3
+       AND (s.target_portfolio_id = $2 OR (s.target_portfolio_id IS NULL AND $4))
        AND s.created_at > NOW() - INTERVAL '10 minutes'
        AND NOT EXISTS (
          SELECT 1 FROM paper_orders o WHERE o.signal_id = s.id AND o.portfolio_id = $2
@@ -1620,7 +1704,7 @@ export async function executeLane(
        )
      ORDER BY COALESCE(s.confidence, s.overall_score) DESC
      LIMIT 5`,
-    [dataMode, portfolioId, lane],
+    [dataMode, portfolioId, lane, ownsUntargetedSignals(portfolioId)],
   );
   if (signals.length === 0) return;
 
@@ -1667,9 +1751,14 @@ export async function executeLane(
   for (const signal of signals) {
     const latest = await getPortfolio(portfolioId);
     if (!latest) break;
-    if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= env.RESEARCH_MAX_TRADES_PER_DAY) {
+    if (lane === 'RESEARCH' && (await researchTradesToday(portfolioId)) >= researchDailyCap(portfolioId)) {
       funnel.details.researchDailyCapReached = true;
       break;
+    }
+    const researchOnly = isResearchOnlyStrategy(signal.strategy_id);
+    if (researchOnly && lane !== 'RESEARCH') {
+      funnel.reject('strategyFailed');
+      continue;
     }
 
     // Per-signal duplicate check (fixes race across loop iterations)
@@ -1803,7 +1892,7 @@ export async function executeLane(
     await setRiskState(portfolioId, risk.riskState);
     await query(`UPDATE user_portfolios SET risk_state_changed_at = NOW() WHERE id = $1`, [portfolioId]);
 
-    const stored = signalFromStored(signal);
+    const stored = signalFromStored(signal, researchOnly && lane === 'RESEARCH');
     if (!stored) {
       funnel.reject('evFailed');
       continue;
@@ -1968,9 +2057,17 @@ export async function executeLane(
     const evOk =
       lane === 'PRODUCTION'
         ? finalEv.passes
-        : finalEv.expectedNetValue != null &&
-          finalCost.networkFeePriced &&
-          finalEv.threshold - finalEv.expectedNetValue <= env.RESEARCH_MAX_EV_SHORTFALL;
+        : researchOnly
+          ? olderLaneRejection({
+              costRate: finalCost.totalCostRate,
+              networkFeePriced: finalCost.networkFeePriced,
+              maxRoundTripCostPct: env.OLDER_TOKEN_RESEARCH_MAX_ROUND_TRIP_COST_PCT,
+              criticalDataOk: true,
+              inCooldown: false,
+            }) == null
+          : finalEv.expectedNetValue != null &&
+            finalCost.networkFeePriced &&
+            finalEv.threshold - finalEv.expectedNetValue <= env.RESEARCH_MAX_EV_SHORTFALL;
     if (!evOk) {
       funnel.reject('evFailed');
       await markRiskExecution(riskDecisionId, 'EV_FAILED_AT_FINAL_SIZE', finalEv.reasons.join(','));

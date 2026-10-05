@@ -11,6 +11,8 @@ import {
   type Signal,
 } from './types.js';
 import { MomentumBreakoutStrategy } from './momentum-breakout.js';
+import { OlderBreakoutStrategy } from './older-breakout.js';
+import { OlderRevivalStrategy } from './older-revival.js';
 
 function baseGates(s: Strategy, ctx: StrategyContext): Signal | null {
   if (ctx.safety?.blocked) {
@@ -252,6 +254,8 @@ export function createStrategyCatalog(): Strategy[] {
     new MeanReversionStrategy(),
     new PostSelloffRecoveryStrategy(),
     new WalletFlowStrategy(),
+    new OlderBreakoutStrategy(),
+    new OlderRevivalStrategy(),
   ];
 }
 

@@ -1,25 +1,47 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
-import { api, money, pct, pnlClass } from '../lib/api';
+import { api, money, pct, pnlClass, type TradeExtreme } from '../lib/api';
 import { useRealtime } from '../hooks/useRealtime';
+import type { PortfolioLane } from '@memebot/shared';
+import {
+  LaneFilterSelect,
+  LaneLegend,
+  LaneTags,
+  laneFilterScope,
+  laneRowClass,
+  matchesLaneFilter,
+  type LaneFilter,
+} from '../components/LaneBadge';
+
+const laneOf = (r: Record<string, unknown>) => (r.lane as PortfolioLane | null | undefined) ?? null;
+const strategyOf = (r: Record<string, unknown>) => (r.strategy_id as string | null | undefined) ?? null;
 
 export function TradesPage() {
   const [trades, setTrades] = useState<Record<string, unknown>[]>([]);
   const [failed, setFailed] = useState<Record<string, unknown>[]>([]);
+  const [extremes, setExtremes] = useState<{ winners: TradeExtreme[]; losers: TradeExtreme[] } | null>(null);
   const [tab, setTab] = useState<'trades' | 'failed'>('trades');
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
+  const [laneFilter, setLaneFilter] = useState<LaneFilter>('all');
   const [params] = useSearchParams();
 
+  const scope = laneFilterScope(laneFilter);
   async function load() {
-    const [t, f] = await Promise.all([api.trades(), api.failedTrades()]);
+    const [t, f, x] = await Promise.all([api.trades(scope), api.failedTrades(scope), api.tradeExtremes(scope)]);
     setTrades(t as Record<string, unknown>[]);
     setFailed(f);
+    setExtremes(x);
   }
+
+  const inLane = (r: Record<string, unknown>) => matchesLaneFilter(laneFilter, laneOf(r), strategyOf(r));
+  const extremeInLane = (r: TradeExtreme) => matchesLaneFilter(laneFilter, r.lane, r.strategyId);
+  const shownTrades = trades.filter(inLane);
+  const shownFailed = failed.filter(inLane);
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [scope]);
   useRealtime((msg) => {
     if (msg.type === 'trade_opened' || msg.type === 'trade_closed' || msg.payload == null) {
       void load();
@@ -32,11 +54,15 @@ export function TradesPage() {
   }, [params]);
 
   async function openDetail(id: string) {
-    setDetail(await api.trade(id));
+    setDetail(await api.trade(id, 'all'));
   }
 
   return (
     <div className="page">
+      <div className="lane-legend" style={{ justifyContent: 'space-between' }}>
+        <LaneLegend />
+        <LaneFilterSelect value={laneFilter} onChange={setLaneFilter} />
+      </div>
       <div className="tabs" role="tablist">
         <button
           role="tab"
@@ -52,10 +78,24 @@ export function TradesPage() {
           className={`tab ${tab === 'failed' ? 'active' : ''}`}
           onClick={() => setTab('failed')}
         >
-          Failed attempts ({failed.length})
+          Failed attempts ({shownFailed.length})
         </button>
       </div>
-      {tab === 'failed' && <FailedAttempts rows={failed} onDetail={(id) => void openDetail(id)} />}
+      {tab === 'failed' && <FailedAttempts rows={shownFailed} onDetail={(id) => void openDetail(id)} />}
+      {tab === 'trades' && extremes && (
+        <div className="grid grid-2" style={{ marginBottom: '0.75rem' }}>
+          <ExtremeTrades
+            title="Top 5 profits"
+            rows={extremes.winners.filter(extremeInLane)}
+            onDetail={(id) => void openDetail(id)}
+          />
+          <ExtremeTrades
+            title="Top 5 losses"
+            rows={extremes.losers.filter(extremeInLane)}
+            onDetail={(id) => void openDetail(id)}
+          />
+        </div>
+      )}
       {tab === 'trades' && (
       <div className="panel">
         <h2>Trades</h2>
@@ -66,6 +106,7 @@ export function TradesPage() {
                 <th>Time</th>
                 <th>Side</th>
                 <th>Token</th>
+                <th>Lane</th>
                 <th>Status</th>
                 <th>Requested</th>
                 <th>Executed</th>
@@ -80,11 +121,14 @@ export function TradesPage() {
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
-                <tr key={String(t.id)}>
+              {shownTrades.map((t) => (
+                <tr key={String(t.id)} className={laneRowClass(laneOf(t), strategyOf(t))}>
                   <td>{new Date(String(t.created_at)).toLocaleString()}</td>
                   <td className={t.side === 'BUY' ? 'pos' : 'neg'}>{String(t.side)}</td>
                   <td>{String(t.symbol)}</td>
+                  <td>
+                    <LaneTags lane={laneOf(t)} strategyId={strategyOf(t)} />
+                  </td>
                   <td>{String(t.status)}</td>
                   <td>{money(Number(t.requested_price_usd), 6)}</td>
                   <td>{money(Number(t.executed_price_usd ?? 0), 6)}</td>
@@ -135,6 +179,74 @@ export function TradesPage() {
   );
 }
 
+function holdDuration(openedAt: string, closedAt: string | null): string {
+  if (!closedAt) return '—';
+  const min = Math.round((new Date(closedAt).getTime() - new Date(openedAt).getTime()) / 60_000);
+  return min >= 60 ? `${Math.floor(min / 60)}h ${min % 60}m` : `${min}m`;
+}
+
+function ExtremeTrades({
+  title,
+  rows,
+  onDetail,
+}: {
+  title: string;
+  rows: TradeExtreme[];
+  onDetail: (orderId: string) => void;
+}) {
+  return (
+    <div className="panel">
+      <h2>{title}</h2>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>Lane</th>
+              <th>Net P/L</th>
+              <th>Reason</th>
+              <th>Held</th>
+              <th>Closed</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.positionId} className={laneRowClass(r.lane, r.strategyId)}>
+                <td>{r.symbol ?? r.tokenId.slice(0, 6)}</td>
+                <td>
+                  <LaneTags lane={r.lane} strategyId={r.strategyId} />
+                </td>
+                <td className={pnlClass(r.netPnlUsd)}>
+                  {money(r.netPnlUsd)}
+                  {r.netPnlPct != null ? ` (${pct(r.netPnlPct)})` : ''}
+                </td>
+                <td>{(r.closeReason ?? '—').replace(/_/g, ' ')}</td>
+                <td>{holdDuration(r.openedAt, r.closedAt)}</td>
+                <td>{r.closedAt ? new Date(r.closedAt).toLocaleString() : '—'}</td>
+                <td>
+                  {r.exitOrderId && (
+                    <button className="btn" onClick={() => onDetail(r.exitOrderId!)}>
+                      Detail
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={7} style={{ color: 'var(--muted)' }}>
+                  No closed trades in this lane yet
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function attemptOutcome(r: Record<string, unknown>): { text: string; className?: string } {
   if (r.position_status === 'OPEN') return { text: 'Position still open — retrying' };
   if (r.exit_status === 'FILLED' || r.exit_status === 'PARTIAL') {
@@ -161,6 +273,7 @@ function FailedAttempts({ rows, onDetail }: { rows: Record<string, unknown>[]; o
           <thead>
             <tr>
               <th>Token</th>
+              <th>Lane</th>
               <th>Side</th>
               <th>Failed</th>
               <th>Reason</th>
@@ -175,8 +288,11 @@ function FailedAttempts({ rows, onDetail }: { rows: Record<string, unknown>[]; o
             {rows.map((r) => {
               const outcome = attemptOutcome(r);
               return (
-                <tr key={String(r.id)}>
+                <tr key={String(r.id)} className={laneRowClass(laneOf(r), strategyOf(r))}>
                   <td>{String(r.symbol)}</td>
+                  <td>
+                    <LaneTags lane={laneOf(r)} strategyId={strategyOf(r)} />
+                  </td>
                   <td className={r.side === 'BUY' ? 'pos' : 'neg'}>{String(r.side)}</td>
                   <td>{Number(r.attempt_count ?? 1).toLocaleString()}×</td>
                   <td>{String(r.failure_reason ?? '—')}</td>
@@ -198,8 +314,9 @@ function FailedAttempts({ rows, onDetail }: { rows: Record<string, unknown>[]; o
         </table>
       </div>
       <p className="disclaimer">
-        Repeated failures for the same position and reason are stored once with an attempt count. A sell that cannot
-        fill because the token has no liquidity is retried for 15 minutes, then the position is closed at $0.
+        Repeated failures for the same position and reason are stored once with an attempt count. A failed sell is
+        retried at most every 10 seconds and only the first failure is charged network fees. A sell that cannot fill
+        because the token has no liquidity is retried for 15 minutes, then the position is closed at $0.
       </p>
     </div>
   );
@@ -217,6 +334,9 @@ function TradeDetailBody({ detail }: { detail: Record<string, unknown> }) {
           {String(order.side)} {String(order.symbol)}
         </strong>{' '}
         · {String(order.status)}
+      </div>
+      <div>
+        <LaneTags lane={laneOf(order)} strategyId={strategyOf(order)} />
       </div>
       <div>Signal time: {order.signal_at ? new Date(String(order.signal_at)).toLocaleString() : '—'}</div>
       <div>

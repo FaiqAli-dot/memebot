@@ -358,6 +358,17 @@ export async function executePaperSell(opts: {
         return { success: false, reason: 'Position not open' };
       }
 
+      const recentFailure = await client.query(
+        `SELECT 1 FROM paper_orders
+         WHERE position_id = $1 AND side = 'SELL' AND status = 'FAILED'
+           AND last_attempt_at > NOW() - make_interval(secs => $2)
+         LIMIT 1`,
+        [opts.positionId, env.SELL_RETRY_INTERVAL_SEC],
+      );
+      if (recentFailure.rows.length > 0) {
+        return { success: false, reason: 'sell_retry_throttled' };
+      }
+
       const qty = Number(pos.quantity);
       const notional = qty * opts.midPriceUsd;
       const sim = simulateTrade({
@@ -375,36 +386,34 @@ export async function executePaperSell(opts: {
       let orderId = uuid();
 
       if (sim.execution.failed) {
-        // Still charge network if configured. A retry with the same failure reason updates the
-        // position's existing failed order (attempt count, summed fees) instead of adding a row.
-        const repeat = await client.query<{ id: string; created_at: Date }>(
+        // Still charge network if configured, but only for the first failure. A retry with the same
+        // failure reason updates the position's existing failed order (attempt count) at no extra
+        // cost, so a stuck exit cannot bleed paper cash and distort research results.
+        const repeat = await client.query<{ id: string; created_at: Date; total_cost_usd: string }>(
           `UPDATE paper_orders SET
              attempt_count = attempt_count + 1, last_attempt_at = NOW(),
-             requested_price_usd = $3, requested_amount_usd = $4,
-             network_fee_usd = network_fee_usd + $5, priority_fee_usd = priority_fee_usd + $6,
-             total_cost_usd = total_cost_usd + $7, execution_record = $8,
-             sol_price_usd = $9, sol_price_source = $10
+             requested_price_usd = $3, requested_amount_usd = $4, execution_record = $5,
+             sol_price_usd = $6, sol_price_source = $7
            WHERE id = (
              SELECT id FROM paper_orders
              WHERE position_id = $1 AND side = 'SELL' AND status = 'FAILED'
                AND failure_reason IS NOT DISTINCT FROM $2
              ORDER BY created_at DESC LIMIT 1
            )
-           RETURNING id, created_at`,
+           RETURNING id, created_at, total_cost_usd`,
           [
             opts.positionId,
             sim.execution.failureReason,
             opts.midPriceUsd,
             notional,
-            sim.costs.networkFeeUsd,
-            sim.costs.priorityFeeUsd,
-            sim.costs.totalCostUsd,
             JSON.stringify(sim.execution),
             sim.costs.solPriceUsd,
             sim.costs.solPriceSource,
           ],
         );
         let firstAttemptAt = new Date();
+        const chargedCostUsd = repeat.rows[0] ? 0 : sim.costs.totalCostUsd;
+        const exitCostUsd = repeat.rows[0] ? Number(repeat.rows[0].total_cost_usd) : sim.costs.totalCostUsd;
         if (repeat.rows[0]) {
           orderId = repeat.rows[0].id;
           firstAttemptAt = repeat.rows[0].created_at;
@@ -436,12 +445,12 @@ export async function executePaperSell(opts: {
             ],
           );
         }
-        if (sim.costs.totalCostUsd > 0) {
+        if (chargedCostUsd > 0) {
           await client.query(
             `UPDATE user_portfolios SET cash_usd = GREATEST(0, cash_usd - $2),
               total_network_cost_usd = total_network_cost_usd + $2, updated_at = NOW()
              WHERE id = $1`,
-            [opts.portfolioId, sim.costs.totalCostUsd],
+            [opts.portfolioId, chargedCostUsd],
           );
         }
         // Untradeable (no liquidity to sell into): retry for the grace period, then close at zero
@@ -454,7 +463,7 @@ export async function executePaperSell(opts: {
             ? opts.closeReason
             : 'emergency_liquidity_collapse';
           const costBasis = Number(pos.cost_basis_usd);
-          const netPnl = -costBasis - sim.costs.totalCostUsd;
+          const netPnl = -costBasis - exitCostUsd;
           await client.query(
             `UPDATE positions SET status = 'CLOSED', current_price_usd = 0, current_value_usd = 0,
               unrealized_pnl_usd = 0, realized_pnl_usd = $2, gross_pnl_usd = $3, net_pnl_usd = $2,

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import type { BotReadiness, ReadinessNearMiss, ReadinessState } from '@memebot/shared';
 import { api } from '../lib/api';
 import { useRealtime, useThrottled } from '../hooks/useRealtime';
+import { LaneBadge } from './LaneBadge';
 
 const POLL_MS = 10_000;
 
@@ -25,6 +26,14 @@ function ago(iso: string | null): string {
   if (sec < 60) return `${sec}s ago`;
   if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
   return `${Math.round(sec / 3600)}h ago`;
+}
+
+function stamp(iso: string | null): string {
+  if (!iso) return 'never';
+  const d = new Date(iso);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const clock = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return `${ago(iso)} (${sameDay ? clock : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`})`;
 }
 
 function EvLine({ label, c }: { label: string; c: ReadinessNearMiss }) {
@@ -103,11 +112,28 @@ export function ReadinessPanel() {
       <div className="readiness-head">
         <span className="readiness-dot" />
         <span className="readiness-state">{STATE_LABEL[data.state]}</span>
-        <span className="readiness-headline">{data.headline}</span>
+        <span className="readiness-headline">Production: {data.headline}</span>
         <span className="readiness-meta">
-          last signal {ago(data.lastSignalAt)} · last trade {ago(data.lastTradeAt)}
+          last signal {stamp(data.lastSignalAt)} · last trade {stamp(data.lastTradeAt)}
         </span>
       </div>
+      {data.researchLanes && data.researchLanes.length > 0 && (
+        <div className="readiness-research-lanes">
+          {data.researchLanes.map((l) => (
+            <div key={l.key} className="readiness-research-lane">
+              <LaneBadge lane={l.key === 'exploration' ? 'EXPLORATION_RESEARCH' : 'OLDER_TOKEN_RESEARCH'} />
+              <span>
+                last trade <strong>{stamp(l.lastTradeAt)}</strong>
+              </span>
+              <span>last signal {stamp(l.lastSignalAt)}</span>
+              <span>{l.openPositions} open</span>
+              <span>
+                {l.tradesToday}/{l.dailyCap} trades today
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       <p className="readiness-detail">{data.detail}</p>
 
       <div className="readiness-grid three">
@@ -130,7 +156,10 @@ export function ReadinessPanel() {
             </li>
           </ul>
 
-          <h3 style={{ marginTop: '0.75rem' }}>Research lane (separate portfolio)</h3>
+          <h3 style={{ marginTop: '0.75rem' }}>
+            Exploration research lane (borderline new-token signals · separate portfolio){' '}
+            <LaneBadge lane="EXPLORATION_RESEARCH" short />
+          </h3>
           <div className="funnel-row funnel-total">
             <span>{research.enabled ? 'Enabled' : 'Disabled'} · EV shortfall ≤ {fmtPct(research.maxEvShortfall)}</span>
             <span>

@@ -1,4 +1,5 @@
 import type { StrategyParamsById } from './strategy-params.js';
+import type { PortfolioLane } from './lanes.js';
 import type {
   BotStatus,
   ConfidenceLevel,
@@ -331,6 +332,8 @@ export interface PositionData {
   closeReason: string | null;
   dataMode: DataMode;
   token?: TokenInfo;
+  lane?: PortfolioLane | null;
+  strategyId?: string | null;
 }
 
 export interface PricePoint {
@@ -904,6 +907,17 @@ export interface BotReadiness {
   research: ReadinessResearch;
   lastSignalAt: string | null;
   lastTradeAt: string | null;
+  /** Research lane activity (the readiness state and headline are production-only). */
+  researchLanes?: ReadinessResearchLane[];
+}
+
+export interface ReadinessResearchLane {
+  key: 'exploration' | 'olderToken';
+  lastTradeAt: string | null;
+  lastSignalAt: string | null;
+  openPositions: number;
+  tradesToday: number;
+  dailyCap: number;
 }
 
 export interface BotEventData {
@@ -915,6 +929,8 @@ export interface BotEventData {
   details: Record<string, unknown>;
   createdAt: string;
   dataMode: DataMode;
+  lane?: PortfolioLane | null;
+  strategyId?: string | null;
 }
 
 export interface EquityPoint {
@@ -999,6 +1015,8 @@ export interface ScannerRow {
   overallScore: number | null;
   lastUpdated: string;
   dataMode: DataMode;
+  signalLane?: PortfolioLane | null;
+  signalStrategyId?: string | null;
   discoverySource?: DiscoverySource | string | null;
   safetyScore?: number | null;
   safetyClass?: SafetyClass | null;

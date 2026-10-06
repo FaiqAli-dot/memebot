@@ -10,8 +10,9 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { SCORE_DISCLAIMER } from '@memebot/shared';
+import { SCORE_DISCLAIMER, type PortfolioLane } from '@memebot/shared';
 import { api, money, pct } from '../lib/api';
+import { LaneTags } from '../components/LaneBadge';
 
 export function TokenDetailPage() {
   const { id } = useParams();
@@ -49,6 +50,15 @@ export function TokenDetailPage() {
         <h2>
           {String(token.symbol)} · {String(token.name)}
         </h2>
+        {signal && (
+          <div style={{ marginBottom: '0.4rem' }}>
+            <LaneTags
+              lane={signal.portfolio_lane as PortfolioLane | null}
+              strategyId={String(signal.strategy_name ?? '') || null}
+            />
+            <span style={{ color: 'var(--muted)', fontSize: '0.68rem', marginLeft: '0.4rem' }}>latest signal</span>
+          </div>
+        )}
         <div style={{ color: 'var(--muted)' }}>
           {String(token.chain)} · {String(token.address)} · mode {String(token.data_mode).toUpperCase()} ·
           source {String(token.discovery_source ?? 'UNKNOWN')}
@@ -108,6 +118,12 @@ export function TokenDetailPage() {
           <h3>Why this signal?</h3>
           {signal ? (
             <>
+              <div style={{ marginBottom: '0.3rem' }}>
+                <LaneTags
+                  lane={signal.portfolio_lane as PortfolioLane | null}
+                  strategyId={String(signal.strategy_name ?? '') || null}
+                />
+              </div>
               <div>
                 Model score {Number(signal.overall_score).toFixed(1)} · risk {String(signal.risk_label)} ·{' '}
                 {String(signal.strategy_name)} {String(signal.strategy_version)}

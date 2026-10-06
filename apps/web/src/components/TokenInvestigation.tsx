@@ -1,4 +1,7 @@
+import type { ReactNode } from 'react';
+import type { PortfolioLane } from '@memebot/shared';
 import { money } from '../lib/api';
+import { LaneTags, laneRowClass } from './LaneBadge';
 
 type Row = Record<string, unknown>;
 
@@ -24,7 +27,17 @@ function short(v: unknown): string {
   return v == null ? '—' : String(v).slice(0, 8);
 }
 
-function Table({ title, rows, cols }: { title: string; rows: Row[]; cols: Array<[string, (r: Row) => string]> }) {
+function lane(r: Row, strategyKey?: string): ReactNode {
+  return (
+    <LaneTags
+      lane={(r.portfolio_lane as PortfolioLane | null | undefined) ?? null}
+      strategyId={strategyKey ? ((r[strategyKey] as string | null | undefined) ?? null) : null}
+      short
+    />
+  );
+}
+
+function Table({ title, rows, cols }: { title: string; rows: Row[]; cols: Array<[string, (r: Row) => ReactNode]> }) {
   return (
     <div style={{ marginTop: '1rem' }}>
       <h4>
@@ -44,7 +57,13 @@ function Table({ title, rows, cols }: { title: string; rows: Row[]; cols: Array<
             </thead>
             <tbody>
               {rows.map((r, i) => (
-                <tr key={String(r.id ?? i)}>
+                <tr
+                  key={String(r.id ?? i)}
+                  className={laneRowClass(
+                    r.portfolio_lane as PortfolioLane | null | undefined,
+                    (r.strategy_id ?? r.strategy_key) as string | null | undefined,
+                  )}
+                >
                   {cols.map(([h, f]) => (
                     <td key={h}>{f(r)}</td>
                   ))}
@@ -118,8 +137,7 @@ export function TokenInvestigation({ detail }: { detail: Row }) {
         cols={[
           ['Created', (r) => ts(r.created_at)],
           ['Signal', (r) => short(r.id)],
-          ['Lane', (r) => txt(r.lane)],
-          ['Strategy', (r) => txt(r.strategy_id)],
+          ['Lane', (r) => lane(r, 'strategy_id')],
           ['Score', (r) => num(r.overall_score)],
           ['Liq at signal', (r) => money(Number((r.market_state as Row | null)?.liquidityUsd ?? NaN), 0)],
           ['Vol5m at signal', (r) => money(Number((r.market_state as Row | null)?.volume5mUsd ?? NaN), 0)],
@@ -132,6 +150,7 @@ export function TokenInvestigation({ detail }: { detail: Row }) {
         rows={list('executionAttempts')}
         cols={[
           ['Signal', (r) => short(r.signal_id)],
+          ['Lane', (r) => lane(r, 'strategy_id')],
           ['Signal at', (r) => ts(r.signal_created_at)],
           ['Ticks', (r) => txt(r.attempts)],
           ['First / last', (r) => `${ts(r.first_attempt_at)} → ${ts(r.last_attempt_at)}`],
@@ -154,6 +173,7 @@ export function TokenInvestigation({ detail }: { detail: Row }) {
         rows={list('riskDecisions')}
         cols={[
           ['Decision', (r) => short(r.id)],
+          ['Lane', (r) => lane(r, 'strategy_id')],
           ['Signal', (r) => short(r.signal_id)],
           ['Result', (r) => `${txt(r.decision)} ${r.rejection_reason ? `(${r.rejection_reason})` : ''}`],
           ['Evaluations', (r) => txt(r.attempts)],
@@ -170,6 +190,7 @@ export function TokenInvestigation({ detail }: { detail: Row }) {
         cols={[
           ['Created', (r) => ts(r.created_at)],
           ['Order', (r) => short(r.id)],
+          ['Lane', (r) => lane(r)],
           ['Side', (r) => txt(r.side)],
           ['Status', (r) => `${txt(r.status)} ${r.failure_reason ? `(${r.failure_reason})` : ''}`],
           ['Attempts', (r) => txt(r.attempt_count)],
@@ -186,6 +207,7 @@ export function TokenInvestigation({ detail }: { detail: Row }) {
         rows={list('positions')}
         cols={[
           ['Position', (r) => short(r.id)],
+          ['Lane', (r) => lane(r, 'strategy_key')],
           ['Opened', (r) => ts(r.opened_at)],
           ['Closed', (r) => ts(r.closed_at)],
           ['Status', (r) => txt(r.status)],

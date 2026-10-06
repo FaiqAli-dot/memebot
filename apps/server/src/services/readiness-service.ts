@@ -6,7 +6,7 @@ import type {
   ReadinessNearMiss,
   ReadinessState,
 } from '@memebot/shared';
-import { RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
+import { OLDER_TOKEN_RESEARCH_PORTFOLIO_ID, RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
 import { query } from '../db/client.js';
 import { dataMode, env } from '../config/env.js';
 import { getPortfolio, getPortfolioSettings } from './portfolio-service.js';
@@ -196,10 +196,13 @@ export async function getBotReadiness(portfolioId: string): Promise<BotReadiness
       ),
       query<{ prod: string; research: string; last: Date | null }>(
         `SELECT COUNT(*) FILTER (WHERE lane = 'PRODUCTION' AND created_at > NOW() - make_interval(mins => $2))::text AS prod,
-                COUNT(*) FILTER (WHERE lane = 'RESEARCH' AND created_at > NOW() - make_interval(mins => $2))::text AS research,
+                COUNT(*) FILTER (
+                  WHERE lane = 'RESEARCH' AND (target_portfolio_id IS NULL OR target_portfolio_id = $3)
+                    AND created_at > NOW() - make_interval(mins => $2)
+                )::text AS research,
                 MAX(created_at) FILTER (WHERE lane = 'PRODUCTION') AS last
          FROM signals WHERE data_mode = $1`,
-        [dataMode, WINDOW_MINUTES],
+        [dataMode, WINDOW_MINUTES, RESEARCH_PORTFOLIO_ID],
       ),
       query<{ in_window: string; last: Date | null }>(
         `SELECT COUNT(*) FILTER (WHERE opened_at > NOW() - make_interval(mins => $2))::text AS in_window,
@@ -468,11 +471,46 @@ export async function getBotReadiness(portfolioId: string): Promise<BotReadiness
     detail = parts.join(' ');
   }
 
+  const researchStats = await query<{
+    id: string;
+    last_trade: Date | null;
+    last_signal: Date | null;
+    open_positions: number;
+    trades_today: number;
+  }>(
+    `SELECT p.id,
+            (SELECT MAX(opened_at) FROM positions WHERE portfolio_id = p.id) AS last_trade,
+            (SELECT MAX(created_at) FROM signals WHERE target_portfolio_id = p.id) AS last_signal,
+            (SELECT COUNT(*)::int FROM positions WHERE portfolio_id = p.id AND status = 'OPEN') AS open_positions,
+            (SELECT COUNT(*)::int FROM positions
+              WHERE portfolio_id = p.id AND opened_at >= date_trunc('day', NOW())) AS trades_today
+       FROM user_portfolios p WHERE p.id = ANY($1::uuid[])`,
+    [[RESEARCH_PORTFOLIO_ID, OLDER_TOKEN_RESEARCH_PORTFOLIO_ID]],
+  );
+  const researchLane = (key: 'exploration' | 'olderToken', id: string) => {
+    const r = researchStats.rows.find((row) => row.id === id);
+    return {
+      key,
+      lastTradeAt: r?.last_trade?.toISOString() ?? null,
+      lastSignalAt: r?.last_signal?.toISOString() ?? null,
+      openPositions: r?.open_positions ?? 0,
+      tradesToday: r?.trades_today ?? 0,
+      dailyCap:
+        id === OLDER_TOKEN_RESEARCH_PORTFOLIO_ID
+          ? env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY
+          : env.RESEARCH_MAX_TRADES_PER_DAY,
+    };
+  };
+
   return {
     state,
     headline,
     detail,
     windowMinutes: WINDOW_MINUTES,
+    researchLanes: [
+      researchLane('exploration', RESEARCH_PORTFOLIO_ID),
+      researchLane('olderToken', OLDER_TOKEN_RESEARCH_PORTFOLIO_ID),
+    ],
     gates,
     warmup: { tokensEligible, tokensReady, minHistoryMinutes: MIN_HISTORY_MINUTES },
     funnel: {

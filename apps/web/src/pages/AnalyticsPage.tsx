@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { AnalyticsSummary } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct, pnlClass } from '../lib/api';
+import { LaneBadge } from '../components/LaneBadge';
 
 export function AnalyticsPage() {
   const [a, setA] = useState<(AnalyticsSummary & { scoreDisclaimer?: string }) | null>(null);
@@ -15,6 +16,11 @@ export function AnalyticsPage() {
 
   return (
     <div className="page">
+      <div className="lane-legend">
+        <span>Analytics for</span>
+        <LaneBadge lane="PRODUCTION" />
+        <span>only — older-token research is reported on the dashboard&apos;s research panel</span>
+      </div>
       <div className="grid grid-4" style={{ marginBottom: '0.75rem' }}>
         <Stat label="Total trades" value={String(a.totalTrades)} />
         <Stat label="Winning / Losing" value={`${a.winningTrades} / ${a.losingTrades}`} />

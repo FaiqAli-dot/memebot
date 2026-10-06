@@ -12,11 +12,24 @@ import type {
   BotEventData,
   BotStatusInfo,
   EquityPoint,
+  PortfolioLane,
   PortfolioSummary,
   PositionData,
 } from '@memebot/shared';
-import { SCORE_DISCLAIMER } from '@memebot/shared';
-import { api, money, pct, pnlClass } from '../lib/api';
+import { PORTFOLIO_LANES, PORTFOLIO_LANE_LABELS, SCORE_DISCLAIMER } from '@memebot/shared';
+import { api, money, pct, pnlClass, type RecentSignal } from '../lib/api';
+import {
+  LaneBadge,
+  LaneFilterSelect,
+  LaneLegend,
+  LaneTags,
+  StrategyBadge,
+  laneRowClass,
+  matchesLaneFilter,
+  type LaneFilter,
+} from '../components/LaneBadge';
+import { OlderTokenResearchPanel } from '../components/OlderTokenResearchPanel';
+import { EventLine } from '../components/EventLine';
 import { useRealtime, useThrottled } from '../hooks/useRealtime';
 import { ReadinessPanel } from '../components/ReadinessPanel';
 import { LearningPanel } from '../components/LearningPanel';
@@ -34,6 +47,10 @@ type BoardTab = (typeof BOARD_TABS)[number]['id'];
 export function DashboardPage() {
   const [board, setBoard] = useState<BoardTab>('trading');
   const [portfolio, setPortfolio] = useState<PortfolioSummary | null>(null);
+  const [allPortfolios, setAllPortfolios] = useState<Array<PortfolioSummary & { lane: PortfolioLane | null }>>(
+    [],
+  );
+  const [statsLane, setStatsLane] = useState<PortfolioLane>('PRODUCTION');
   const [bot, setBot] = useState<BotStatusInfo | null>(null);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [positions, setPositions] = useState<PositionData[]>([]);
@@ -46,27 +63,45 @@ export function DashboardPage() {
     usable: boolean;
     note: string;
   } | null>(null);
+  const [signals, setSignals] = useState<RecentSignal[]>([]);
+  const [laneFilter, setLaneFilter] = useState<LaneFilter>('all');
   const [q, setQ] = useState('');
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [p, b, e, pos, t, ev, sol] = await Promise.all([
+    const [p, b, e, pos, t, ev, sol, sig, all] = await Promise.all([
       api.portfolio(),
       api.botStatus(),
       api.equity(),
-      api.positions('OPEN'),
-      api.trades(),
-      api.events(q ? `?q=${encodeURIComponent(q)}&limit=80` : '?limit=80'),
+      api.positions('OPEN', 'all'),
+      api.trades('all'),
+      api.events(q ? `?q=${encodeURIComponent(q)}&limit=80` : '?limit=80', 'all'),
       api.solPrice(),
+      api.recentSignals('all', 30),
+      api.portfolios(),
     ]);
     setPortfolio(p);
+    setAllPortfolios(all);
     setBot(b);
     setEquity(e);
     setPositions(pos);
     setTrades(t as Record<string, unknown>[]);
     setEvents(ev);
     setSolPrice(sol);
+    setSignals(sig);
   }, [q]);
+
+  const researchPortfolios = allPortfolios.filter((x) => x.lane !== 'PRODUCTION');
+  const stats =
+    statsLane === 'PRODUCTION' ? portfolio : (allPortfolios.find((x) => x.lane === statsLane) ?? null);
+  const shownPositions = positions.filter((p) => matchesLaneFilter(laneFilter, p.lane, p.strategyId));
+  const shownTrades = trades.filter((t) =>
+    matchesLaneFilter(laneFilter, t.lane as PortfolioLane | null, t.strategy_id as string | null),
+  );
+  const shownSignals = signals.filter((s) => matchesLaneFilter(laneFilter, s.lane, s.strategyId));
+  const shownEvents = events.filter(
+    (e) => laneFilter === 'all' || (e.lane != null && matchesLaneFilter(laneFilter, e.lane, e.strategyId)),
+  );
 
   useEffect(() => {
     void refresh();
@@ -158,19 +193,34 @@ export function DashboardPage() {
       {board === 'learning' && <LearningPanel />}
       {board === 'storage' && <StoragePanel />}
 
+      <LaneLegend />
+      <div className="lane-legend">
+        <span>Portfolio stats below:</span>
+        {PORTFOLIO_LANES.map((lane) => (
+          <button
+            key={lane}
+            className={`btn ${statsLane === lane ? 'primary' : ''}`}
+            style={{ padding: '0.15rem 0.5rem', fontSize: '0.75rem' }}
+            onClick={() => setStatsLane(lane)}
+          >
+            {PORTFOLIO_LANE_LABELS[lane]}
+          </button>
+        ))}
+        <span>· {stats?.openPositions ?? 0} open · updates live on every trade</span>
+      </div>
       <div className="grid grid-4" style={{ marginBottom: '0.75rem' }}>
-        <Metric label="Starting balance" value={money(portfolio?.startingBalanceUsd)} />
-        <Metric label="Cash" value={money(portfolio?.cashUsd)} />
-        <Metric label="Equity" value={money(portfolio?.equityUsd)} />
-        <Metric label="Invested" value={money(portfolio?.investedValueUsd)} />
-        <Metric label="Unrealized P/L" value={money(portfolio?.unrealizedPnlUsd)} className={pnlClass(portfolio?.unrealizedPnlUsd)} />
-        <Metric label="Realized P/L" value={money(portfolio?.realizedPnlUsd)} className={pnlClass(portfolio?.realizedPnlUsd)} />
-        <Metric label="Total P/L" value={`${money(portfolio?.totalPnlUsd)} (${pct(portfolio?.returnPct)})`} className={pnlClass(portfolio?.totalPnlUsd)} />
-        <Metric label="Max drawdown" value={pct(portfolio?.maxDrawdownPct)} />
-        <Metric label="Total fees" value={money(portfolio?.totalFeesUsd)} />
-        <Metric label="Network/gas" value={money(portfolio?.totalNetworkCostUsd)} />
-        <Metric label="Slippage cost" value={money(portfolio?.totalSlippageCostUsd)} />
-        <Metric label="Price impact cost" value={money(portfolio?.totalPriceImpactCostUsd)} />
+        <Metric label="Starting balance" value={money(stats?.startingBalanceUsd)} />
+        <Metric label="Cash" value={money(stats?.cashUsd)} />
+        <Metric label="Equity" value={money(stats?.equityUsd)} />
+        <Metric label="Invested" value={money(stats?.investedValueUsd)} />
+        <Metric label="Unrealized P/L" value={money(stats?.unrealizedPnlUsd)} className={pnlClass(stats?.unrealizedPnlUsd)} />
+        <Metric label="Realized P/L" value={money(stats?.realizedPnlUsd)} className={pnlClass(stats?.realizedPnlUsd)} />
+        <Metric label="Total P/L" value={`${money(stats?.totalPnlUsd)} (${pct(stats?.returnPct)})`} className={pnlClass(stats?.totalPnlUsd)} />
+        <Metric label="Max drawdown" value={pct(stats?.maxDrawdownPct)} />
+        <Metric label="Total fees" value={money(stats?.totalFeesUsd)} />
+        <Metric label="Network/gas" value={money(stats?.totalNetworkCostUsd)} />
+        <Metric label="Slippage cost" value={money(stats?.totalSlippageCostUsd)} />
+        <Metric label="Price impact cost" value={money(stats?.totalPriceImpactCostUsd)} />
         <Metric
           label="SOL/USD (fee conversion)"
           value={
@@ -179,6 +229,41 @@ export function DashboardPage() {
               : 'unavailable'
           }
         />
+      </div>
+      <div className="panel" style={{ marginBottom: '0.75rem' }}>
+        <h2>Research portfolios (paper only · separate from production)</h2>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Lane</th>
+                <th>Equity</th>
+                <th>Cash</th>
+                <th>Open</th>
+                <th>Unrealized P/L</th>
+                <th>Realized P/L</th>
+                <th>Total P/L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {researchPortfolios.map((r) => (
+                <tr key={r.id} className={laneRowClass(r.lane, null)}>
+                  <td>
+                    <LaneBadge lane={r.lane} short />
+                  </td>
+                  <td>{money(r.equityUsd)}</td>
+                  <td>{money(r.cashUsd)}</td>
+                  <td>{r.openPositions}</td>
+                  <td className={pnlClass(r.unrealizedPnlUsd)}>{money(r.unrealizedPnlUsd)}</td>
+                  <td className={pnlClass(r.realizedPnlUsd)}>{money(r.realizedPnlUsd)}</td>
+                  <td className={pnlClass(r.totalPnlUsd)}>
+                    {money(r.totalPnlUsd)} ({pct(r.returnPct)})
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
       {solPrice && (
         <p className="disclaimer" style={{ marginTop: 0, marginBottom: '0.75rem', borderTop: 'none', paddingTop: 0 }}>
@@ -232,6 +317,63 @@ export function DashboardPage() {
         </div>
       </div>
 
+      <OlderTokenResearchPanel />
+
+      <div className="lane-legend" style={{ justifyContent: 'space-between' }}>
+        <span>Positions, trades, signals and the log below show every experiment, tagged by lane.</span>
+        <LaneFilterSelect value={laneFilter} onChange={setLaneFilter} />
+      </div>
+
+      <div className="panel" style={{ marginBottom: '0.75rem' }}>
+        <h2>Recent signals</h2>
+        <div className="table-wrap" style={{ maxHeight: 300 }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Token</th>
+                <th>Lane</th>
+                <th>Strategy</th>
+                <th>EV</th>
+                <th>Execution</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shownSignals.map((s) => (
+                <tr key={s.id} className={laneRowClass(s.lane, s.strategyId)}>
+                  <td>{new Date(s.createdAt).toLocaleTimeString()}</td>
+                  <td>
+                    <Link to={`/tokens/${s.tokenId}`}>{s.symbol ?? s.tokenId.slice(0, 6)}</Link>
+                  </td>
+                  <td>
+                    <LaneBadge lane={s.lane} short />
+                  </td>
+                  <td>
+                    <StrategyBadge strategyId={s.strategyId} />
+                  </td>
+                  <td>{s.expectedValue != null ? pct(s.expectedValue * 100) : 'n/a'}</td>
+                  <td>
+                    <span className={signalStatusClass(s.executionStatus)}>{s.executionStatus ?? 'PENDING'}</span>
+                    {s.executionReason && (
+                      <div className="muted" style={{ fontSize: '0.75rem' }}>
+                        {s.executionReason.replace(/_/g, ' ')}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {shownSignals.length === 0 && (
+                <tr>
+                  <td colSpan={6} style={{ color: 'var(--muted)' }}>
+                    No signals for this experiment yet
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div className="grid grid-2" style={{ marginBottom: '0.75rem' }}>
         <div className="panel">
           <h2>Active positions</h2>
@@ -240,6 +382,7 @@ export function DashboardPage() {
               <thead>
                 <tr>
                   <th>Token</th>
+                  <th>Lane</th>
                   <th>Entry</th>
                   <th>Mark</th>
                   <th>Value</th>
@@ -248,10 +391,13 @@ export function DashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {positions.map((p) => (
-                  <tr key={p.id}>
+                {shownPositions.map((p) => (
+                  <tr key={p.id} className={laneRowClass(p.lane, p.strategyId)}>
                     <td>
                       <Link to={`/tokens/${p.tokenId}`}>{p.token?.symbol ?? p.tokenId.slice(0, 6)}</Link>
+                    </td>
+                    <td>
+                      <LaneTags lane={p.lane} strategyId={p.strategyId} short />
                     </td>
                     <td>{money(p.entryPriceUsd, 6)}</td>
                     <td>{money(p.currentPriceUsd, 6)}</td>
@@ -264,9 +410,9 @@ export function DashboardPage() {
                     </td>
                   </tr>
                 ))}
-                {positions.length === 0 && (
+                {shownPositions.length === 0 && (
                   <tr>
-                    <td colSpan={6} style={{ color: 'var(--muted)' }}>
+                    <td colSpan={7} style={{ color: 'var(--muted)' }}>
                       No open positions
                     </td>
                   </tr>
@@ -283,6 +429,7 @@ export function DashboardPage() {
                 <tr>
                   <th>Side</th>
                   <th>Token</th>
+                  <th>Lane</th>
                   <th>Filled</th>
                   <th>Exec px</th>
                   <th>Fees</th>
@@ -290,11 +437,21 @@ export function DashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {trades.slice(0, 12).map((t) => (
-                  <tr key={String(t.id)}>
+                {shownTrades.slice(0, 12).map((t) => (
+                  <tr
+                    key={String(t.id)}
+                    className={laneRowClass(t.lane as PortfolioLane | null, t.strategy_id as string | null)}
+                  >
                     <td className={t.side === 'BUY' ? 'pos' : 'neg'}>{String(t.side)}</td>
                     <td>
                       <Link to={`/trades?focus=${String(t.id)}`}>{String(t.symbol)}</Link>
+                    </td>
+                    <td>
+                      <LaneTags
+                        lane={t.lane as PortfolioLane | null}
+                        strategyId={t.strategy_id as string | null}
+                        short
+                      />
                     </td>
                     <td>{money(Number(t.filled_amount_usd))}</td>
                     <td>{money(Number(t.executed_price_usd ?? 0), 6)}</td>
@@ -319,18 +476,20 @@ export function DashboardPage() {
           />
         </div>
         <div className="log-panel">
-          {events.map((e) => (
-            <div key={e.id} className={`log-line ${e.level}`}>
-              <span>{new Date(e.createdAt).toLocaleTimeString()}</span>
-              <span className="cat">{e.category}</span>
-              <span>{e.message}</span>
-            </div>
+          {shownEvents.map((e) => (
+            <EventLine key={e.id} event={e} />
           ))}
         </div>
         <p className="disclaimer">{SCORE_DISCLAIMER}</p>
       </div>
     </div>
   );
+}
+
+function signalStatusClass(status: string | null): string {
+  if (status === 'EXECUTED' || status === 'FILLED') return 'pos';
+  if (status == null || status === 'PENDING') return 'muted';
+  return 'neg';
 }
 
 function Metric({

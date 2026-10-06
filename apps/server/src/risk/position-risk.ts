@@ -235,7 +235,10 @@ export function assessPositionRisk(
     riskState: p.riskStateMultiplier,
   };
   const riskScore = Object.values(multipliers).reduce((a, b) => a * b, 1);
-  const requested = cfg.baseSizeUsd * riskScore;
+  // Research lanes trade the minimum rather than going silent when multipliers shrink
+  // the size below it; the limits below can still cap or reject it.
+  const scaled = cfg.baseSizeUsd * riskScore;
+  const requested = c.lane === 'RESEARCH' ? Math.max(cfg.minSizeUsd, scaled) : scaled;
 
   // ---- Limits cap the size (resize before reject) ----
   // Exposure is booked as cost basis (fill + entry fee), so headroom excludes the entry fee

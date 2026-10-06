@@ -17,6 +17,8 @@ import type {
 } from '@memebot/shared';
 import { api, money, pct, pnlClass } from '../lib/api';
 import { useRealtime, useThrottled } from '../hooks/useRealtime';
+import { LaneLegend, LaneTags, laneCardClass } from '../components/LaneBadge';
+import { EventLine } from '../components/EventLine';
 
 type Flash = 'up' | 'down' | null;
 
@@ -38,7 +40,7 @@ export function LivePage() {
   const closeReasons = useRef(new Map<string, string>());
 
   const load = useCallback(async () => {
-    const live = await api.livePositions();
+    const live = await api.livePositions('all');
     const liveIds = new Set(live.map((p) => p.id));
     setCards((prev) => {
       const prevById = new Map(prev.map((c) => [c.position.id, c]));
@@ -76,7 +78,7 @@ export function LivePage() {
   }, [cards]);
 
   const loadEvents = useCallback(async () => {
-    setEvents(await api.events('?limit=15'));
+    setEvents(await api.events('?limit=15', 'all'));
   }, []);
 
   useEffect(() => {
@@ -146,6 +148,7 @@ export function LivePage() {
 
   return (
     <div className="page">
+      <LaneLegend />
       <div className="live-header">
         <h2 style={{ margin: 0 }}>Live positions</h2>
         <span className="badge">{openCount} open</span>
@@ -161,11 +164,7 @@ export function LivePage() {
           </div>
           <div className="log-panel">
             {events.map((e) => (
-              <div key={e.id} className={`log-line ${e.level}`}>
-                <span>{new Date(e.createdAt).toLocaleTimeString()}</span>
-                <span className="cat">{e.category}</span>
-                <span>{e.message}</span>
-              </div>
+              <EventLine key={e.id} event={e} />
             ))}
           </div>
         </div>
@@ -192,11 +191,16 @@ function PositionCard({ card, now }: { card: CardState; now: number }) {
   const tickAge = card.lastTickAt != null ? Math.floor((now - card.lastTickAt) / 1000) : null;
 
   return (
-    <div className={`panel live-card ${card.closedReason ? 'closed' : ''}`}>
+    <div className={`panel live-card ${card.closedReason ? 'closed' : ''} ${laneCardClass(p.lane, p.strategyId)}`}>
       <div className="live-card-head">
-        <Link to={`/tokens/${p.tokenId}`} className="live-symbol">
-          {p.token?.symbol ?? p.tokenId.slice(0, 6)}
-        </Link>
+        <div>
+          <Link to={`/tokens/${p.tokenId}`} className="live-symbol">
+            {p.token?.symbol ?? p.tokenId.slice(0, 6)}
+          </Link>
+          <div style={{ marginTop: '0.25rem' }}>
+            <LaneTags lane={p.lane} strategyId={p.strategyId} />
+          </div>
+        </div>
         {card.closedReason ? (
           <span className="badge pause">CLOSED · {card.closedReason}</span>
         ) : (

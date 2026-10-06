@@ -32,11 +32,12 @@ import {
   executePaperSell,
   markPositionMarkToMarket,
 } from '../engines/paper/engine.js';
-import { evaluateExitRules } from '../engines/paper/exits.js';
+import { evaluateExitRules, isImplausibleMark } from '../engines/paper/exits.js';
 import { query } from '../db/client.js';
 import { pruneOldData } from '../db/retention.js';
 import { publish } from '../ws/hub.js';
 import { runDailyReportIfDue } from '../services/report-service.js';
+import { portfolioLane } from '../services/lanes.js';
 import { buildEntrySnapshot, recordMissingObservations, recordTradeObservation } from '../learning/observations.js';
 import { runHealthCheckIfDue } from '../learning/health-service.js';
 import { getActiveEvCalibrations } from '../learning/calibration-service.js';
@@ -202,6 +203,28 @@ function quoteFromMarket(market: MarketRow, midPriceUsd = market.price_usd): Mar
     quoteReserve: market.quote_reserve,
   };
 }
+
+function unquotedMarketQuote(priceUsd: number): MarketQuote {
+  return {
+    chain: 'solana',
+    address: '',
+    priceUsd,
+    marketCapUsd: null,
+    volume5mUsd: 0,
+    volume1hUsd: 0,
+    volume24hUsd: 0,
+    buyVolume5mUsd: 0,
+    sellVolume5mUsd: 0,
+    txCount5m: 0,
+    priceChange5mPct: 0,
+    priceChange1hPct: 0,
+    liquidityUsd: 0,
+    liquidityStatus: 'UNKNOWN',
+    observedAt: new Date(),
+  };
+}
+
+const implausibleMarkLogged = new Set<string>();
 
 function toMetricSnapshot(s: SnapshotHistoryRow): MetricSnapshot {
   return {
@@ -2277,8 +2300,8 @@ export async function executeLane(
         message: lane === 'RESEARCH' ? 'Research paper BUY executed' : 'Paper BUY executed',
         details: { ...result, lane, latencyMs: realistic.latency.totalMs },
       });
+      publish('trade_opened', { ...result, portfolioId, lane: portfolioLane(portfolioId) });
       if (lane === 'PRODUCTION') {
-        publish('trade_opened', result);
         publish('portfolio_updated', await getPortfolio(portfolioId));
       }
     } else {
@@ -2324,6 +2347,7 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
     id: string;
     token_id: string;
     entry_price_usd: string;
+    current_price_usd: string | null;
     highest_price_usd: string;
     stop_loss_pct: string;
     take_profit_pct: string;
@@ -2338,14 +2362,74 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
 
   const gas = await providers.gasFee.getFeeEstimate();
   const isProduction = portfolioId === env.DEFAULT_PORTFOLIO_ID;
+  const unquotedWriteOffMs = Math.max(getStalePriceMaxAgeMs(), env.UNTRADEABLE_EXIT_GRACE_MINUTES * 60_000);
 
   for (const pos of positions) {
     const market = await getLatestMarketByToken(pos.token_id);
+
+    // Past max hold with no fresh quote for longer than the untradeable grace: the stale deferral
+    // would hold it open forever, so close it at zero like any other untradeable exit.
+    const holdExpired = Date.now() - pos.opened_at.getTime() >= settings.maxHoldingTimeSec * 1000;
+    const quoteAgeMs = market ? Date.now() - market.observed_at.getTime() : Number.POSITIVE_INFINITY;
+    if (holdExpired && quoteAgeMs >= unquotedWriteOffMs) {
+      const midPriceUsd = market?.price_usd ?? Number(pos.current_price_usd ?? pos.entry_price_usd);
+      const result = await executePaperSell({
+        portfolioId,
+        positionId: pos.id,
+        midPriceUsd,
+        quote: market
+          ? { ...quoteFromMarket(market, midPriceUsd), liquidityUsd: 0 }
+          : unquotedMarketQuote(midPriceUsd),
+        gas,
+        priorityFeeLamports: settings.priorityFeeLamports,
+        failedTxStillChargesNetwork: settings.failedTxStillChargesNetwork,
+        closeReason: 'emergency_no_market_data',
+      });
+      if (result.success) {
+        try {
+          await recordTradeObservation(pos.id);
+        } catch (err) {
+          logger.warn({ err, positionId: pos.id }, 'Trade observation deferred to the learning job');
+        }
+        await logBotEvent({
+          portfolioId,
+          level: 'warn',
+          category: 'execution',
+          message: 'Paper position written off (no market data past max hold)',
+          details: { ...result, positionId: pos.id, lastQuoteAt: market?.observed_at ?? null },
+        });
+        publish('trade_closed', {
+          ...result,
+          positionId: pos.id,
+          closeReason: 'emergency_no_market_data',
+          lane: portfolioLane(portfolioId),
+        });
+        if (isProduction) {
+          publish('portfolio_updated', await getPortfolio(portfolioId));
+        }
+      }
+      continue;
+    }
     if (!market) continue;
 
-    await markPositionMarkToMarket(pos.id, market.price_usd);
     const entry = Number(pos.entry_price_usd);
-    const ret = entry > 0 ? (market.price_usd - entry) / entry : 0;
+    const previousMarkUsd = Number(pos.current_price_usd ?? entry);
+    const badTick = isImplausibleMark({
+      previousMarkUsd,
+      markPriceUsd: market.price_usd,
+      liquidityKnown: market.liquidity_status === 'KNOWN' && market.liquidity_usd > 0,
+    });
+    if (badTick && !implausibleMarkLogged.has(pos.id)) {
+      implausibleMarkLogged.add(pos.id);
+      logger.warn(
+        { positionId: pos.id, previousMarkUsd, markPriceUsd: market.price_usd, liquidityStatus: market.liquidity_status },
+        'Ignoring implausible mark from a pool without known liquidity',
+      );
+    }
+    const markPriceUsd = badTick ? previousMarkUsd : market.price_usd;
+
+    await markPositionMarkToMarket(pos.id, markPriceUsd);
+    const ret = entry > 0 ? (markPriceUsd - entry) / entry : 0;
     const prevMfe = Number(pos.mfe_pct ?? 0);
     const prevMae = Number(pos.mae_pct ?? 0);
     const mfe = Math.max(prevMfe, ret * 100);
@@ -2359,19 +2443,18 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
     );
 
     const costBasis = Number(pos.cost_basis_usd);
-    const unrealizedPnlUsd = Number(pos.quantity) * market.price_usd - costBasis;
-    if (isProduction) {
-      publish('position_updated', {
-        positionId: pos.id,
-        tokenId: pos.token_id,
-        price: market.price_usd,
-        priceUsd: market.price_usd,
-        observedAt: market.observed_at.toISOString(),
-        highestPriceUsd: Math.max(Number(pos.highest_price_usd), market.price_usd),
-        unrealizedPnlUsd,
-        unrealizedPnlPct: costBasis > 0 ? (unrealizedPnlUsd / costBasis) * 100 : 0,
-      });
-    }
+    const unrealizedPnlUsd = Number(pos.quantity) * markPriceUsd - costBasis;
+    publish('position_updated', {
+      positionId: pos.id,
+      tokenId: pos.token_id,
+      lane: portfolioLane(portfolioId),
+      price: markPriceUsd,
+      priceUsd: markPriceUsd,
+      observedAt: market.observed_at.toISOString(),
+      highestPriceUsd: Math.max(Number(pos.highest_price_usd), markPriceUsd),
+      unrealizedPnlUsd,
+      unrealizedPnlPct: costBasis > 0 ? (unrealizedPnlUsd / costBasis) * 100 : 0,
+    });
 
     const marketStale =
       market.stale || Date.now() - market.observed_at.getTime() > getStalePriceMaxAgeMs();
@@ -2380,7 +2463,7 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
     // Unknown liquidity is not treated as collapse (it is not evidence of zero).
     const decision = evaluateExitRules({
       entryPriceUsd: Number(pos.entry_price_usd),
-      markPriceUsd: market.price_usd,
+      markPriceUsd,
       highestPriceUsd: Number(pos.highest_price_usd),
       stopLossPct: Number(pos.stop_loss_pct),
       takeProfitPct: Number(pos.take_profit_pct),
@@ -2434,8 +2517,8 @@ async function manageOpenPositions(portfolioId: string, settings: PortfolioSetti
         message: `Paper SELL executed (${finalReason})`,
         details: result,
       });
+      publish('trade_closed', { ...result, positionId: pos.id, closeReason: finalReason, lane: portfolioLane(portfolioId) });
       if (isProduction) {
-        publish('trade_closed', { ...result, positionId: pos.id, closeReason: finalReason });
         publish('portfolio_updated', await getPortfolio(portfolioId));
       }
     }

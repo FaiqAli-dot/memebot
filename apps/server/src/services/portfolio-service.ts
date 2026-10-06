@@ -6,7 +6,9 @@ import type {
 } from '@memebot/shared';
 import { query, withTransaction } from '../db/client.js';
 import { env, dataMode } from '../config/env.js';
-import { defaultPortfolioSettings, normalizeSettings } from '../engines/risk/engine.js';
+import { defaultPortfolioSettings, evaluateRisk, normalizeSettings } from '../engines/risk/engine.js';
+import { normalizeRiskState, type PortfolioRiskState } from '../risk/state-machine.js';
+import { isKillSwitchActive } from '../monitoring/kill-switch.js';
 import { OLDER_TOKEN_RESEARCH_PORTFOLIO_ID, RESEARCH_PORTFOLIO_ID } from '@memebot/shared';
 
 export async function ensureDefaultPortfolio(): Promise<string> {
@@ -191,6 +193,39 @@ export async function updatePortfolioSettings(
     `UPDATE user_portfolios SET settings = $2, updated_at = NOW() WHERE id = $1`,
     [portfolioId, JSON.stringify(next)],
   );
+  return next;
+}
+
+/**
+ * Re-runs the risk state machine against the portfolio's current settings. A HALTED state is
+ * re-derived from scratch (evaluated as if in RECOVERY), so raising the drawdown limit releases a
+ * drawdown halt that no longer applies, while a still-breached limit or active kill switch re-halts.
+ */
+export async function reevaluateRiskState(portfolioId: string): Promise<PortfolioRiskState | null> {
+  const portfolio = await getPortfolio(portfolioId);
+  if (!portfolio) return null;
+  const settings = await getPortfolioSettings(portfolioId);
+  const current = normalizeRiskState(portfolio.riskState);
+  const risk = evaluateRisk({
+    equityUsd: portfolio.equityUsd,
+    cashUsd: portfolio.cashUsd,
+    openPositions: portfolio.openPositions,
+    startingBalanceUsd: portfolio.startingBalanceUsd,
+    peakEquityUsd: Math.max(portfolio.peakEquityUsd, portfolio.equityUsd),
+    realizedPnlTodayUsd: 0,
+    proposedSizeUsd: 1,
+    stopLossPct: settings.stopLossPct,
+    settings,
+    currentRiskState: current === 'HALTED' ? 'RECOVERY' : current,
+    killSwitchActive: await isKillSwitchActive(portfolioId),
+  });
+  const next = normalizeRiskState(risk.riskState);
+  if (next !== current) {
+    await query(
+      `UPDATE user_portfolios SET risk_state = $2, risk_state_changed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [portfolioId, next],
+    );
+  }
   return next;
 }
 

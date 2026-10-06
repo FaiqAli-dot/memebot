@@ -430,22 +430,50 @@ describe('integration: paper trading loop + edge cases', () => {
         closeReason: 'max_holding_time',
       });
 
-    // Inside the grace period: position stays open, retries collapse into one counted row.
-    for (let i = 0; i < 5; i++) expect((await sell()).success).toBe(false);
-    const failed = await query<{ id: string; attempt_count: number; total_cost_usd: string; network_fee_usd: string }>(
-      `SELECT id, attempt_count, total_cost_usd, network_fee_usd FROM paper_orders
-       WHERE position_id = $1 AND status = 'FAILED'`,
-      [buy.positionId],
-    );
+    const failedOrder = () =>
+      query<{ id: string; attempt_count: number; total_cost_usd: string; network_fee_usd: string }>(
+        `SELECT id, attempt_count, total_cost_usd, network_fee_usd FROM paper_orders
+         WHERE position_id = $1 AND status = 'FAILED'`,
+        [buy.positionId],
+      );
+    const backdateLastAttempt = () =>
+      query(
+        `UPDATE paper_orders SET last_attempt_at = NOW() - INTERVAL '11 seconds'
+         WHERE position_id = $1 AND status = 'FAILED'`,
+        [buy.positionId],
+      );
+
+    // Rapid retries inside the retry interval are throttled: one attempt, one charge.
+    const cashBefore = (await getPortfolio(portfolioId))!.cashUsd;
+    expect((await sell()).success).toBe(false);
+    for (let i = 0; i < 4; i++) expect((await sell()).reason).toBe('sell_retry_throttled');
+    const failed = await failedOrder();
     expect(failed.rows).toHaveLength(1);
-    expect(failed.rows[0]!.attempt_count).toBe(5);
-    expect(Number(failed.rows[0]!.total_cost_usd)).toBeGreaterThan(0);
+    expect(failed.rows[0]!.attempt_count).toBe(1);
+    const firstCost = Number(failed.rows[0]!.total_cost_usd);
+    expect(firstCost).toBeGreaterThan(0);
+    expect((await getPortfolio(portfolioId))!.cashUsd).toBeCloseTo(cashBefore - firstCost, 6);
+
+    // Retries after the interval count as attempts but are not charged again.
+    for (let i = 0; i < 4; i++) {
+      await backdateLastAttempt();
+      expect((await sell()).success).toBe(false);
+    }
+    const retried = await failedOrder();
+    expect(retried.rows[0]!.attempt_count).toBe(5);
+    expect(Number(retried.rows[0]!.total_cost_usd)).toBeCloseTo(firstCost, 9);
+    expect((await getPortfolio(portfolioId))!.cashUsd).toBeCloseTo(cashBefore - firstCost, 6);
     const open = await query<{ status: string }>(`SELECT status FROM positions WHERE id = $1`, [buy.positionId]);
     expect(open.rows[0]!.status).toBe('OPEN');
 
     // First attempt now older than 15 minutes: next failure closes the position at $0.
     await query(`UPDATE paper_orders SET created_at = NOW() - INTERVAL '16 minutes' WHERE id = $1`, [failed.rows[0]!.id]);
+    await backdateLastAttempt();
+    const basis = await query<{ cost_basis_usd: string }>(`SELECT cost_basis_usd FROM positions WHERE id = $1`, [
+      buy.positionId,
+    ]);
     const closing = await sell();
+    expect(closing.netPnl).toBeCloseTo(-Number(basis.rows[0]!.cost_basis_usd) - firstCost, 6);
     expect(closing.success).toBe(true);
     expect(closing.closeReason).toBe('emergency_liquidity_collapse');
     const pos = await query<{ status: string; close_reason: string; exit_order_id: string; current_value_usd: string }>(

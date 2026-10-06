@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { StrategyLabStats } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct } from '../lib/api';
+import { LaneBadge } from '../components/LaneBadge';
 
 export function StrategiesPage() {
   const [rows, setRows] = useState<StrategyLabStats[]>([]);
@@ -25,6 +26,11 @@ export function StrategiesPage() {
     <div className="page">
       <div className="panel">
         <h2>Strategy Lab</h2>
+        <div className="lane-legend">
+          <span>Stats for</span>
+          <LaneBadge lane="PRODUCTION" />
+          <span>only</span>
+        </div>
         <p style={{ color: 'var(--muted)' }}>{note}</p>
         <div className="filters">
           <label>

@@ -4,6 +4,7 @@ import type { ScannerRow } from '@memebot/shared';
 import { SCORE_DISCLAIMER } from '@memebot/shared';
 import { api, money, pct } from '../lib/api';
 import { useRealtime, useThrottled } from '../hooks/useRealtime';
+import { LaneLegend, LaneTags, laneRowClass } from '../components/LaneBadge';
 
 export function ScannerPage() {
   const [rows, setRows] = useState<ScannerRow[]>([]);
@@ -42,6 +43,7 @@ export function ScannerPage() {
     <div className="page">
       <div className="panel">
         <h2>Scanner</h2>
+        <LaneLegend />
         <div className="filters">
           <select value={filter} onChange={(e) => setFilter(e.target.value)}>
             <option value="all">All</option>
@@ -94,7 +96,10 @@ export function ScannerPage() {
             </thead>
             <tbody>
               {rows.map((r) => (
-                <tr key={r.tokenId} className={flash ? 'flash' : ''}>
+                <tr
+                  key={r.tokenId}
+                  className={`${flash ? 'flash' : ''} ${laneRowClass(r.signalLane, r.signalStrategyId)}`}
+                >
                   <td>
                     <Link to={`/tokens/${r.tokenId}`}>
                       {r.symbol}
@@ -122,7 +127,15 @@ export function ScannerPage() {
                   <td className={`risk-${r.riskLabel}`}>
                     {r.riskLabel.replace('_', ' ')} ({r.riskScore.toFixed(0)})
                   </td>
-                  <td>{r.signal ?? '—'}{r.overallScore != null ? ` · ${r.overallScore.toFixed(0)}` : ''}</td>
+                  <td>
+                    {r.signal ?? '—'}
+                    {r.overallScore != null ? ` · ${r.overallScore.toFixed(0)}` : ''}
+                    {r.signal && (
+                      <div style={{ marginTop: '0.2rem' }}>
+                        <LaneTags lane={r.signalLane} strategyId={r.signalStrategyId} short />
+                      </div>
+                    )}
+                  </td>
                   <td>{new Date(r.lastUpdated).toLocaleTimeString()}</td>
                 </tr>
               ))}

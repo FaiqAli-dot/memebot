@@ -3,6 +3,7 @@ import { dataMode } from '../config/env.js';
 import { rejectionBucket } from './reasons.js';
 import { listSourceHealth } from './source-health.js';
 import { getStorageMonitor } from './storage.js';
+import { portfolioLane, signalLane } from '../services/lanes.js';
 
 export interface IntelligenceListFilters {
   q?: string;
@@ -162,13 +163,19 @@ export async function listIntelligenceTokens(filters: IntelligenceListFilters): 
        t.initial_liquidity_usd, t.initial_market_cap_usd, t.initial_price_usd,
        t.lifecycle_state, t.trading_eligibility,
        m.price_usd, m.market_cap_usd, m.liquidity_usd, m.volume_24h_usd, m.observed_at AS last_market_at,
-       EXTRACT(EPOCH FROM (NOW() - COALESCE(t.pool_created_at, t.first_observed_at, t.discovered_at))) / 60 AS age_minutes
+       EXTRACT(EPOCH FROM (NOW() - COALESCE(t.pool_created_at, t.first_observed_at, t.discovered_at))) / 60 AS age_minutes,
+       ls.lane AS signal_lane, ls.target_portfolio_id AS signal_target_portfolio_id, ls.strategy_name AS signal_strategy
      FROM tokens t
      LEFT JOIN LATERAL (
        SELECT liquidity_usd, market_cap_usd, volume_24h_usd, price_usd, observed_at
        FROM market_snapshots ms WHERE ms.token_id = t.id
        ORDER BY observed_at DESC LIMIT 1
      ) m ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT lane, target_portfolio_id, strategy_name
+       FROM signals sg WHERE sg.token_id = t.id
+       ORDER BY created_at DESC LIMIT 1
+     ) ls ON TRUE
      WHERE ${whereSql}
      ORDER BY t.last_discovered_at DESC NULLS LAST, t.discovered_at DESC
      LIMIT $${limIdx} OFFSET $${offIdx}`,
@@ -198,6 +205,8 @@ export async function listIntelligenceTokens(filters: IntelligenceListFilters): 
       dbcStatus: r.dbc_status,
       migrationStatus: r.migration_status,
       lifecycleState: r.lifecycle_state,
+      signalLane: r.signal_lane ? signalLane(r.signal_lane, r.signal_target_portfolio_id) : null,
+      signalStrategyId: r.signal_strategy ?? null,
     })),
   };
 }
@@ -233,7 +242,7 @@ export async function getIntelligenceTokenDetail(tokenId: string): Promise<Recor
   );
 
   const signals = await query(
-    `SELECT id, created_at, lane, strategy_name AS strategy_id, strategy_version, overall_score,
+    `SELECT id, created_at, lane, target_portfolio_id, strategy_name AS strategy_id, strategy_version, overall_score,
             confidence, data_confidence, expected_value, market_state, explanation
      FROM signals WHERE token_id = $1 ORDER BY created_at ASC`,
     [tokenId],
@@ -267,6 +276,9 @@ export async function getIntelligenceTokenDetail(tokenId: string): Promise<Recor
     [tokenId],
   );
 
+  const byPortfolio = (rows: Row[]) =>
+    rows.map((r) => ({ ...r, portfolio_lane: portfolioLane(r.portfolio_id as string | null) }));
+
   return {
     token: t,
     discoveryEvents: events.rows,
@@ -274,11 +286,14 @@ export async function getIntelligenceTokenDetail(tokenId: string): Promise<Recor
     featureSnapshots: features.rows,
     outcomeCheckpoints: checkpoints.rows,
     outcomeSummaries: summaries.rows,
-    signals: signals.rows,
-    executionAttempts: attempts.rows,
-    riskDecisions: riskDecisions.rows,
-    orders: orders.rows,
-    positions: positions.rows,
+    signals: signals.rows.map((r) => ({
+      ...r,
+      portfolio_lane: signalLane(r.lane as string | null, r.target_portfolio_id as string | null),
+    })),
+    executionAttempts: byPortfolio(attempts.rows),
+    riskDecisions: byPortfolio(riskDecisions.rows),
+    orders: byPortfolio(orders.rows),
+    positions: byPortfolio(positions.rows),
     pools: pools.rows,
     latestMarket: latestMarket.rows[0] ?? null,
     timeline: buildTimeline({

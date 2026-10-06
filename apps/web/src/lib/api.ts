@@ -1,4 +1,63 @@
+import type { PortfolioLane, PortfolioScope, PortfolioSummary } from '@memebot/shared';
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
+
+export interface RecentSignal {
+  id: string;
+  tokenId: string;
+  symbol: string | null;
+  strategyId: string;
+  lane: PortfolioLane | null;
+  expectedValue: number | null;
+  overallScore: number | null;
+  confidence: string | null;
+  createdAt: string;
+  executionStatus: string | null;
+  executionReason: string | null;
+}
+
+export interface TradeExtreme {
+  positionId: string;
+  tokenId: string;
+  symbol: string | null;
+  lane: PortfolioLane | null;
+  strategyId: string | null;
+  netPnlUsd: number;
+  netPnlPct: number | null;
+  closeReason: string | null;
+  entryPriceUsd: number;
+  exitPriceUsd: number | null;
+  openedAt: string;
+  closedAt: string | null;
+  exitOrderId: string | null;
+}
+
+export interface OlderTokenResearchSummary {
+  enabled: boolean;
+  maxTradesPerDay: number;
+  portfolio: PortfolioSummary | null;
+  strategies: Array<{
+    strategyId: string;
+    open: number;
+    closed: number;
+    wins: number;
+    netPnlUsd: number;
+    openedToday: number;
+  }>;
+  signalsLastHour: Array<{ strategyId: string; count: number }>;
+  maxRoundTripCostPct: number;
+  candidatesLast24h: Array<{ strategyId: string; reason: string; count: number }>;
+  recentCandidates: Array<{
+    observedAt: string;
+    strategyId: string;
+    tokenId: string;
+    symbol: string | null;
+    signalled: boolean;
+    reason: string | null;
+    costRate: number | null;
+    liquidityUsd: number | null;
+  }>;
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -15,6 +74,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   meta: () => request<Record<string, unknown>>('/api/meta'),
   portfolio: () => request<import('@memebot/shared').PortfolioSummary>('/api/portfolio'),
+  portfolios: () => request<Array<PortfolioSummary & { lane: PortfolioLane | null }>>('/api/portfolios'),
   botStatus: () => request<import('@memebot/shared').BotStatusInfo>('/api/bot/status'),
   botReadiness: () => request<import('@memebot/shared').BotReadiness>('/api/bot/readiness'),
   learningStatus: () => request<import('@memebot/shared').LearningStatus>('/api/learning/status'),
@@ -35,18 +95,27 @@ export const api = {
     request<{ rows: import('@memebot/shared').ScannerRow[]; scoreDisclaimer: string; dataMode: string }>(
       `/api/scanner${qs}`,
     ),
-  positions: (status?: string) =>
+  positions: (status?: string, scope: PortfolioScope = 'production') =>
     request<import('@memebot/shared').PositionData[]>(
-      `/api/positions${status ? `?status=${status}` : ''}`,
+      `/api/positions?portfolio=${scope}${status ? `&status=${status}` : ''}`,
     ),
-  livePositions: () =>
-    request<import('@memebot/shared').LivePositionData[]>('/api/positions/live'),
-  trades: () => request<unknown[]>('/api/trades'),
-  failedTrades: () => request<Record<string, unknown>[]>('/api/trades/failed'),
-  trade: (id: string) => request<Record<string, unknown>>(`/api/trades/${id}`),
+  livePositions: (scope: PortfolioScope = 'production') =>
+    request<import('@memebot/shared').LivePositionData[]>(`/api/positions/live?portfolio=${scope}`),
+  trades: (scope: PortfolioScope = 'production') => request<unknown[]>(`/api/trades?portfolio=${scope}`),
+  tradeExtremes: (scope: PortfolioScope = 'production') =>
+    request<{ winners: TradeExtreme[]; losers: TradeExtreme[] }>(`/api/trades/extremes?portfolio=${scope}`),
+  failedTrades: (scope: PortfolioScope = 'production') =>
+    request<Record<string, unknown>[]>(`/api/trades/failed?portfolio=${scope}`),
+  trade: (id: string, scope: PortfolioScope = 'production') =>
+    request<Record<string, unknown>>(`/api/trades/${id}?portfolio=${scope}`),
   equity: () => request<import('@memebot/shared').EquityPoint[]>('/api/equity'),
-  events: (qs = '') =>
-    request<import('@memebot/shared').BotEventData[]>(`/api/events${qs}`),
+  events: (qs = '', scope: PortfolioScope = 'production') =>
+    request<import('@memebot/shared').BotEventData[]>(
+      `/api/events${qs ? `${qs}&` : '?'}portfolio=${scope}`,
+    ),
+  recentSignals: (scope: PortfolioScope = 'all', limit = 20) =>
+    request<RecentSignal[]>(`/api/signals/recent?portfolio=${scope}&limit=${limit}`),
+  olderTokenResearch: () => request<OlderTokenResearchSummary>('/api/research/older-token'),
   analytics: () => request<import('@memebot/shared').AnalyticsSummary & { scoreDisclaimer: string }>('/api/analytics'),
   strategies: () =>
     request<{ strategies: import('@memebot/shared').StrategyLabStats[]; scoreDisclaimer: string; note: string }>(

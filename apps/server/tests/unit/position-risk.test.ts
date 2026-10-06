@@ -91,6 +91,30 @@ describe('risk scenarios', () => {
     expect(r.finalSizeUsd).toBeCloseTo(1.5);
   });
 
+  it('A3: research lane below the minimum trades the minimum; production is still rejected', () => {
+    // $93 bankroll: 4.67 × 0.5 (research) × 0.6 (MEDIUM) × 0.7 (regime) ≈ $0.98
+    const cfg = { ...CFG, baseSizeUsd: 4.67 };
+    const research = assessPositionRisk(candidate({ lane: 'RESEARCH', regimeMultiplier: 0.7 }), portfolio(), cfg);
+    expect(research.decision).toBe('SIZED');
+    expect(research.finalSizeUsd).toBeCloseTo(1);
+
+    const production = assessPositionRisk(
+      candidate({ dataConfidence: 'LOW', regimeMultiplier: 0.5 }),
+      portfolio(),
+      cfg,
+    );
+    expect(production.decision).toBe('REJECTED');
+    expect(production.rejectionReason).toBe('minimumPositionSize');
+
+    const tooRisky = assessPositionRisk(
+      candidate({ lane: 'RESEARCH', regimeMultiplier: 0.7 }),
+      portfolio(),
+      { ...cfg, maxRiskPerTradeUsd: 0.05 },
+    );
+    expect(tooRisky.decision).toBe('REJECTED');
+    expect(tooRisky.rejectionReason).toBe('maximumLossExceeded');
+  });
+
   it('B: max loss too high at base size → resized, not rejected', () => {
     const cfg = { ...CFG, baseSizeUsd: 20, maxRiskPerTradeUsd: 1 };
     const r = assessPositionRisk(candidate({ dataConfidence: 'HIGH' }), portfolio(), cfg);

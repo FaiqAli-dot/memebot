@@ -4,11 +4,13 @@ import type {
   BotStatusInfo,
   EquityPoint,
   LivePositionData,
+  PortfolioLane,
   PositionData,
   ScannerRow,
   StrategyLabStats,
 } from '@memebot/shared';
-import { SCORE_DISCLAIMER } from '@memebot/shared';
+import { eventStrategyId, portfolioLane, signalLane, signalPortfolioSql } from './lanes.js';
+import { OLDER_TOKEN_RESEARCH_PORTFOLIO_ID, RESEARCH_PORTFOLIO_ID, SCORE_DISCLAIMER } from '@memebot/shared';
 import { query } from '../db/client.js';
 import { dataMode, env, realismProfile } from '../config/env.js';
 import { getPortfolio } from './portfolio-service.js';
@@ -101,12 +103,16 @@ export async function getScannerRows(opts: {
     top_holder_pct: string | null;
     signal_side: string | null;
     overall_score: string | null;
+    signal_lane: string | null;
+    signal_target_portfolio_id: string | null;
+    signal_strategy: string | null;
   }>(
     `SELECT t.id, t.address, t.symbol, t.name, t.chain, t.created_at_onchain, t.discovered_at, t.watchlisted,
       m.price_usd, m.market_cap_usd, m.liquidity_usd, m.volume_5m_usd, m.volume_1h_usd,
       m.buy_volume_5m_usd, m.sell_volume_5m_usd, m.price_change_5m_pct, m.observed_at,
       h.holder_count, h.top_holder_pct,
-      s.side AS signal_side, s.overall_score
+      s.side AS signal_side, s.overall_score, s.lane AS signal_lane,
+      s.target_portfolio_id AS signal_target_portfolio_id, s.strategy_name AS signal_strategy
      FROM tokens t
      LEFT JOIN LATERAL (
        SELECT * FROM market_snapshots ms WHERE ms.token_id = t.id ORDER BY ms.observed_at DESC LIMIT 1
@@ -115,7 +121,8 @@ export async function getScannerRows(opts: {
        SELECT * FROM holder_snapshots hs WHERE hs.token_id = t.id ORDER BY hs.observed_at DESC LIMIT 1
      ) h ON TRUE
      LEFT JOIN LATERAL (
-       SELECT side, overall_score FROM signals sg WHERE sg.token_id = t.id ORDER BY sg.created_at DESC LIMIT 1
+       SELECT side, overall_score, lane, target_portfolio_id, strategy_name
+       FROM signals sg WHERE sg.token_id = t.id ORDER BY sg.created_at DESC LIMIT 1
      ) s ON TRUE
      WHERE t.data_mode = $1
      LIMIT 200`,
@@ -197,6 +204,8 @@ export async function getScannerRows(opts: {
       overallScore: r.overall_score != null ? Number(r.overall_score) : scores.overall,
       lastUpdated: (r.observed_at ?? r.discovered_at).toISOString(),
       dataMode,
+      signalLane: r.signal_side ? signalLane(r.signal_lane, r.signal_target_portfolio_id) : null,
+      signalStrategyId: r.signal_strategy,
     };
   });
 
@@ -261,13 +270,20 @@ export async function getScannerRows(opts: {
   return mapped.slice(0, opts.limit);
 }
 
-export async function getPositions(portfolioId: string, status?: 'OPEN' | 'CLOSED'): Promise<PositionData[]> {
-  const params: unknown[] = [portfolioId];
+function portfolioIdList(portfolioIds: string | string[]): string[] {
+  return Array.isArray(portfolioIds) ? portfolioIds : [portfolioIds];
+}
+
+export async function getPositions(
+  portfolioIds: string | string[],
+  status?: 'OPEN' | 'CLOSED',
+): Promise<PositionData[]> {
+  const params: unknown[] = [portfolioIdList(portfolioIds)];
   let sql = `
     SELECT p.*, t.symbol, t.name, t.address, t.chain
     FROM positions p
     JOIN tokens t ON t.id = p.token_id
-    WHERE p.portfolio_id = $1`;
+    WHERE p.portfolio_id = ANY($1::uuid[])`;
   if (status) {
     params.push(status);
     sql += ` AND p.status = $2`;
@@ -278,8 +294,8 @@ export async function getPositions(portfolioId: string, status?: 'OPEN' | 'CLOSE
   return rows.map((r) => mapPosition(r));
 }
 
-export async function getLivePositions(portfolioId: string): Promise<LivePositionData[]> {
-  const positions = await getPositions(portfolioId, 'OPEN');
+export async function getLivePositions(portfolioIds: string | string[]): Promise<LivePositionData[]> {
+  const positions = await getPositions(portfolioIds, 'OPEN');
   return Promise.all(
     positions.map(async (p) => {
       const { rows } = await query<{ observed_at: Date; price_usd: string }>(
@@ -334,6 +350,8 @@ function mapPosition(r: Record<string, unknown>): PositionData {
     closedAt: r.closed_at ? new Date(r.closed_at as Date).toISOString() : null,
     closeReason: (r.close_reason as string) ?? null,
     dataMode: r.data_mode as PositionData['dataMode'],
+    lane: portfolioLane(String(r.portfolio_id)),
+    strategyId: (r.strategy_key as string | null) ?? null,
     token: {
       id: String(r.token_id),
       chain: String(r.chain),
@@ -349,26 +367,104 @@ function mapPosition(r: Record<string, unknown>): PositionData {
   };
 }
 
-export async function getTrades(portfolioId: string) {
+function withOrderLane<T extends Record<string, unknown>>(rows: T[]): Array<T & { lane: PortfolioLane | null }> {
+  return rows.map((r) => ({ ...r, lane: portfolioLane(r.portfolio_id as string | null) }));
+}
+
+export async function getTrades(portfolioIds: string | string[]) {
   const { rows } = await query(
-    `SELECT o.*, t.symbol, t.address, t.chain
+    `SELECT o.*, t.symbol, t.address, t.chain,
+            COALESCE(p.strategy_key, s.strategy_name) AS strategy_id
      FROM paper_orders o
      JOIN tokens t ON t.id = o.token_id
-     WHERE o.portfolio_id = $1 AND o.status <> 'FAILED'
+     LEFT JOIN positions p ON p.id = o.position_id
+     LEFT JOIN signals s ON s.id = o.signal_id
+     WHERE o.portfolio_id = ANY($1::uuid[]) AND o.status <> 'FAILED'
      ORDER BY o.created_at DESC
      LIMIT 100`,
-    [portfolioId],
+    [portfolioIdList(portfolioIds)],
   );
-  return rows;
+  return withOrderLane(rows);
+}
+
+export interface TradeExtreme {
+  positionId: string;
+  tokenId: string;
+  symbol: string | null;
+  lane: PortfolioLane | null;
+  strategyId: string | null;
+  netPnlUsd: number;
+  netPnlPct: number | null;
+  closeReason: string | null;
+  entryPriceUsd: number;
+  exitPriceUsd: number | null;
+  openedAt: string;
+  closedAt: string | null;
+  exitOrderId: string | null;
+}
+
+/** Top closed positions by net P/L in each direction (winners > 0, losers < 0). */
+export async function getTradeExtremes(portfolioIds: string | string[], limit = 5) {
+  const select = (order: 'DESC' | 'ASC', sign: '>' | '<') =>
+    query<{
+      id: string;
+      token_id: string;
+      symbol: string | null;
+      portfolio_id: string;
+      strategy_id: string | null;
+      net_pnl_usd: string;
+      cost_basis_usd: string;
+      close_reason: string | null;
+      entry_price_usd: string;
+      exit_price_usd: string | null;
+      opened_at: Date;
+      closed_at: Date | null;
+      exit_order_id: string | null;
+    }>(
+      `SELECT p.id, p.token_id, t.symbol, p.portfolio_id,
+              COALESCE(p.strategy_key, s.strategy_name) AS strategy_id,
+              p.net_pnl_usd, p.cost_basis_usd, p.close_reason, p.entry_price_usd,
+              e.executed_price_usd AS exit_price_usd, p.opened_at, p.closed_at, p.exit_order_id
+       FROM positions p
+       JOIN tokens t ON t.id = p.token_id
+       LEFT JOIN signals s ON s.id = p.entry_signal_id
+       LEFT JOIN paper_orders e ON e.id = p.exit_order_id
+       WHERE p.portfolio_id = ANY($1::uuid[]) AND p.status = 'CLOSED' AND p.net_pnl_usd ${sign} 0
+       ORDER BY p.net_pnl_usd ${order}
+       LIMIT $2`,
+      [portfolioIdList(portfolioIds), limit],
+    );
+  const toExtreme = (r: Awaited<ReturnType<typeof select>>['rows'][number]): TradeExtreme => {
+    const basis = Number(r.cost_basis_usd);
+    const net = Number(r.net_pnl_usd);
+    return {
+      positionId: r.id,
+      tokenId: r.token_id,
+      symbol: r.symbol,
+      lane: portfolioLane(r.portfolio_id),
+      strategyId: r.strategy_id,
+      netPnlUsd: net,
+      netPnlPct: basis > 0 ? (net / basis) * 100 : null,
+      closeReason: r.close_reason,
+      entryPriceUsd: Number(r.entry_price_usd),
+      exitPriceUsd: r.exit_price_usd != null ? Number(r.exit_price_usd) : null,
+      openedAt: r.opened_at.toISOString(),
+      closedAt: r.closed_at?.toISOString() ?? null,
+      exitOrderId: r.exit_order_id,
+    };
+  };
+  const [winners, losers] = await Promise.all([select('DESC', '>'), select('ASC', '<')]);
+  return { winners: winners.rows.map(toExtreme), losers: losers.rows.map(toExtreme) };
 }
 
 /**
  * Failed orders, one row per position + failure reason (retries are counted, not repeated),
  * with how the position eventually ended: filled exit, closed at $0, or still open.
  */
-export async function getFailedOrders(portfolioId: string) {
+export async function getFailedOrders(portfolioIds: string | string[]) {
   const { rows } = await query(
-    `SELECT o.id, o.side, o.failure_reason, o.attempt_count, o.created_at AS first_attempt_at,
+    `SELECT o.id, o.portfolio_id, p.strategy_key AS strategy_id,
+            o.side, o.failure_reason, o.attempt_count, o.created_at AS first_attempt_at,
             COALESCE(o.last_attempt_at, o.created_at) AS last_attempt_at,
             o.requested_price_usd, o.requested_amount_usd, o.network_fee_usd, o.priority_fee_usd,
             o.total_cost_usd, t.symbol,
@@ -380,26 +476,28 @@ export async function getFailedOrders(portfolioId: string) {
      JOIN tokens t ON t.id = o.token_id
      LEFT JOIN positions p ON p.id = o.position_id
      LEFT JOIN paper_orders e ON e.id = p.exit_order_id
-     WHERE o.portfolio_id = $1 AND o.status = 'FAILED'
+     WHERE o.portfolio_id = ANY($1::uuid[]) AND o.status = 'FAILED'
      ORDER BY COALESCE(o.last_attempt_at, o.created_at) DESC
      LIMIT 100`,
-    [portfolioId],
+    [portfolioIdList(portfolioIds)],
   );
-  return rows;
+  return withOrderLane(rows);
 }
 
-export async function getTradeDetail(portfolioId: string, orderId: string) {
+export async function getTradeDetail(portfolioIds: string | string[], orderId: string) {
   const { rows } = await query(
     `SELECT o.*, t.symbol, t.name, t.address, t.chain,
        s.created_at AS signal_at, s.explanation, s.market_state, s.overall_score,
-       s.momentum_score, s.liquidity_score, s.volume_score, s.holder_score, s.risk_score, s.risk_label
+       s.momentum_score, s.liquidity_score, s.volume_score, s.holder_score, s.risk_score, s.risk_label,
+       COALESCE(p.strategy_key, s.strategy_name) AS strategy_id
      FROM paper_orders o
      JOIN tokens t ON t.id = o.token_id
      LEFT JOIN signals s ON s.id = o.signal_id
-     WHERE o.portfolio_id = $1 AND o.id = $2`,
-    [portfolioId, orderId],
+     LEFT JOIN positions p ON p.id = o.position_id
+     WHERE o.portfolio_id = ANY($1::uuid[]) AND o.id = $2`,
+    [portfolioIdList(portfolioIds), orderId],
   );
-  const order = rows[0];
+  const order = rows[0] ? withOrderLane(rows)[0] : undefined;
   if (!order) return null;
 
   let position = null;
@@ -441,27 +539,32 @@ export async function getEquityHistory(portfolioId: string): Promise<EquityPoint
 }
 
 export async function getBotEvents(
-  portfolioId: string,
+  portfolioIds: string | string[],
   opts: { q?: string; level?: string; category?: string; limit: number },
 ): Promise<BotEventData[]> {
-  const clauses = [`(portfolio_id = $1 OR portfolio_id IS NULL)`, `data_mode = $2`];
-  const params: unknown[] = [portfolioId, dataMode];
+  const clauses = [`(e.portfolio_id = ANY($1::uuid[]) OR e.portfolio_id IS NULL)`, `e.data_mode = $2`];
+  const params: unknown[] = [portfolioIdList(portfolioIds), dataMode];
   if (opts.level) {
     params.push(opts.level);
-    clauses.push(`level = $${params.length}`);
+    clauses.push(`e.level = $${params.length}`);
   }
   if (opts.category) {
     params.push(opts.category);
-    clauses.push(`category = $${params.length}`);
+    clauses.push(`e.category = $${params.length}`);
   }
   if (opts.q) {
     params.push(`%${opts.q}%`);
-    clauses.push(`message ILIKE $${params.length}`);
+    clauses.push(`e.message ILIKE $${params.length}`);
   }
   params.push(opts.limit);
   const { rows } = await query(
-    `SELECT * FROM bot_events WHERE ${clauses.join(' AND ')}
-     ORDER BY created_at DESC LIMIT $${params.length}`,
+    `SELECT e.*, s.strategy_name AS signal_strategy
+     FROM bot_events e
+     LEFT JOIN signals s ON s.id = CASE
+       WHEN e.details->>'signalId' ~ '^[0-9a-fA-F-]{36}$' THEN (e.details->>'signalId')::uuid
+     END
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY e.created_at DESC LIMIT $${params.length}`,
     params,
   );
   return rows.map((r) => ({
@@ -473,7 +576,214 @@ export async function getBotEvents(
     details: r.details ?? {},
     createdAt: new Date(r.created_at).toISOString(),
     dataMode: r.data_mode,
+    lane: portfolioLane(r.portfolio_id),
+    strategyId: r.signal_strategy ?? eventStrategyId(r.details),
   }));
+}
+
+/** Latest BUY signals for the given portfolios, with the routed portfolio's latest execution attempt. */
+export async function getRecentSignals(portfolioIds: string | string[], limit: number) {
+  const { rows } = await query<{
+    id: string;
+    token_id: string;
+    symbol: string | null;
+    strategy_id: string;
+    lane: string;
+    portfolio_id: string | null;
+    expected_value: string | null;
+    overall_score: string | null;
+    confidence: string | null;
+    created_at: Date;
+    attempt_status: string | null;
+    attempt_reason: string | null;
+    order_status: string | null;
+    order_reason: string | null;
+    risk_decision: string | null;
+    risk_reason: string | null;
+    risk_exec_status: string | null;
+    risk_exec_reason: string | null;
+    position_open: boolean;
+    trades_before: string;
+  }>(
+    `WITH base AS (
+       SELECT s.id, s.token_id, t.symbol, s.strategy_name AS strategy_id, s.lane,
+              ${signalPortfolioSql('s', '$2', '$3')} AS portfolio_id,
+              s.expected_value, s.overall_score, s.confidence, s.created_at
+       FROM signals s
+       LEFT JOIN tokens t ON t.id = s.token_id
+       WHERE s.data_mode = $1 AND s.side = 'BUY'
+         AND ${signalPortfolioSql('s', '$2', '$3')} = ANY($4::uuid[])
+       ORDER BY s.created_at DESC
+       LIMIT $5
+     )
+     SELECT b.*,
+            a.status AS attempt_status, a.status_reason AS attempt_reason,
+            o.status AS order_status, o.failure_reason AS order_reason,
+            rd.decision AS risk_decision, rd.rejection_reason AS risk_reason,
+            rd.execution_status AS risk_exec_status, rd.execution_reason AS risk_exec_reason,
+            EXISTS (
+              SELECT 1 FROM positions p
+              WHERE p.portfolio_id = b.portfolio_id AND p.token_id = b.token_id
+                AND p.opened_at <= b.created_at AND (p.closed_at IS NULL OR p.closed_at > b.created_at)
+            ) AS position_open,
+            (SELECT COUNT(*) FROM positions p
+             WHERE p.portfolio_id = b.portfolio_id
+               AND p.opened_at >= date_trunc('day', b.created_at) AND p.opened_at < b.created_at
+            )::text AS trades_before
+     FROM base b
+     LEFT JOIN LATERAL (
+       SELECT status, status_reason FROM signal_execution_attempts sea
+       WHERE sea.signal_id = b.id ORDER BY sea.last_attempt_at DESC LIMIT 1
+     ) a ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT status, failure_reason FROM paper_orders po
+       WHERE po.signal_id = b.id ORDER BY po.created_at DESC LIMIT 1
+     ) o ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT decision, rejection_reason, execution_status, execution_reason FROM risk_decisions r
+       WHERE r.signal_id = b.id ORDER BY r.evaluated_at DESC LIMIT 1
+     ) rd ON TRUE
+     ORDER BY b.created_at DESC`,
+    [dataMode, env.DEFAULT_PORTFOLIO_ID, RESEARCH_PORTFOLIO_ID, portfolioIdList(portfolioIds), limit],
+  );
+  return rows.map((r) => {
+    const outcome = signalOutcome(r);
+    return {
+      id: r.id,
+      tokenId: r.token_id,
+      symbol: r.symbol,
+      strategyId: r.strategy_id,
+      lane: portfolioLane(r.portfolio_id),
+      expectedValue: r.expected_value != null ? Number(r.expected_value) : null,
+      overallScore: r.overall_score != null ? Number(r.overall_score) : null,
+      confidence: r.confidence,
+      createdAt: r.created_at.toISOString(),
+      executionStatus: outcome.status,
+      executionReason: outcome.reason,
+    };
+  });
+}
+
+/** Signals are only picked up by a lane for this long after creation (see executeLane). */
+const SIGNAL_PICKUP_WINDOW_MS = 10 * 60_000;
+
+function researchDailyCapFor(portfolioId: string | null): number | null {
+  if (portfolioId === RESEARCH_PORTFOLIO_ID) return env.RESEARCH_MAX_TRADES_PER_DAY;
+  if (portfolioId === OLDER_TOKEN_RESEARCH_PORTFOLIO_ID) return env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY;
+  return null;
+}
+
+/** Best available explanation of what happened to a signal, from the most to the least specific record. */
+function signalOutcome(r: {
+  portfolio_id: string | null;
+  created_at: Date;
+  attempt_status: string | null;
+  attempt_reason: string | null;
+  order_status: string | null;
+  order_reason: string | null;
+  risk_decision: string | null;
+  risk_reason: string | null;
+  risk_exec_status: string | null;
+  risk_exec_reason: string | null;
+  position_open: boolean;
+  trades_before: string;
+}): { status: string; reason: string | null } {
+  if (r.attempt_status) return { status: r.attempt_status, reason: r.attempt_reason };
+  if (r.order_status === 'FAILED') return { status: 'EXECUTION_FAILED', reason: r.order_reason };
+  if (r.order_status) return { status: 'EXECUTED', reason: null };
+  if (r.risk_decision === 'REJECTED') return { status: 'RISK_REJECTED', reason: r.risk_reason };
+  if (r.risk_decision) {
+    return { status: r.risk_exec_status ?? r.risk_decision, reason: r.risk_exec_reason ?? r.risk_reason };
+  }
+  if (r.position_open) return { status: 'SKIPPED', reason: 'position_already_open_on_token' };
+  const cap = researchDailyCapFor(r.portfolio_id);
+  if (cap != null && Number(r.trades_before) >= cap) {
+    return { status: 'SKIPPED', reason: `research_daily_cap_reached (${cap}/day)` };
+  }
+  if (Date.now() - r.created_at.getTime() > SIGNAL_PICKUP_WINDOW_MS) {
+    return { status: 'EXPIRED', reason: 'not_picked_up_within_10m' };
+  }
+  return { status: 'PENDING', reason: null };
+}
+
+/** Older-token research portfolio only — never mixed with production stats. */
+export async function getOlderTokenResearchSummary() {
+  const id = OLDER_TOKEN_RESEARCH_PORTFOLIO_ID;
+  const [portfolio, byStrategy, signals, candidates, recentCandidates] = await Promise.all([
+    getPortfolio(id),
+    query<{ strategy_id: string; open: string; closed: string; wins: string; net_pnl: string; today: string }>(
+      `SELECT COALESCE(strategy_key, '-') AS strategy_id,
+              COUNT(*) FILTER (WHERE status = 'OPEN')::text AS open,
+              COUNT(*) FILTER (WHERE status = 'CLOSED')::text AS closed,
+              COUNT(*) FILTER (WHERE status = 'CLOSED' AND net_pnl_usd > 0)::text AS wins,
+              COALESCE(SUM(net_pnl_usd) FILTER (WHERE status = 'CLOSED'), 0)::text AS net_pnl,
+              COUNT(*) FILTER (WHERE opened_at >= date_trunc('day', NOW()))::text AS today
+       FROM positions WHERE portfolio_id = $1
+       GROUP BY 1 ORDER BY 1`,
+      [id],
+    ),
+    query<{ strategy_id: string; n: string }>(
+      `SELECT strategy_name AS strategy_id, COUNT(*)::text AS n
+       FROM signals
+       WHERE target_portfolio_id = $1 AND data_mode = $2 AND created_at > NOW() - INTERVAL '60 minutes'
+       GROUP BY 1 ORDER BY 1`,
+      [id, dataMode],
+    ),
+    query<{ strategy_id: string; reason: string; n: string }>(
+      `SELECT strategy_id, COALESCE(features->>'rejectionReason', 'signal_emitted') AS reason, COUNT(*)::text AS n
+       FROM opportunities
+       WHERE decision IN ('OLDER_RESEARCH_SIGNAL', 'OLDER_RESEARCH_REJECTED')
+         AND observed_at > NOW() - INTERVAL '24 hours'
+       GROUP BY 1, 2 ORDER BY 3 DESC`,
+    ),
+    query<{
+      observed_at: Date;
+      strategy_id: string;
+      token_id: string;
+      symbol: string | null;
+      decision: string;
+      reason: string | null;
+      cost_rate: string | null;
+      liquidity_usd: string | null;
+    }>(
+      `SELECT o.observed_at, o.strategy_id, o.token_id, t.symbol, o.decision,
+              o.features->>'rejectionReason' AS reason, o.execution_cost_rate::text AS cost_rate,
+              o.liquidity_usd::text AS liquidity_usd
+       FROM opportunities o LEFT JOIN tokens t ON t.id = o.token_id
+       WHERE o.decision IN ('OLDER_RESEARCH_SIGNAL', 'OLDER_RESEARCH_REJECTED')
+       ORDER BY o.observed_at DESC LIMIT 8`,
+    ),
+  ]);
+  return {
+    enabled: env.OLDER_TOKEN_RESEARCH_ENABLED,
+    maxTradesPerDay: env.OLDER_TOKEN_RESEARCH_MAX_TRADES_PER_DAY,
+    maxRoundTripCostPct: env.OLDER_TOKEN_RESEARCH_MAX_ROUND_TRIP_COST_PCT,
+    candidatesLast24h: candidates.rows.map((r) => ({
+      strategyId: r.strategy_id,
+      reason: r.reason,
+      count: Number(r.n),
+    })),
+    recentCandidates: recentCandidates.rows.map((r) => ({
+      observedAt: r.observed_at.toISOString(),
+      strategyId: r.strategy_id,
+      tokenId: r.token_id,
+      symbol: r.symbol,
+      signalled: r.decision === 'OLDER_RESEARCH_SIGNAL',
+      reason: r.reason,
+      costRate: r.cost_rate != null ? Number(r.cost_rate) : null,
+      liquidityUsd: r.liquidity_usd != null ? Number(r.liquidity_usd) : null,
+    })),
+    portfolio,
+    strategies: byStrategy.rows.map((r) => ({
+      strategyId: r.strategy_id,
+      open: Number(r.open),
+      closed: Number(r.closed),
+      wins: Number(r.wins),
+      netPnlUsd: Number(r.net_pnl),
+      openedToday: Number(r.today),
+    })),
+    signalsLastHour: signals.rows.map((r) => ({ strategyId: r.strategy_id, count: Number(r.n) })),
+  };
 }
 
 export async function getAnalytics(portfolioId: string): Promise<AnalyticsSummary> {
@@ -685,6 +995,7 @@ export async function getTokenDetail(tokenId: string) {
     signal: signal.rows[0]
       ? {
           ...signal.rows[0],
+          portfolio_lane: signalLane(signal.rows[0].lane, signal.rows[0].target_portfolio_id),
           scoreDisclaimer: SCORE_DISCLAIMER,
         }
       : null,

@@ -13,6 +13,7 @@ import {
   getPortfolio,
   getPortfolioSettings,
   updatePortfolioSettings,
+  reevaluateRiskState,
   setBotStatus,
   resetPaperAccount,
   resetAllSimulationData,
@@ -24,6 +25,7 @@ import {
   getLivePositions,
   getTrades,
   getFailedOrders,
+  getTradeExtremes,
   getTradeDetail,
   getEquityHistory,
   getBotEvents,
@@ -34,8 +36,11 @@ import {
   getMissedOpportunities,
   getRegimeHistory,
   getSystemHealth,
+  getRecentSignals,
+  getOlderTokenResearchSummary,
   meta,
 } from '../../services/query-service.js';
+import { parsePortfolioScope, portfolioLane, scopePortfolioIds } from '../../services/lanes.js';
 import { getBotReadiness } from '../../services/readiness-service.js';
 import { getLearningStatus } from '../../learning/status-service.js';
 import { getWeek1Overview } from '../../services/week1-service.js';
@@ -60,6 +65,11 @@ const reportIdSchema = z.string().uuid();
 
 function portfolioId(): string {
   return env.DEFAULT_PORTFOLIO_ID;
+}
+
+/** List views may include research portfolios; stats endpoints always stay on the production portfolio. */
+function scopedPortfolios(scope: unknown): string[] {
+  return scopePortfolioIds(parsePortfolioScope(scope));
 }
 
 apiRouter.get('/health', async (_req, res, next) => {
@@ -102,6 +112,21 @@ apiRouter.get('/portfolio', async (_req, res, next) => {
     await ensureDefaultPortfolio();
     const p = await getPortfolio(portfolioId());
     res.json(p);
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/portfolios', async (_req, res, next) => {
+  try {
+    await ensureDefaultPortfolio();
+    const ids = scopePortfolioIds('all');
+    const summaries = await Promise.all(ids.map((id) => getPortfolio(id)));
+    res.json(
+      summaries
+        .filter((p): p is NonNullable<typeof p> => p != null)
+        .map((p) => ({ ...p, lane: portfolioLane(p.id) })),
+    );
   } catch (err) {
     next(err);
   }
@@ -187,7 +212,9 @@ apiRouter.put('/settings', async (req, res, next) => {
   try {
     const body = portfolioSettingsSchema.parse(req.body);
     await ensureDefaultPortfolio();
-    res.json(await updatePortfolioSettings(portfolioId(), body));
+    const settings = await updatePortfolioSettings(portfolioId(), body);
+    await reevaluateRiskState(portfolioId());
+    res.json(settings);
   } catch (err) {
     next(err);
   }
@@ -225,31 +252,39 @@ apiRouter.get('/positions', async (req, res, next) => {
       req.query.status === 'OPEN' || req.query.status === 'CLOSED'
         ? req.query.status
         : undefined;
-    res.json(await getPositions(portfolioId(), status));
+    res.json(await getPositions(scopedPortfolios(req.query.portfolio), status));
   } catch (err) {
     next(err);
   }
 });
 
-apiRouter.get('/positions/live', async (_req, res, next) => {
+apiRouter.get('/positions/live', async (req, res, next) => {
   try {
-    res.json(await getLivePositions(portfolioId()));
+    res.json(await getLivePositions(scopedPortfolios(req.query.portfolio)));
   } catch (err) {
     next(err);
   }
 });
 
-apiRouter.get('/trades', async (_req, res, next) => {
+apiRouter.get('/trades', async (req, res, next) => {
   try {
-    res.json(await getTrades(portfolioId()));
+    res.json(await getTrades(scopedPortfolios(req.query.portfolio)));
   } catch (err) {
     next(err);
   }
 });
 
-apiRouter.get('/trades/failed', async (_req, res, next) => {
+apiRouter.get('/trades/failed', async (req, res, next) => {
   try {
-    res.json(await getFailedOrders(portfolioId()));
+    res.json(await getFailedOrders(scopedPortfolios(req.query.portfolio)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/trades/extremes', async (req, res, next) => {
+  try {
+    res.json(await getTradeExtremes(scopedPortfolios(req.query.portfolio)));
   } catch (err) {
     next(err);
   }
@@ -257,7 +292,7 @@ apiRouter.get('/trades/failed', async (_req, res, next) => {
 
 apiRouter.get('/trades/:id', async (req, res, next) => {
   try {
-    const detail = await getTradeDetail(portfolioId(), req.params.id);
+    const detail = await getTradeDetail(scopedPortfolios(req.query.portfolio), req.params.id);
     if (!detail) {
       res.status(404).json({ error: 'Trade not found' });
       return;
@@ -279,7 +314,24 @@ apiRouter.get('/equity', async (_req, res, next) => {
 apiRouter.get('/events', async (req, res, next) => {
   try {
     const q = botEventsQuerySchema.parse(req.query);
-    res.json(await getBotEvents(portfolioId(), q));
+    res.json(await getBotEvents(scopedPortfolios(req.query.portfolio), q));
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/signals/recent', async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    res.json(await getRecentSignals(scopedPortfolios(req.query.portfolio), limit));
+  } catch (err) {
+    next(err);
+  }
+});
+
+apiRouter.get('/research/older-token', async (_req, res, next) => {
+  try {
+    res.json(await getOlderTokenResearchSummary());
   } catch (err) {
     next(err);
   }

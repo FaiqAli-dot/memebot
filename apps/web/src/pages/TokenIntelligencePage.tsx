@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, money, pct } from '../lib/api';
 import { TokenInvestigation } from '../components/TokenInvestigation';
+import { LaneTags, laneRowClass } from '../components/LaneBadge';
+import type { PortfolioLane } from '@memebot/shared';
 
 type IntelRow = {
   tokenId: string;
@@ -23,6 +25,8 @@ type IntelRow = {
   rejectionReason: string | null;
   dbcStatus?: string | null;
   migrationStatus?: string | null;
+  signalLane?: PortfolioLane | null;
+  signalStrategyId?: string | null;
 };
 
 type Summary = {
@@ -344,6 +348,7 @@ export function TokenIntelligencePage() {
                 <th>First seen</th>
                 <th>Status</th>
                 <th>Score</th>
+                <th>Signal lane</th>
                 <th>Risk</th>
                 <th>Trade</th>
                 <th>Rejection</th>
@@ -351,7 +356,7 @@ export function TokenIntelligencePage() {
             </thead>
             <tbody>
               {visibleRows.map((r) => (
-                <tr key={r.tokenId}>
+                <tr key={r.tokenId} className={laneRowClass(r.signalLane, r.signalStrategyId)}>
                   <td>
                     <button type="button" className="linkish" onClick={() => void openDetail(r.tokenId)}>
                       {r.name?.slice(0, 18) || r.address.slice(0, 8)}
@@ -372,6 +377,9 @@ export function TokenIntelligencePage() {
                   <td>{r.firstSeen ? new Date(r.firstSeen).toLocaleString() : '—'}</td>
                   <td>{r.status}</td>
                   <td>{r.signalScore != null ? r.signalScore.toFixed(2) : '—'}</td>
+                  <td>
+                    {r.signalLane ? <LaneTags lane={r.signalLane} strategyId={r.signalStrategyId} short /> : '—'}
+                  </td>
                   <td>{r.riskStatus ?? '—'}</td>
                   <td>{r.tradeStatus ?? '—'}</td>
                   <td>{r.rejectionReason ?? '—'}</td>

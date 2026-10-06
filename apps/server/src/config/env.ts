@@ -311,6 +311,8 @@ const envSchema = z.object({
    * (from its first failed attempt), then the position is closed at $0 as a liquidity collapse.
    */
   UNTRADEABLE_EXIT_GRACE_MINUTES: z.coerce.number().min(0).default(15),
+  /** Minimum gap between sell attempts on a position whose last sell failed. */
+  SELL_RETRY_INTERVAL_SEC: z.coerce.number().min(0).default(10),
   // Alerts — disabled when unset
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_CHAT_ID: z.string().optional().default(''),

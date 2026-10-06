@@ -84,6 +84,22 @@ export function evaluateExitRules(input: ExitRuleInput): ExitDecision {
   };
 }
 
+/** Max one-tick rise of a mark that is not backed by known pool liquidity. */
+export const MAX_UNVERIFIED_MARK_JUMP = 10;
+
+/**
+ * A price from a pool with no known liquidity that jumps far above the last trusted mark is a
+ * bad tick (e.g. a dust pool quoting 18,000x) and must not revalue the position or set peak equity.
+ */
+export function isImplausibleMark(input: {
+  previousMarkUsd: number;
+  markPriceUsd: number;
+  liquidityKnown: boolean;
+}): boolean {
+  if (input.liquidityKnown || !(input.previousMarkUsd > 0)) return false;
+  return input.markPriceUsd / input.previousMarkUsd > MAX_UNVERIFIED_MARK_JUMP;
+}
+
 /** Theoretical stop price for display only — never used as execution price. */
 export function theoreticalStopPrice(
   entryPriceUsd: number,
